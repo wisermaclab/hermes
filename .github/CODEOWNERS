@@ -1,0 +1,16 @@
+# Public-repository governance and release boundaries
+/.github/ @rzheng-mac
+/SECURITY.md @rzheng-mac
+/CONTRIBUTING.md @rzheng-mac
+/LICENSE @rzheng-mac
+/README.md @rzheng-mac
+/PUBLIC_SNAPSHOT.json @rzheng-mac
+/THIRD_PARTY_NOTICES.md @rzheng-mac
+/pyproject.toml @rzheng-mac
+/release/ @rzheng-mac
+/data/ @rzheng-mac
+/device/ @rzheng-mac
+/docs/itu_p2040/ @rzheng-mac
+/models/ @rzheng-mac
+/outputs/ @rzheng-mac
+/src/mmWaveRadar/radar/data/ @rzheng-mac

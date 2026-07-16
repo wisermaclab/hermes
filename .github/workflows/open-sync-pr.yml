@@ -1,0 +1,49 @@
+name: Open private-source sync PR
+
+on:
+  push:
+    branches: [sync/private-main]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+concurrency:
+  group: open-private-source-sync-pr
+  cancel-in-progress: false
+
+jobs:
+  open-sync-pr:
+    name: Open or update sync PR
+    if: github.repository == 'wisermaclab/hermes'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - name: Open PR when none exists
+        shell: bash
+        run: |
+          set -euo pipefail
+          existing="$(
+            gh pr list \
+              --repo "$GH_REPO" \
+              --base main \
+              --head sync/private-main \
+              --state open \
+              --json number \
+              --jq '.[0].number // empty'
+          )"
+          if [[ -n "$existing" ]]; then
+            echo "Sync PR #$existing already tracks the updated branch."
+            exit 0
+          fi
+
+          short_sha="${GITHUB_SHA:0:12}"
+          gh pr create \
+            --repo "$GH_REPO" \
+            --base main \
+            --head sync/private-main \
+            --title "Sync audited private source ($short_sha)" \
+            --body "Automated audited snapshot from the authoritative private repository."
