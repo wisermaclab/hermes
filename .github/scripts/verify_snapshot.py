@@ -55,6 +55,7 @@ REQUIRED_MANAGED_FILES = {
     "pyproject.toml",
 }
 FORBIDDEN_PREFIXES = (
+    "data/",
     "device/",
     "docs/itu_p2040/",
     "models/",
