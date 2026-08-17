@@ -1,0 +1,56 @@
+<scene version="2.1.0">
+    <bsdf type="itu-radio-material" id="mat-env-floor">
+        <string name="type" value="wood"/>
+        <float name="thickness" value="0.040000"/>
+        <float name="scattering_coefficient" value="0.200000"/>
+        <float name="xpd_coefficient" value="0.050000"/>
+    </bsdf>
+    <bsdf type="itu-radio-material" id="mat-env-furniture">
+        <string name="type" value="chipboard"/>
+        <float name="thickness" value="0.030000"/>
+        <float name="scattering_coefficient" value="0.350000"/>
+        <float name="xpd_coefficient" value="0.100000"/>
+    </bsdf>
+    <bsdf type="itu-radio-material" id="mat-env-wall">
+        <string name="type" value="concrete"/>
+        <float name="thickness" value="0.030000"/>
+        <float name="scattering_coefficient" value="0.120000"/>
+        <float name="xpd_coefficient" value="0.030000"/>
+    </bsdf>
+    <shape type="cube" id="floor">
+        <transform name="to_world"><scale x="4.193000" y="3.128000" z="0.020000"/><translate x="4.193000" y="0.874000" z="-1.160000"/></transform>
+        <ref name="bsdf" id="mat-env-floor"/>
+    </shape>
+    <shape type="cube" id="back_wall_patch_01">
+        <transform name="to_world"><scale x="0.020000" y="1.260000" z="1.620000"/><translate x="8.406000" y="2.786000" z="0.480000"/></transform>
+        <ref name="bsdf" id="mat-env-wall"/>
+    </shape>
+    <shape type="cube" id="back_wall_patch_02">
+        <transform name="to_world"><scale x="0.020000" y="0.270000" z="1.350000"/><translate x="8.406000" y="-1.984000" z="0.750000"/></transform>
+        <ref name="bsdf" id="mat-env-wall"/>
+    </shape>
+    <shape type="cube" id="left_wall_patch_01">
+        <transform name="to_world"><scale x="1.710000" y="0.020000" z="1.350000"/><translate x="4.770000" y="-2.274000" z="0.210000"/></transform>
+        <ref name="bsdf" id="mat-env-wall"/>
+    </shape>
+    <shape type="cube" id="right_wall_patch_01">
+        <transform name="to_world"><scale x="1.620000" y="0.020000" z="1.620000"/><translate x="6.840000" y="4.022000" z="0.480000"/></transform>
+        <ref name="bsdf" id="mat-env-wall"/>
+    </shape>
+    <shape type="cube" id="furniture_01">
+        <transform name="to_world"><scale x="0.860820" y="0.562160" z="0.376720"/><translate x="3.585820" y="-1.453160" z="-0.528280"/></transform>
+        <ref name="bsdf" id="mat-env-furniture"/>
+    </shape>
+    <shape type="cube" id="furniture_02">
+        <transform name="to_world"><scale x="0.881840" y="1.112820" z="0.776100"/><translate x="7.288200" y="-0.979180" z="-0.191180"/></transform>
+        <ref name="bsdf" id="mat-env-furniture"/>
+    </shape>
+    <shape type="cube" id="furniture_03">
+        <transform name="to_world"><scale x="1.393980" y="0.591480" z="0.385300"/><translate x="3.788140" y="2.481360" z="-0.563300"/></transform>
+        <ref name="bsdf" id="mat-env-furniture"/>
+    </shape>
+    <shape type="cube" id="furniture_04">
+        <transform name="to_world"><scale x="0.940020" y="0.937440" z="0.319610"/><translate x="7.014840" y="2.582700" z="-0.663130"/></transform>
+        <ref name="bsdf" id="mat-env-furniture"/>
+    </shape>
+</scene>

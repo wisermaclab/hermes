@@ -1,0 +1,43 @@
+{
+  "frames": [
+    {
+      "benchmark_index": 0,
+      "motion_time_s": 0.0,
+      "radar_frame_id": "000020",
+      "camera_frame_id": "000056",
+      "pose_frame_id": "000056",
+      "dataset_frame_id": "000020",
+      "metadata": {
+        "benchmark": {
+          "action": "Walk",
+          "camera_frame_id": "000056",
+          "dataset": "RT-Pose",
+          "environment": "cluttered",
+          "id": "rtpose_seq10_frame0020",
+          "location": "Indoor",
+          "occlusion": "Nothing",
+          "pose_frame_id": "000056",
+          "radar_frame_id": "000020",
+          "rtpose_sequence_id": "10",
+          "scenario": "Cluttered",
+          "single_subject": true,
+          "source_subject_type": "Single-Person",
+          "subject_count": "single"
+        },
+        "mapping_override": false,
+        "purpose": "rtpose_validation_bundle",
+        "real_radar_frame_id": "000020",
+        "real_radar_time_s": 2.0,
+        "selection_note": "",
+        "source": "RT-Pose Train.json pose-frame to Radar_frameID mapping",
+        "source_frame_id": "000056",
+        "source_lidar_valid": 0,
+        "source_radar_frame_id": "000020",
+        "source_radar_time_s": 2.0,
+        "source_smpl_index": 18,
+        "source_smpl_time_s": 1.8,
+        "pose_to_real_radar_time_offset_s": 0.19999999999999996
+      }
+    }
+  ]
+}

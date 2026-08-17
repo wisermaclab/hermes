@@ -1,0 +1,11 @@
+{
+  "metadata": {
+    "source": "tools/bundle_prepare/rtpose/prepare_rtpose_bundle.py",
+    "format": "mmwave_validation_environment"
+  },
+  "scene_path": "environment_geometry/environment_scene.xml",
+  "geometry_outputs": {
+    "geometry_source": "dataset_cache",
+    "scene_path": "environment_geometry/environment_scene.xml"
+  }
+}

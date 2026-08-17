@@ -1,0 +1,119 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/wisermaclab/hermes/validation/schema/sensor.schema.json",
+  "title": "HERMES Bundle v1 sensor",
+  "type": "object",
+  "properties": {
+    "board_model": {"type": "string", "minLength": 1},
+    "hardware_model": {"type": "string", "minLength": 1},
+    "name": {"type": "string", "minLength": 1},
+    "pattern_mode": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Directional response: digitized, none/omnidirectional, or cosine."
+    },
+    "cosine_3db_beamwidth_deg": {
+      "type": "number",
+      "exclusiveMinimum": 0,
+      "exclusiveMaximum": 180,
+      "description": "Full power-pattern 3 dB beamwidth for cosine mode."
+    },
+    "virtual_channel_order": {
+      "type": "string",
+      "enum": ["tx_major", "rx_major"]
+    },
+    "tx_indices_zero_based": {
+      "type": "array",
+      "items": {"type": "integer", "minimum": 0},
+      "minItems": 1,
+      "uniqueItems": true,
+      "description": "Zero-based Tx element indices selected from the named board."
+    },
+    "rx_indices_zero_based": {
+      "type": "array",
+      "items": {"type": "integer", "minimum": 0},
+      "minItems": 1,
+      "uniqueItems": true,
+      "description": "Zero-based Rx element indices selected from the named board."
+    },
+    "tx_power_dbm": {"type": "number"},
+    "position": {"$ref": "#/$defs/vector3"},
+    "orientation": {"$ref": "#/$defs/vector3"},
+    "orientation_deg": {
+      "$ref": "#/$defs/vector3",
+      "description": "Optional degree-valued mirror of orientation."
+    },
+    "radar": {
+      "type": "object",
+      "properties": {
+        "position": {"$ref": "#/$defs/vector3"},
+        "orientation": {"$ref": "#/$defs/vector3"},
+        "name": {"type": "string"},
+        "tx_power_dbm": {"type": "number"}
+      },
+      "additionalProperties": true
+    },
+    "fmcw_profile": {"type": "string", "minLength": 1},
+    "profile": {"type": "string", "minLength": 1},
+    "fmcw": {
+      "type": "object",
+      "required": [
+        "slope_hz_per_s",
+        "num_adc_samples",
+        "num_chirps_per_frame",
+        "frame_period_s"
+      ],
+      "properties": {
+        "carrier_frequency_hz": {"type": "number", "exclusiveMinimum": 0},
+        "center_frequency_hz": {"type": "number", "exclusiveMinimum": 0},
+        "start_frequency_hz": {"type": "number", "exclusiveMinimum": 0},
+        "bandwidth_hz": {"type": "number", "exclusiveMinimum": 0},
+        "slope_hz_per_s": {"type": "number"},
+        "chirp_duration_s": {"type": "number", "exclusiveMinimum": 0},
+        "ramp_time_s": {"type": "number", "exclusiveMinimum": 0},
+        "chirp_repetition_time_s": {"type": "number", "exclusiveMinimum": 0},
+        "sampling_frequency_hz": {"type": "number", "exclusiveMinimum": 0},
+        "num_adc_samples": {"type": "integer", "minimum": 1},
+        "num_chirps_per_frame": {"type": "integer", "minimum": 1},
+        "frame_period_s": {"type": "number", "exclusiveMinimum": 0},
+        "num_tx": {"type": "integer", "minimum": 1},
+        "tdm_enabled": {
+          "type": "boolean",
+          "default": false,
+          "description": "True when each Tx occupies a consecutive physical chirp slot; false when all selected Tx channels are simultaneous."
+        }
+      },
+      "additionalProperties": true
+    },
+    "metadata": {"type": "object"}
+  },
+  "allOf": [
+    {
+      "anyOf": [
+        {"required": ["board_model"]},
+        {"required": ["hardware_model"]}
+      ]
+    },
+    {
+      "anyOf": [
+        {"required": ["fmcw"]},
+        {"required": ["fmcw_profile"]},
+        {"required": ["profile"]}
+      ]
+    }
+  ],
+  "$defs": {
+    "vector3": {
+      "type": "array",
+      "prefixItems": [
+        {"type": "number"},
+        {"type": "number"},
+        {"type": "number"}
+      ],
+      "items": false,
+      "minItems": 3,
+      "maxItems": 3
+    }
+  },
+  "additionalProperties": true
+}

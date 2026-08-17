@@ -1,0 +1,849 @@
+{
+  "generator": "internal/public_release/export_public_tree.py",
+  "managed_files": [
+    {
+      "mode": "100644",
+      "path": ".gitignore",
+      "sha256": "cd5152a434bfffeac3a1a2e3a95cf1d86b096b9e751c18e38fcc5a66235b1cc1"
+    },
+    {
+      "mode": "100644",
+      "path": "CHANGELOG.md",
+      "sha256": "8bb5077b902714d70a29fc9ae71be51216e7a98016fb1cc508e908860f065dc2"
+    },
+    {
+      "mode": "100644",
+      "path": "COMMERCIAL-LICENSING.md",
+      "sha256": "dcd1f0cb5968272a7d21af4f075c892797e1948031bb2287091ae1ba07f090a0"
+    },
+    {
+      "mode": "100644",
+      "path": "CONTRIBUTING.md",
+      "sha256": "3faaa4ea7c84e2a3f5fbb818cd504bb6f49a40ce71b86c0a4d8fde3bbadb3df5"
+    },
+    {
+      "mode": "100644",
+      "path": "LICENSE",
+      "sha256": "c0ea4a896d2c8c394b29f9427589996db826cd501c512279ff0ed3ef48fabbe5"
+    },
+    {
+      "mode": "100644",
+      "path": "LICENSE-DOCS-DATA",
+      "sha256": "3711f963c05d0be80d53e5923308a6dee31b203da23435c9cfb7c7b6e4dd5e19"
+    },
+    {
+      "mode": "100644",
+      "path": "NOTICE",
+      "sha256": "ef782ce62acfa4d559109d3bdddde7191b82d51191a84a2e56fae3bce79633b0"
+    },
+    {
+      "mode": "100644",
+      "path": "README.md",
+      "sha256": "f725c48476950f1339e84eedd46acd11aa5a5a731357a28e742bd619ad102b03"
+    },
+    {
+      "mode": "100644",
+      "path": "THIRD_PARTY_NOTICES.md",
+      "sha256": "4356c1c79c9b82831741d7a1f39d333ee87c5a86fc58a6cec9a19e3cf25df29c"
+    },
+    {
+      "mode": "100644",
+      "path": "benchmarks/README.md",
+      "sha256": "c27567aac9f7d85c20404041872c46f856bd8bd418a153115868acd20c130181"
+    },
+    {
+      "mode": "100644",
+      "path": "benchmarks/human_only_rt_po_range_profile/run.py",
+      "sha256": "bd182a0bfc9d7e081659e935917ecd79b5bd9edbddcbce43f55a292578c72d18"
+    },
+    {
+      "mode": "100644",
+      "path": "benchmarks/human_po/run.py",
+      "sha256": "5aa628353c9186fbe939269bbe277906b793759a0d03d1ff8dc3c97ec847c1ef"
+    },
+    {
+      "mode": "100644",
+      "path": "benchmarks/human_rt/run.py",
+      "sha256": "d86fe0e1064cf03a2609fa71ea678191baec2e9edab821d3d4f1925ff6ec9934"
+    },
+    {
+      "mode": "100644",
+      "path": "data/AMASS/README.md",
+      "sha256": "2e27f06103b99188e4818d1716f60ee017d1651cbbf8b216fc8c7fb380f83ad1"
+    },
+    {
+      "mode": "100644",
+      "path": "data/AMASS/walking_poses_cmu_105_02.npz",
+      "sha256": "a978f1b6dcd349e358cce922c767a07bf7bf86d044bcbf10a071945fe55d2c12"
+    },
+    {
+      "mode": "100644",
+      "path": "data/validation_bundles/README.md",
+      "sha256": "2b811ae1a46746322ee5b7e66d1a4ec18cf95249ea17b9ff839bc8a8af8bd80a"
+    },
+    {
+      "mode": "100644",
+      "path": "data/validation_bundles/mmradarpose_p1_an0_ac4_r0_frame0240/NOTICE.md",
+      "sha256": "a5d6b4d839cfe087ee8c9fd00e64b8adad017be9cf15e3f665440f9876d0732f"
+    },
+    {
+      "mode": "100644",
+      "path": "data/validation_bundles/mmradarpose_p1_an0_ac4_r0_frame0240/README.md",
+      "sha256": "8c075f211f8cd97b3041aad0ae8a9529b2a7d7676563e6eb365d2ee7946af1ba"
+    },
+    {
+      "mode": "100644",
+      "path": "data/validation_bundles/mmradarpose_p1_an0_ac4_r0_frame0240/amass_sequence.npz",
+      "sha256": "12adb7141396c4d0a1e872a50fe88cd2b8fe8c2550349115ada5cb9e240667f7"
+    },
+    {
+      "mode": "100644",
+      "path": "data/validation_bundles/mmradarpose_p1_an0_ac4_r0_frame0240/benchmark_metadata.json",
+      "sha256": "479db1a8b135cebbb0f19b2bee076b840edfe6534197d23586dddc71de95b3c8"
+    },
+    {
+      "mode": "100644",
+      "path": "data/validation_bundles/mmradarpose_p1_an0_ac4_r0_frame0240/bundle.json",
+      "sha256": "18e936f6561efe5cf6da75c155a351e1a5ab6314dc2a5832c0ed872864acd824"
+    },
+    {
+      "mode": "100644",
+      "path": "data/validation_bundles/mmradarpose_p1_an0_ac4_r0_frame0240/environment.json",
+      "sha256": "4701098d862d8f460a7bb13a5077b47ba768b992e06dbfef6cab4a28e87ea58a"
+    },
+    {
+      "mode": "100644",
+      "path": "data/validation_bundles/mmradarpose_p1_an0_ac4_r0_frame0240/frames.json",
+      "sha256": "b66986c44cf4449b0554410f6fece28888e25cf340649856335bd979a34d8107"
+    },
+    {
+      "mode": "100644",
+      "path": "data/validation_bundles/mmradarpose_p1_an0_ac4_r0_frame0240/radar_adc.npz",
+      "sha256": "eefd8c82ffc87a9f2338ad77c049f8f347ce8e63256132d620d4ce4953044e0c"
+    },
+    {
+      "mode": "100644",
+      "path": "data/validation_bundles/mmradarpose_p1_an0_ac4_r0_frame0240/sensor.json",
+      "sha256": "78e5935e2f419df4770d083166565b6facf746e75da7111ea3dd9c5e78a7f59a"
+    },
+    {
+      "mode": "100644",
+      "path": "data/validation_bundles/rtpose_seq10_frame0020/NOTICE.md",
+      "sha256": "31bc6dd07a41438423d3cf81ee153c08aa6f53c1a6e169e0d869c053e4edeb78"
+    },
+    {
+      "mode": "100644",
+      "path": "data/validation_bundles/rtpose_seq10_frame0020/README.md",
+      "sha256": "3ade605620a033f5efcd18e3a9f468defe5df00c315c359a118fa8baca5743a7"
+    },
+    {
+      "mode": "100644",
+      "path": "data/validation_bundles/rtpose_seq10_frame0020/amass_sequence.npz",
+      "sha256": "f593dbf12f2013f2c7b4dcda9605788149ba052b388afef887dd39b6e64fcc92"
+    },
+    {
+      "mode": "100644",
+      "path": "data/validation_bundles/rtpose_seq10_frame0020/benchmark_metadata.json",
+      "sha256": "a091d13894bea61c9844933d16828ea0c7f88bb451aa36181f36aad0f03885ce"
+    },
+    {
+      "mode": "100644",
+      "path": "data/validation_bundles/rtpose_seq10_frame0020/bundle.json",
+      "sha256": "18e936f6561efe5cf6da75c155a351e1a5ab6314dc2a5832c0ed872864acd824"
+    },
+    {
+      "mode": "100644",
+      "path": "data/validation_bundles/rtpose_seq10_frame0020/camera/left/000056_face_occluded.png",
+      "sha256": "aa7edd6849e7f660cb707cbc17262ec47909424a858b0e3ec725ae5c3ce0bb8a"
+    },
+    {
+      "mode": "100644",
+      "path": "data/validation_bundles/rtpose_seq10_frame0020/camera/right/000056_face_occluded.png",
+      "sha256": "d9bb4ad251ec427fcb61a4507a141c48f4a4005821ec847c7e241da3dcb2d0a6"
+    },
+    {
+      "mode": "100644",
+      "path": "data/validation_bundles/rtpose_seq10_frame0020/environment.json",
+      "sha256": "3d497ed4fc3a09f87233ea46a2e78a9c8c3662880a58c65fee24f3206c75040c"
+    },
+    {
+      "mode": "100644",
+      "path": "data/validation_bundles/rtpose_seq10_frame0020/environment_geometry/environment_scene.xml",
+      "sha256": "e7679c6821ebb88204c8b65cb07593b0e79ad9d5c175dd61dc65a35697ad8704"
+    },
+    {
+      "mode": "100644",
+      "path": "data/validation_bundles/rtpose_seq10_frame0020/frames.json",
+      "sha256": "7a3749ca68ef8501f7f225c6523456640e8586016f351d250fbe3cbd974305ee"
+    },
+    {
+      "mode": "100644",
+      "path": "data/validation_bundles/rtpose_seq10_frame0020/radar_adc.npz",
+      "sha256": "7d2600a8401e58f8fbb062eedd973f1fcad0fc5709fe8e173a2ff89abc1835dd"
+    },
+    {
+      "mode": "100644",
+      "path": "data/validation_bundles/rtpose_seq10_frame0020/sensor.json",
+      "sha256": "6feb411636d3655af1b3ac664339cc4bacf8c2d4e67ced94b9e76f32f0be269d"
+    },
+    {
+      "mode": "100644",
+      "path": "demo/Full-RT.ipynb",
+      "sha256": "b6ad9fbfb05670d7f51863e891f68eddb7d5d40c349cc8b399ed4a8deed76348"
+    },
+    {
+      "mode": "100644",
+      "path": "demo/Human-Only-PO.ipynb",
+      "sha256": "fc5a7c88ff26f755e17524128263efad1c930ad009653e804d039b68f5f23371"
+    },
+    {
+      "mode": "100644",
+      "path": "demo/Hybrid-PO.ipynb",
+      "sha256": "db8cd4a00eaf0f18c975997c131171f67eb059f3c314876e1a2277b4895b6ef4"
+    },
+    {
+      "mode": "100644",
+      "path": "demo/Point-Targets.ipynb",
+      "sha256": "b2765883c0983826b549850e814764a56a35731fa3dc63299752a2fed41408c5"
+    },
+    {
+      "mode": "100644",
+      "path": "demo/README.md",
+      "sha256": "620f4b451029888021cfea2a035b6f0447407876692354451de636c37d0a9cf5"
+    },
+    {
+      "mode": "100644",
+      "path": "docs/api/index.html",
+      "sha256": "3b833065eb78420b1952a899d6147b205ef31953eae12df4242ddb9a0cd60a4d"
+    },
+    {
+      "mode": "100644",
+      "path": "pyproject.toml",
+      "sha256": "1d59f0f6250ca0fb94260458e8a28dec37ec433718159a3966761bcd84c50bf9"
+    },
+    {
+      "mode": "100644",
+      "path": "src/mmWaveRadar/__init__.py",
+      "sha256": "ac4e122941f0a93e078b78e1718792f16a525c64e62318bc72770de972f2cae5"
+    },
+    {
+      "mode": "100644",
+      "path": "src/mmWaveRadar/diagnostics/__init__.py",
+      "sha256": "d044a3b251924208eed00007fbb115d7b11d36c4963ba5cb894a64632a384888"
+    },
+    {
+      "mode": "100644",
+      "path": "src/mmWaveRadar/diagnostics/radial_velocity_geometry.py",
+      "sha256": "23580565d68fa56673bd4007fc34bd6c4b2194e4aede0413223c2df9481eb56d"
+    },
+    {
+      "mode": "100644",
+      "path": "src/mmWaveRadar/dsp/__init__.py",
+      "sha256": "1efe8e8a26c26cec82c93f21fa7d05269a6ccf9040074b1c14cf082b103c4f10"
+    },
+    {
+      "mode": "100644",
+      "path": "src/mmWaveRadar/dsp/angle.py",
+      "sha256": "345b4c94a10c48fe1409d782d74508a82df1644319858eae0992698aa00ec202"
+    },
+    {
+      "mode": "100644",
+      "path": "src/mmWaveRadar/dsp/array_processing.py",
+      "sha256": "f1a2036980b6be7999417b8e1e150d1305584c75b2cbbf963fa6a3eab23bd0f2"
+    },
+    {
+      "mode": "100644",
+      "path": "src/mmWaveRadar/dsp/cfar.py",
+      "sha256": "1a1aef84d1812eac34d90e93383190d53da4bae6c380fc5b4ad2a7632797974a"
+    },
+    {
+      "mode": "100644",
+      "path": "src/mmWaveRadar/dsp/clutter.py",
+      "sha256": "70231415a12124ca7af45772de24af84745574af13493f25676288d940bc96f2"
+    },
+    {
+      "mode": "100644",
+      "path": "src/mmWaveRadar/dsp/constants.py",
+      "sha256": "73ca632ec45accded9440dd48cf9401b5adc0d478aed96a8f8355b04e805abb7"
+    },
+    {
+      "mode": "100644",
+      "path": "src/mmWaveRadar/dsp/doppler.py",
+      "sha256": "692e37f2db158e579d265a74ec285d86b825ba28db381ee00c6cb14d989a3207"
+    },
+    {
+      "mode": "100644",
+      "path": "src/mmWaveRadar/dsp/fft.py",
+      "sha256": "c86d8c33d9ea143bdfae5e20a629bf5ce7f5e22f0a0cb697a307dae464c8edeb"
+    },
+    {
+      "mode": "100644",
+      "path": "src/mmWaveRadar/dsp/imaging.py",
+      "sha256": "722b4bbe5cd28e2569670d7061fbff70566f82da3eac9d64afdacc07e0622152"
+    },
+    {
+      "mode": "100644",
+      "path": "src/mmWaveRadar/dsp/point_cloud.py",
+      "sha256": "fe4e665f594964e9d3afa4f90230ed913dc259827f7cada8d1d4e36c91b31c2b"
+    },
+    {
+      "mode": "100644",
+      "path": "src/mmWaveRadar/dsp/power.py",
+      "sha256": "e20e9d591579fe23f02f9a3294695dd8aa3e0aed88e42623255f3e125ca515e0"
+    },
+    {
+      "mode": "100644",
+      "path": "src/mmWaveRadar/dsp/profiles.py",
+      "sha256": "3fb4878749c9436ec7667b5ddafeead0f8eb727fbc8bcf115fbd02a7612ce030"
+    },
+    {
+      "mode": "100644",
+      "path": "src/mmWaveRadar/dsp/visualization.py",
+      "sha256": "6978dfae0e7e74625fe32039495081680bda91273574b5f4011fb209e179c7a5"
+    },
+    {
+      "mode": "100644",
+      "path": "src/mmWaveRadar/dsp/window.py",
+      "sha256": "83ea95f473577ce19aa4a434cbf99563467a7aeb39c63048bc0eb9dab504a90d"
+    },
+    {
+      "mode": "100644",
+      "path": "src/mmWaveRadar/experiments/__init__.py",
+      "sha256": "7f31686233df118dca316801292f7b494a4eb045e27616439677993868a8c887"
+    },
+    {
+      "mode": "100644",
+      "path": "src/mmWaveRadar/experiments/human_room.py",
+      "sha256": "41b08740a4aae47b9b43df9e102c999384e705ffda4a88081dd51af314108abe"
+    },
+    {
+      "mode": "100644",
+      "path": "src/mmWaveRadar/experiments/manifest.py",
+      "sha256": "3e9e8f0de892f76ec3576efd4827a5675388c40eed67d2c537b56725a7e224b1"
+    },
+    {
+      "mode": "100644",
+      "path": "src/mmWaveRadar/experiments/physics_microscope.py",
+      "sha256": "9ad44d8b14255b02e148659a346837d76717bd88287e1983c95b8df82e11ab76"
+    },
+    {
+      "mode": "100644",
+      "path": "src/mmWaveRadar/experiments/solver_diagnostics.py",
+      "sha256": "04c218af586a6050b4e73f63b3130d6d2fdfb1ccc407f61ab2778854900af40e"
+    },
+    {
+      "mode": "100644",
+      "path": "src/mmWaveRadar/gui/__init__.py",
+      "sha256": "621e3b8bedbc687b91982739ffa028141c20125e6df19f1ce251b6778ff4f10d"
+    },
+    {
+      "mode": "100644",
+      "path": "src/mmWaveRadar/gui/app.py",
+      "sha256": "ac44a779f777cce0ebfc3219571e0b08aa0992653cc1361b3da98ea8d9027be7"
+    },
+    {
+      "mode": "100644",
+      "path": "src/mmWaveRadar/gui/cli.py",
+      "sha256": "c649a3077950c1b862ba013fc2de5a93be2d5c98b59a0115998fdc3b5df1b1f9"
+    },
+    {
+      "mode": "100644",
+      "path": "src/mmWaveRadar/materials/__init__.py",
+      "sha256": "d095ddfc329256d0591388c96944266d3e16d24624505be552f8987336863d79"
+    },
+    {
+      "mode": "100644",
+      "path": "src/mmWaveRadar/materials/human.py",
+      "sha256": "999c9d91cbb4192f92ee685d4856e114e0eec02ee3bed3cad4e2064f26036daf"
+    },
+    {
+      "mode": "100644",
+      "path": "src/mmWaveRadar/materials/physical_optics.py",
+      "sha256": "0aa47ec8aff9d5039e5fb89d5e6a2e956e8a89602b18c84d0bc604d742d7f4b9"
+    },
+    {
+      "mode": "100644",
+      "path": "src/mmWaveRadar/measurements.py",
+      "sha256": "4a8198713aff73a0f34ef1b9a686e9711e1d6947f4179f6d0637788ff45304f3"
+    },
+    {
+      "mode": "100644",
+      "path": "src/mmWaveRadar/radar/__init__.py",
+      "sha256": "c870ca819f222d27443e51da508ec86fadf6b357f1356cbdf421c9659d4af205"
+    },
+    {
+      "mode": "100644",
+      "path": "src/mmWaveRadar/radar/fmcw.py",
+      "sha256": "c72b9cf9e5fa7434829d4cc55765bca59f985068a26088e292642cce4268effb"
+    },
+    {
+      "mode": "100644",
+      "path": "src/mmWaveRadar/radar/hardware.py",
+      "sha256": "8152d12a811a542b4adbc797d938e40b887baa11d85fcb7b28ede66382c528ea"
+    },
+    {
+      "mode": "100644",
+      "path": "src/mmWaveRadar/radar/sensor.py",
+      "sha256": "ca638b51364bff9c6d17a476433795471e3a9ef88f9fbc281b296b16962ece32"
+    },
+    {
+      "mode": "100644",
+      "path": "src/mmWaveRadar/radar/ti.py",
+      "sha256": "f2fa91b46624d34979155e87fd60c85b0a31f778ac8b09753f340ed9e85899c1"
+    },
+    {
+      "mode": "100644",
+      "path": "src/mmWaveRadar/simulation/__init__.py",
+      "sha256": "427561d8dea6cf1b1b79434bc3dc64dcd17921710d1c7739c867cfa46449e772"
+    },
+    {
+      "mode": "100644",
+      "path": "src/mmWaveRadar/simulation/adc_synthesis.py",
+      "sha256": "89bda9b14eadf7ede35964381bd6a84b8fb2e35107a6cdfb9d684682de20fb16"
+    },
+    {
+      "mode": "100644",
+      "path": "src/mmWaveRadar/simulation/calibration.py",
+      "sha256": "700378ffaea116d50df167cae4cb095e8251c2f98b55ae23de20c58e84f7b281"
+    },
+    {
+      "mode": "100644",
+      "path": "src/mmWaveRadar/simulation/channel_gain.py",
+      "sha256": "44b951ad3afac96a96b51dac7fdfa557317f492232ad690c4c88069f8a184061"
+    },
+    {
+      "mode": "100644",
+      "path": "src/mmWaveRadar/simulation/env_human_coupling.py",
+      "sha256": "3de4b0aac91fd475157990d6849fcf94cc4682e038c88ce43dcfeb25ad4754ee"
+    },
+    {
+      "mode": "100644",
+      "path": "src/mmWaveRadar/simulation/hybrid_pipeline.py",
+      "sha256": "30cf40b34da59d8067ccad9136dcad23feefdb684b9ae08f75424c4de83b31b1"
+    },
+    {
+      "mode": "100644",
+      "path": "src/mmWaveRadar/simulation/motion_diagnostics.py",
+      "sha256": "091c56ceb382f7e3a5822bcbc001e035ebc3ba0ab85e88e94f5d42ad2a1631b5"
+    },
+    {
+      "mode": "100644",
+      "path": "src/mmWaveRadar/simulation/path_filters.py",
+      "sha256": "28c72feb588065374e50ec0c1b62716d416da747bc837bababeaafd84191be55"
+    },
+    {
+      "mode": "100644",
+      "path": "src/mmWaveRadar/simulation/physical_optics.py",
+      "sha256": "4cca5d5a88b278d08deb0187059ed7c2a5abb3795201fd8d1fd60ae364930844"
+    },
+    {
+      "mode": "100644",
+      "path": "src/mmWaveRadar/simulation/po_profile.py",
+      "sha256": "798ea0e673669879285eaf10424871cb71f93e6f716e63b248f159498c5b7e42"
+    },
+    {
+      "mode": "100644",
+      "path": "src/mmWaveRadar/simulation/point_targets.py",
+      "sha256": "3bedf47f6d039bbd3e9e2c1f0836b17c8c33c6f76002827dc9b22dc64dd5de99"
+    },
+    {
+      "mode": "100644",
+      "path": "src/mmWaveRadar/simulation/rt_coherence.py",
+      "sha256": "1d187bdf33e813ff07d8ae2621149fb83d81cf053b795a2709e0239a2c804ea0"
+    },
+    {
+      "mode": "100644",
+      "path": "src/mmWaveRadar/simulation/rt_schedule_profile.py",
+      "sha256": "1c884187ea624ad53c59adcdc6ab1cc5e6e9c97ab62866b981cdbb441269a312"
+    },
+    {
+      "mode": "100644",
+      "path": "src/mmWaveRadar/simulation/runtime.py",
+      "sha256": "3cc54ac16c26e38cc80b1e96276d90271f3d9dc1a823327ed08d7122c044cb1c"
+    },
+    {
+      "mode": "100644",
+      "path": "src/mmWaveRadar/simulation/simulator.py",
+      "sha256": "721fc56048d7a40d2a622bb24ed29f815c984fdcefca2e338c8f633d645380a8"
+    },
+    {
+      "mode": "100644",
+      "path": "src/mmWaveRadar/simulation/static_blocking.py",
+      "sha256": "e1cec42a0581930d161edf575a6045f7f31bdb84cb2e7a7376b2655fb9e67706"
+    },
+    {
+      "mode": "100644",
+      "path": "src/mmWaveRadar/simulation/tdm.py",
+      "sha256": "d9cdf98021f15eae5e1d99c1ca875ab8eccf52f3dbc78dce565de5695212737a"
+    },
+    {
+      "mode": "100644",
+      "path": "src/mmWaveRadar/simulation/types.py",
+      "sha256": "c1bb0210282207b4c02641abf137cbba4da45d333fbe9e158651cf39e1678170"
+    },
+    {
+      "mode": "100644",
+      "path": "src/mmWaveRadar/smpl.py",
+      "sha256": "cd6541590f723700fcf7928f02ccde9fe05722a96cdd79521e3a2b9b9b0b2570"
+    },
+    {
+      "mode": "100644",
+      "path": "src/mmWaveRadar/targets/__init__.py",
+      "sha256": "e676a5bf208ac9db4d51d3fa99aafe57e8071aa1c8f112a3994f1aeb352c931d"
+    },
+    {
+      "mode": "100644",
+      "path": "src/mmWaveRadar/targets/mesh.py",
+      "sha256": "073b491c21e0c1b5ecc4bd674b5d61769d312729709cb600f3a1138569a11231"
+    },
+    {
+      "mode": "100644",
+      "path": "src/mmWaveRadar/targets/smpl.py",
+      "sha256": "599d2ff00ad66c83c20e55bd73519a955cd74e67f9460921a7c483c0d16ed24f"
+    },
+    {
+      "mode": "100644",
+      "path": "src/mmWaveRadar/tutorial_support.py",
+      "sha256": "442d51e35951d5c2f4c7234dcb7a10996d0d3603a2d7719ac2ad12196dde31d3"
+    },
+    {
+      "mode": "100644",
+      "path": "src/mmWaveRadar/visualization.py",
+      "sha256": "778bd5d62111af2c8987fff3cd62687f5946994f834c24794d10839a80670d96"
+    },
+    {
+      "mode": "100644",
+      "path": "tests/unit/sensing_test_helpers.py",
+      "sha256": "a5e0de8598ab66fef0cb9ee273bf160562646b74874670295051bed20647fda4"
+    },
+    {
+      "mode": "100644",
+      "path": "tests/unit/test_bundle_integrity.py",
+      "sha256": "1702e1c131a173c220d28d96ee3d3792e1bcc5b49ca05252985c0a4ff7a13ca4"
+    },
+    {
+      "mode": "100644",
+      "path": "tests/unit/test_bundle_mesh.py",
+      "sha256": "5197cfc3e6570311c7dc99e7844d7073fb36a998e20a706fff81bafac69bd9b9"
+    },
+    {
+      "mode": "100644",
+      "path": "tests/unit/test_bundle_prepare_tools.py",
+      "sha256": "4f7ea146208a28c1b1fb2b5a572ed7f2204084c9c96e4d7bdbdab452d04e687c"
+    },
+    {
+      "mode": "100644",
+      "path": "tests/unit/test_dsp_power.py",
+      "sha256": "ef03f544a79dc1540d61a372d1aded20bd365921611858aa8d9bdcec8ad2bcc7"
+    },
+    {
+      "mode": "100644",
+      "path": "tests/unit/test_dsp_profiles.py",
+      "sha256": "be5d1b9c73600830e3ef509d6a7076f8ae899631235ea06de7202be869cf955e"
+    },
+    {
+      "mode": "100644",
+      "path": "tests/unit/test_dsp_visualization.py",
+      "sha256": "d93cb84886ff401bfc3fc227bd79bd15e3b8b994655b326d742c2c9ea5b45896"
+    },
+    {
+      "mode": "100644",
+      "path": "tests/unit/test_experiment_manifest.py",
+      "sha256": "50e82fa469d32bae62c7674022c653d3091ff3746584287759111512d8ac4f92"
+    },
+    {
+      "mode": "100644",
+      "path": "tests/unit/test_gui_app.py",
+      "sha256": "fe2fc978212c0b8a3365fc4572213d02da59a3c0ff5aa5f7b60cbc5bff5dfa43"
+    },
+    {
+      "mode": "100644",
+      "path": "tests/unit/test_measurements_gui_api.py",
+      "sha256": "53d9ad76abbf1be24025e74228c94d56cbe06f38a7f1e2b6615b20c86e6d3ef3"
+    },
+    {
+      "mode": "100644",
+      "path": "tests/unit/test_mmradarpose_release_tools.py",
+      "sha256": "11e00afcb8156e04690dbf913396a9e8ab619f10e6aa09dfd438f65784baf7bc"
+    },
+    {
+      "mode": "100644",
+      "path": "tests/unit/test_mmwave_dsp.py",
+      "sha256": "d8fe3c37cdeffc682c557fc43426f122ab35c689b3432a3869379ebad352a8dd"
+    },
+    {
+      "mode": "100644",
+      "path": "tests/unit/test_mmwave_smpl.py",
+      "sha256": "4b9582086fb8aa49db0ab014e920e299992ffaf687ab5a3a7efbd52fdc577ad7"
+    },
+    {
+      "mode": "100644",
+      "path": "tests/unit/test_motion_defaults.py",
+      "sha256": "d8dbb3cded704d8afbae82f49d2f1e0f3bfd0a23c03b2d0a841254185da59cde"
+    },
+    {
+      "mode": "100644",
+      "path": "tests/unit/test_physics_microscope.py",
+      "sha256": "c125f5f9652a41859fc7c96dbba2c0a4b8abe508c53527a7a111a96649e7d1fa"
+    },
+    {
+      "mode": "100644",
+      "path": "tests/unit/test_point_targets.py",
+      "sha256": "835bfcaedf97febc459da2e0ef30b41a7db6298702ac7bd2ef246dc783645bab"
+    },
+    {
+      "mode": "100644",
+      "path": "tests/unit/test_radar_configuration.py",
+      "sha256": "8d1c0736bfca798f0135a5b3da72f287ade1cb55eac8d4a4d3a2c50d9b88a74a"
+    },
+    {
+      "mode": "100644",
+      "path": "tests/unit/test_radial_velocity_diagnostic.py",
+      "sha256": "e025e30f5ee5d2ed4cf945daee9cb9cf4cf79bcdfb780512d3ba95f6f34f8b88"
+    },
+    {
+      "mode": "100644",
+      "path": "tests/unit/test_release_hygiene.py",
+      "sha256": "13343b019d4f1778d3fc90640b3d2ee763c360e039c3a317177c9baab92c33a5"
+    },
+    {
+      "mode": "100644",
+      "path": "tests/unit/test_rt_schedule_profile.py",
+      "sha256": "5c552fabfb7213fb5a34badf1ae65fff323a0618e7d41eb0882dc5cfef06874b"
+    },
+    {
+      "mode": "100644",
+      "path": "tests/unit/test_rtpose_sparse_fit_bundle.py",
+      "sha256": "e1e90a20173d6b9537d28152f04c777483f3a98b30fc7ed4522ac23e69d6d89f"
+    },
+    {
+      "mode": "100644",
+      "path": "tests/unit/test_safe_npz.py",
+      "sha256": "e07423a77701ffa4730dedf7f2936818f6d209749af01f49d854672d12249d43"
+    },
+    {
+      "mode": "100644",
+      "path": "tests/unit/test_sensing.py",
+      "sha256": "e991ec1993f24910bd0e6a543e4c8f2d4a27cb34eb1b2eff4f3e42cbb48600c0"
+    },
+    {
+      "mode": "100644",
+      "path": "tests/unit/test_sensing_core.py",
+      "sha256": "d4181e2a4743cb8f9215f3776145f6fd5f244ba22dbfc4a0d71358b84ead9e8b"
+    },
+    {
+      "mode": "100644",
+      "path": "tests/unit/test_sensing_human_po.py",
+      "sha256": "737e429227b52428d858e44d64e0f1566b454f3f3faa73e3f76e2bf3b30c814e"
+    },
+    {
+      "mode": "100644",
+      "path": "tests/unit/test_sensing_hybrid_po.py",
+      "sha256": "78dfb00f577d2c4c902568297ccc252eacba816ffa4edc12840d76d113853fe0"
+    },
+    {
+      "mode": "100644",
+      "path": "tests/unit/test_sensing_motion_calibration.py",
+      "sha256": "dcc9e526d4f767dfbc2ab3a70bc11e0ce8426f2796271479c515948b40d8345e"
+    },
+    {
+      "mode": "100644",
+      "path": "tests/unit/test_sensing_physical_optics.py",
+      "sha256": "78bfd339a32ef809bbc18a6312be8f06193a555b17b411467386c69cd5355209"
+    },
+    {
+      "mode": "100644",
+      "path": "tests/unit/test_sensing_po_profile.py",
+      "sha256": "7a6726a0028784b51c5eab39bc77a3ac866095d4a319821dcee2f857ca8eac22"
+    },
+    {
+      "mode": "100644",
+      "path": "tests/unit/test_sensing_rt_coherence.py",
+      "sha256": "06953dee895bf61af98edcf76afd016750dec63b071e05bc8b9da90c0a28af06"
+    },
+    {
+      "mode": "100644",
+      "path": "tests/unit/test_sensing_static_blocking.py",
+      "sha256": "ffa5fe5a5bddeae170a60b43a60edd4d1ab566572fcfbb9a0e24819dfae2423f"
+    },
+    {
+      "mode": "100644",
+      "path": "tests/unit/test_simulation_imports.py",
+      "sha256": "33b200b2c345a88e74ec7b38c83d56391e02dce545a27b48e590918da2b6b021"
+    },
+    {
+      "mode": "100644",
+      "path": "tests/unit/test_solver_diagnostics.py",
+      "sha256": "6164ce77f3d52ccae6efb4e57e7152a8e6bb0a4ffe93f2a48ac782294fbbdd10"
+    },
+    {
+      "mode": "100644",
+      "path": "tests/unit/test_tdm_timing.py",
+      "sha256": "afd2d4fd04a5bcdec8ab28cbaa39d675092fa11ed4c3b2b551f01c239ee71085"
+    },
+    {
+      "mode": "100644",
+      "path": "tests/unit/test_ti_radar_catalog.py",
+      "sha256": "6758e1b0ddf4d8a5d7715f47e5a98c069ae2d52e3ef5b7a48606fd33414e01b1"
+    },
+    {
+      "mode": "100644",
+      "path": "tests/unit/test_tutorial_support.py",
+      "sha256": "715351704bad61620a7b0bf46bd36eaf69c6d2c1db654e0303cb5bb7573dc777"
+    },
+    {
+      "mode": "100644",
+      "path": "tests/unit/test_validation_benchmarks.py",
+      "sha256": "5eab45543f1eb69d47b6de1f71acf3de446b6907d3d2ff7b2ac3b200f329be66"
+    },
+    {
+      "mode": "100644",
+      "path": "tools/amass_to_mesh_sequence.py",
+      "sha256": "4af2e3a28b04dd464c0a03177d752e9158e2a59ced2f19bc03fc232882998090"
+    },
+    {
+      "mode": "100644",
+      "path": "tools/bundle_prepare/README.md",
+      "sha256": "a19b7e30b20b3abcc1169801a5e99f85205a1f597f1464e5d44274d581d2ea66"
+    },
+    {
+      "mode": "100644",
+      "path": "tools/bundle_prepare/__init__.py",
+      "sha256": "08b222ec7294a4f4856963c0749d7790ed46ddf8efb6df39bda5420ed5970fa7"
+    },
+    {
+      "mode": "100644",
+      "path": "tools/bundle_prepare/_mesh.py",
+      "sha256": "49325e7ee07e034c1f8d9848d069e592ea818f35d837a216dd2a1f48720883f3"
+    },
+    {
+      "mode": "100644",
+      "path": "tools/bundle_prepare/contract.py",
+      "sha256": "5d0eb31a3304cb51e8647ea533031229988e0956556efeed34de8af5ac958b39"
+    },
+    {
+      "mode": "100644",
+      "path": "tools/bundle_prepare/integrity.py",
+      "sha256": "3ab07ed57c332c81b9d77f249c3f68604ee7f27fdad183d052fb3bd4965b3ffb"
+    },
+    {
+      "mode": "100644",
+      "path": "tools/bundle_prepare/mmradarpose/README.md",
+      "sha256": "36a189ed956f9933945bf8812a34aaab4b7498737b4d98c4fce0918c2dc07beb"
+    },
+    {
+      "mode": "100644",
+      "path": "tools/bundle_prepare/mmradarpose/mmradarpose_environment.py",
+      "sha256": "72098b27a176d72e6b7e3f99f6713b9fb8b8d1641ea793d6eba555c89c1a97b6"
+    },
+    {
+      "mode": "100644",
+      "path": "tools/bundle_prepare/mmradarpose/prepare_mmradarpose_bundle.py",
+      "sha256": "8cb9ed9e9279aaa80d3d4e0b29bd75f429650232fcf341823308382a779fa93e"
+    },
+    {
+      "mode": "100644",
+      "path": "tools/bundle_prepare/rtpose/README.md",
+      "sha256": "8a162a4a18d224e3acd627c6eda5a74e737f7c410b8792290fbbf8710982ae6c"
+    },
+    {
+      "mode": "100644",
+      "path": "tools/bundle_prepare/rtpose/fit_rtpose_environment_geometry.py",
+      "sha256": "4f8f35c476c6fa1c405b315f1114013cb41fbef95970ecb517177e2b7cfadee2"
+    },
+    {
+      "mode": "100644",
+      "path": "tools/bundle_prepare/rtpose/prepare_rtpose_bundle.py",
+      "sha256": "045e39d2b38431a52122d3320a76cd8fb0f66d458738cbb3088eb5d1845110fe"
+    },
+    {
+      "mode": "100644",
+      "path": "tools/bundle_prepare/rtpose/reconstruct_rtpose_background.py",
+      "sha256": "0f0e31dca892a3a685fc3ae0cc83e73ade46d53622c3be38448de8f129b24d03"
+    },
+    {
+      "mode": "100644",
+      "path": "tools/bundle_prepare/rtpose/rtpose_adc.py",
+      "sha256": "b4c9c207da5435d70db4447d33c0c1fd0d909d88ab14c457793e4aca88098cd3"
+    },
+    {
+      "mode": "100644",
+      "path": "tools/bundle_prepare/safe_npz.py",
+      "sha256": "e1b74520cbd46b14fba73b755d4b7c3ad7b0a31eaabcfe708077675cae48390e"
+    },
+    {
+      "mode": "100644",
+      "path": "tools/generate_api_docs.py",
+      "sha256": "c8757bceebdd143fcec76f336152802394fd2c2b76b93b424eb7c11a49c696df"
+    },
+    {
+      "mode": "100644",
+      "path": "tools/hybrid_po/run_calibrated_hybrid_po.py",
+      "sha256": "5fc3d8ac4fe28246e23c3ca90bf40f94ae8e17def1fb040e8e991f19bf0f05cf"
+    },
+    {
+      "mode": "100644",
+      "path": "tools/plot_ti_board_patterns.py",
+      "sha256": "1312257c94d91839a64a292b4c6d7e8cca13569b6b01e4f8d769ce02ce742ac9"
+    },
+    {
+      "mode": "100644",
+      "path": "validation/BUNDLE_SPEC.md",
+      "sha256": "dc3dcd0bb6a8a602c99f3beb2c9a708a126dfb45815b767a19968890da3897f6"
+    },
+    {
+      "mode": "100644",
+      "path": "validation/README.md",
+      "sha256": "51fbd19f909c32a098916354a3cab26d8cbafee64bb0039fdf9a514ab758912f"
+    },
+    {
+      "mode": "100644",
+      "path": "validation/__init__.py",
+      "sha256": "839bd1a7239bcbe8350ff2431ca8b90c7c78bbf8adc1e75c68ebe6bcb71ebaca"
+    },
+    {
+      "mode": "100644",
+      "path": "validation/cli.py",
+      "sha256": "9bfa8c27d563a141d405b5058730e3319e739aa1f820a240182e152f76c45225"
+    },
+    {
+      "mode": "100644",
+      "path": "validation/metrics.py",
+      "sha256": "096906e2922f238538dc36be40cf136288b197e10b0f81b4762c7b35df12e831"
+    },
+    {
+      "mode": "100644",
+      "path": "validation/results.py",
+      "sha256": "b4eaefc535de1869b0254645a1253b9966e44da2089386eba800d0ad8d23e71c"
+    },
+    {
+      "mode": "100644",
+      "path": "validation/runner.py",
+      "sha256": "07d734ed844a99e3ba4ab3f4c8e22696395ebffca5072f18d8f59ff7cea6112e"
+    },
+    {
+      "mode": "100644",
+      "path": "validation/schema/bundle.schema.json",
+      "sha256": "979d16e80f38f4e68fd7c96a0dc63d8c7af3096be74103436a9e21e8256d5ae5"
+    },
+    {
+      "mode": "100644",
+      "path": "validation/schema/environment.schema.json",
+      "sha256": "9158130b530c900b18a273fb39061746003d5914f5942d34f107d9b9eae18b04"
+    },
+    {
+      "mode": "100644",
+      "path": "validation/schema/frames.schema.json",
+      "sha256": "17b5a69852f8a7484a7193dc4d34a8722aeffc904b9030e6d3792bd141367ca9"
+    },
+    {
+      "mode": "100644",
+      "path": "validation/schema/sensor.schema.json",
+      "sha256": "4c5187fee768744c77059cf42e2c67c1bc1ab7fd85fcb9154dae9f929fcece74"
+    }
+  ],
+  "policy_sha256": "7e817e884d16e398732a2d6de6fb15a3b3ae8df0b07050d870887d3f5b7488c1",
+  "schema_version": 1,
+  "source_commit": "51165ac34dddff8b8d1af8c1ea40c31255af3846",
+  "tree_sha256": "a534f4111ccf6904346f9d3e93f502323c2db9fd47e53745772ca62c1fe5969d"
+}

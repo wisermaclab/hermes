@@ -1,0 +1,17 @@
+Required Notice: Copyright (c) 2026 Wireless System Research Group, McMaster University
+
+HERMES code is licensed under the PolyForm Noncommercial License 1.0.0.
+Project-owned documentation and data are licensed under Creative Commons
+Attribution-NonCommercial 4.0 International unless a file or directory notice
+states otherwise. Bundled third-party material is expressly excluded from
+these grants and remains subject to its recorded upstream terms.
+
+License history: The governance-only public bootstrap commit
+0b3694bb82dbf9a220c3942d032901918ca3fea7 was originally made available under
+GPL-3.0-only. That historical grant remains valid for copies of that commit.
+Beginning with the first HERMES simulator release, project-owned governance
+code and configuration are also offered under PolyForm Noncommercial 1.0.0,
+and project-owned governance documentation is also offered under CC BY-NC 4.0,
+as identified by their SPDX headers.
+
+For commercial licensing, contact Rong Zheng (rzheng@mcmaster.ca).

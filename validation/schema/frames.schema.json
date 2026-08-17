@@ -1,0 +1,36 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/wisermaclab/hermes/validation/schema/frames.schema.json",
+  "title": "HERMES Bundle v1 frames",
+  "$defs": {
+    "frame": {
+      "type": "object",
+      "required": ["motion_time_s"],
+      "properties": {
+        "bundle_index": {"type": "integer", "minimum": 0},
+        "benchmark_index": {"type": "integer", "minimum": 0},
+        "motion_time_s": {"type": "number"},
+        "radar_frame_id": {"type": ["string", "integer", "null"]},
+        "camera_frame_id": {"type": ["string", "integer", "null"]},
+        "pose_frame_id": {"type": ["string", "integer", "null"]},
+        "dataset_frame_id": {"type": ["string", "integer", "null"]},
+        "metadata": {"type": "object"}
+      },
+      "additionalProperties": true
+    },
+    "frames": {
+      "type": "array",
+      "minItems": 1,
+      "items": {"$ref": "#/$defs/frame"}
+    }
+  },
+  "oneOf": [
+    {"$ref": "#/$defs/frames"},
+    {
+      "type": "object",
+      "required": ["frames"],
+      "properties": {"frames": {"$ref": "#/$defs/frames"}},
+      "additionalProperties": true
+    }
+  ]
+}

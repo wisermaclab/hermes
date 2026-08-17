@@ -1,0 +1,369 @@
+{
+  "board_model": "IWR6843AOPEVM",
+  "pattern_mode": "none",
+  "radar": {
+    "name": "mmradarpose_p1_an0_ac4_r0_radar",
+    "position": [
+      0.0,
+      0.0,
+      0.0
+    ],
+    "orientation": [
+      1.5707963267948966,
+      0.0,
+      0.0
+    ]
+  },
+  "fmcw": {
+    "carrier_frequency_hz": 60000000000.0,
+    "bandwidth_hz": 1020000000.0,
+    "slope_hz_per_s": 60000000000000.0,
+    "chirp_duration_s": 1.7e-05,
+    "chirp_repetition_time_s": 8.333333333333333e-05,
+    "sampling_frequency_hz": 3800000.0,
+    "num_adc_samples": 64,
+    "num_chirps_per_frame": 128,
+    "frame_period_s": 0.06666666666666667,
+    "num_tx": 3,
+    "tdm_enabled": true,
+    "physical_num_tx": 3,
+    "num_rx": 4,
+    "exported_virtual_channels": 12,
+    "range_resolution_m": 0.148,
+    "unambiguous_range_m": 9.49,
+    "doppler_resolution_mps": 0.078,
+    "unambiguous_doppler_velocity_mps": 5.02,
+    "source": "Table 3 of the mmRadarPose paper; chirp repetition time is 32 ms / (128 loops * 3 transmitters)."
+  },
+  "virtual_channel_order": "tx_major",
+  "metadata": {
+    "dataset": "mmRadarPose",
+    "contract_status": "current",
+    "current_validation_bundle": true,
+    "trial": "p1_an0_ac4_r0",
+    "participant": 1,
+    "angle": 0,
+    "activity": 4,
+    "recording": 0,
+    "alignment": {
+      "radar_to_hss_like": {
+        "rotation_matrix": [
+          [
+            1.0,
+            0.0,
+            0.0
+          ],
+          [
+            0.0,
+            1.0,
+            0.0
+          ],
+          [
+            0.0,
+            0.0,
+            1.0
+          ]
+        ],
+        "translation": [
+          0.16,
+          -2.85,
+          1.07
+        ]
+      },
+      "radar_to_smpl": {
+        "rotation_matrix": [
+          [
+            1.0,
+            0.0,
+            0.0
+          ],
+          [
+            0.0,
+            0.0,
+            1.0
+          ],
+          [
+            0.0,
+            -1.0,
+            0.0
+          ]
+        ],
+        "translation": [
+          0.16,
+          1.07,
+          2.85
+        ]
+      },
+      "description": "Inferred translation-only radar pointcloud alignment to HSS/OMC-like coordinates and corresponding rigid transform to the SMPL model frame.",
+      "status": "inferred_from_dataset",
+      "units": "meters",
+      "convention": {
+        "vector_convention": "column_vector",
+        "hss_like_equation": "p_hss_like = R_radar_to_hss_like @ p_radar + t_radar_to_hss_like",
+        "smpl_equation": "p_smpl = R_radar_to_smpl @ p_radar + t_radar_to_smpl",
+        "hss_like_to_smpl_axis_map": "[x, y, z] -> [x, z, -y]"
+      },
+      "important_notes": [
+        "These values are inferred from paired pointcloud and skeleton sequences in this local dataset.",
+        "They are not the original corner-reflector radar-to-OMC calibration matrices described in the paper.",
+        "The SMPL transform uses the established HSS/OMC-like to SMPL axis conversion after the inferred radar-to-HSS-like translation.",
+        "The all-angle estimate is the recommended practical overlay transform unless a stricter calibration is recovered."
+      ],
+      "selected_alignment": "all_angles",
+      "smpl_model_to_radar_output_axes": [
+        0,
+        2,
+        1
+      ],
+      "smpl_model_to_radar_output_signs": [
+        1.0,
+        -1.0,
+        1.0
+      ],
+      "source": "radar_to_smpl_alignment_inferred.json"
+    },
+    "coordinate_frames": {
+      "bundle_world_frame": "mmRadarPose/radar",
+      "bundle_world_axes": {
+        "x": "lateral axis",
+        "y": "range/boresight axis, positive away from radar",
+        "z": "vertical axis"
+      }
+    },
+    "source_radar_npz": "radar/data_cube_parsed_p1_an0_ac4_r0.npz",
+    "source_smpl_npz": "mmradarpose_p1_an0_ac4_r0_fit.npz",
+    "motion_source": "amass_sequence.npz",
+    "amass_sequence_included": true,
+    "mesh_sequence_included": false,
+    "amass_motion_relative_times_s": [
+      -0.06666666666666643,
+      0.0,
+      0.06666666666666643
+    ],
+    "neutral_shape": true,
+    "frame_mapping": {
+      "source": "mmRadarPose common zero-based trial frame index",
+      "radar_frame_id": "000240",
+      "radar_time_s": 16.0,
+      "pose_frame_id": "000240",
+      "source_smpl_index": 240,
+      "source_smpl_time_s": 16.0,
+      "pose_to_radar_time_offset_s": 0.0,
+      "mapping_override": false
+    },
+    "exported_adc_shape": [
+      1,
+      128,
+      64,
+      12
+    ],
+    "exported_adc_axes": [
+      "frame",
+      "chirp_slow_time",
+      "adc_fast_time",
+      "virtual_channel_iwr6843aop_tx_major"
+    ],
+    "tdm_virtual_adc": true,
+    "tdm_tx_order": [
+      1,
+      2,
+      3
+    ],
+    "tdm_note": "mmRadarPose stores 128 slow-time chirp loops per transmitter; radar_adc.npz stores the 12 virtual channels in TX-major order.",
+    "radar_geometry": {
+      "board_model": "IWR6843AOPEVM",
+      "virtual_channel_order": "tx_major",
+      "virtual_channels": [
+        {
+          "channel": 0,
+          "label": "TX1 to RX1",
+          "tx": 1,
+          "rx": 1,
+          "position_lambda_yz": [
+            0.5,
+            1.0
+          ],
+          "phase_sign": -1
+        },
+        {
+          "channel": 1,
+          "label": "TX1 to RX2",
+          "tx": 1,
+          "rx": 2,
+          "position_lambda_yz": [
+            0.5,
+            1.5
+          ],
+          "phase_sign": 1
+        },
+        {
+          "channel": 2,
+          "label": "TX1 to RX3",
+          "tx": 1,
+          "rx": 3,
+          "position_lambda_yz": [
+            0.0,
+            1.0
+          ],
+          "phase_sign": -1
+        },
+        {
+          "channel": 3,
+          "label": "TX1 to RX4",
+          "tx": 1,
+          "rx": 4,
+          "position_lambda_yz": [
+            0.0,
+            1.5
+          ],
+          "phase_sign": 1
+        },
+        {
+          "channel": 4,
+          "label": "TX2 to RX1",
+          "tx": 2,
+          "rx": 1,
+          "position_lambda_yz": [
+            1.5,
+            0.0
+          ],
+          "phase_sign": -1
+        },
+        {
+          "channel": 5,
+          "label": "TX2 to RX2",
+          "tx": 2,
+          "rx": 2,
+          "position_lambda_yz": [
+            1.5,
+            0.5
+          ],
+          "phase_sign": 1
+        },
+        {
+          "channel": 6,
+          "label": "TX2 to RX3",
+          "tx": 2,
+          "rx": 3,
+          "position_lambda_yz": [
+            1.0,
+            0.0
+          ],
+          "phase_sign": -1
+        },
+        {
+          "channel": 7,
+          "label": "TX2 to RX4",
+          "tx": 2,
+          "rx": 4,
+          "position_lambda_yz": [
+            1.0,
+            0.5
+          ],
+          "phase_sign": 1
+        },
+        {
+          "channel": 8,
+          "label": "TX3 to RX1",
+          "tx": 3,
+          "rx": 1,
+          "position_lambda_yz": [
+            0.5,
+            0.0
+          ],
+          "phase_sign": -1
+        },
+        {
+          "channel": 9,
+          "label": "TX3 to RX2",
+          "tx": 3,
+          "rx": 2,
+          "position_lambda_yz": [
+            0.5,
+            0.5
+          ],
+          "phase_sign": 1
+        },
+        {
+          "channel": 10,
+          "label": "TX3 to RX3",
+          "tx": 3,
+          "rx": 3,
+          "position_lambda_yz": [
+            0.0,
+            0.0
+          ],
+          "phase_sign": -1
+        },
+        {
+          "channel": 11,
+          "label": "TX3 to RX4",
+          "tx": 3,
+          "rx": 4,
+          "position_lambda_yz": [
+            0.0,
+            0.5
+          ],
+          "phase_sign": 1
+        }
+      ]
+    },
+    "environment": {
+      "type": "empty",
+      "scene_file": null,
+      "note": "mmRadarPose provides no scene geometry; the bundle environment is empty."
+    },
+    "benchmark": {
+      "schema_version": 1,
+      "id": "mmradarpose_p1_an0_ac4_r0_frame0240",
+      "dataset": "mmRadarPose",
+      "trial": "p1_an0_ac4_r0",
+      "mmradarpose_trial_id": "p1_an0_ac4_r0",
+      "participant": 1,
+      "participant_id": 1,
+      "angle": 0,
+      "orientation_id": 0,
+      "activity": 4,
+      "activity_id": 4,
+      "recording": 0,
+      "recording_id": 0,
+      "action": "Bicep curls",
+      "environment": "empty",
+      "environment_is_clean": false,
+      "environment_is_cluttered": false,
+      "subject_count": "single",
+      "single_subject": true,
+      "pose_frame_id": "000240",
+      "radar_frame_id": "000240",
+      "camera_frame_id": null,
+      "contract_status": "current",
+      "current_validation_bundle": true,
+      "rtpose_sequence_id": null,
+      "source": "mmRadarPose trial p1_an0_ac4_r0 with an AMASS-like base-SMPL sequence",
+      "note": "Limited example adapted from mmRadarPose trial p1_an0_ac4_r0 at frame 000240.",
+      "evaluation_notes": {
+        "po_human_only": "Use amass_sequence.npz and the packaged empty environment.",
+        "shape": "The distributed motion uses neutral gender and zero betas; it is not participant-specific shape."
+      },
+      "motion": {
+        "file": "amass_sequence.npz",
+        "format": "canonical AMASS-like base-SMPL window",
+        "mesh_sequence_included": false,
+        "mesh_generation": "generated from the AMASS parameters and a separately licensed SMPL model when simulation is run",
+        "parameter_source": "poses, translations, timing, topology, and producer fields come from the selected fitted sequence; betas and gender were neutralized for release",
+        "timing_fields": {
+          "times": "Original selected-window source times in seconds.",
+          "source_capture_times": "Absolute source capture times in seconds.",
+          "bundle_times": "Times relative to the selected radar frame, which is t=0."
+        }
+      },
+      "bundle_contents": {
+        "adc": "radar_adc.npz",
+        "frames": "frames.json",
+        "amass_motion_sequence": "amass_sequence.npz",
+        "sensor": "sensor.json",
+        "environment": "environment.json"
+      }
+    }
+  }
+}

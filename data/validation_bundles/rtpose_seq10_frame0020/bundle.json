@@ -1,0 +1,15 @@
+{
+  "schema_version": 1,
+  "profile": "hermes",
+  "primary_adc": "primary",
+  "adcs": {
+    "primary": {
+      "path": "radar_adc.npz",
+      "origin": "measurement"
+    }
+  },
+  "motion": {
+    "parameters": "amass_sequence.npz"
+  },
+  "environment": "environment.json"
+}

@@ -1,0 +1,243 @@
+{
+  "board_model": "MMWCAS-RF-EVM",
+  "pattern_mode": "cosine30",
+  "virtual_channel_order": "tx_major",
+  "radar": {
+    "name": "rtpose_seq10_radar",
+    "position": [
+      0.0,
+      0.0,
+      0.0
+    ],
+    "orientation": [
+      0.0,
+      0.0,
+      0.0
+    ]
+  },
+  "fmcw": {
+    "carrier_frequency_hz": 78988541000.0,
+    "start_frequency_hz": 77000000000.0,
+    "slope_hz_per_s": 64985000000000.0,
+    "chirp_duration_s": 6e-05,
+    "chirp_repetition_time_s": 6.500000000000001e-05,
+    "adc_start_time_s": 5e-06,
+    "sampling_frequency_hz": 5000000.0,
+    "num_adc_samples": 256,
+    "num_chirps_per_frame": 64,
+    "frame_period_s": 0.1,
+    "num_tx": 12,
+    "tdm_enabled": true
+  },
+  "metadata": {
+    "benchmark": {
+      "action": "Walk",
+      "bundle_contents": {
+        "adc": "radar_adc.npz",
+        "camera_images": {
+          "left": "camera/left/000056_face_occluded.png",
+          "right": "camera/right/000056_face_occluded.png"
+        },
+        "environment_geometry": {
+          "environment_scene.xml": "environment_geometry/environment_scene.xml",
+          "scene_path": "environment_geometry/environment_scene.xml"
+        },
+        "frames": "frames.json",
+        "sensor": "sensor.json",
+        "amass_motion_sequence": "amass_sequence.npz"
+      },
+      "camera_frame_id": "000056",
+      "camera_privacy": {
+        "faces_obfuscated": true,
+        "method": "opaque solid face mask",
+        "irreversible_in_fixture": true,
+        "original_images_included": false,
+        "image_size_px": [
+          1440,
+          1080
+        ],
+        "coordinate_origin": "top-left",
+        "covered_regions_px": {
+          "left": [
+            850,
+            330,
+            995,
+            485
+          ],
+          "right": [
+            675,
+            330,
+            820,
+            485
+          ]
+        }
+      },
+      "dataset": "RT-Pose",
+      "environment": "cluttered",
+      "environment_is_clean": false,
+      "environment_is_cluttered": true,
+      "evaluation_notes": {
+        "po_human_only": "Use amass_sequence.npz and an empty scene.",
+        "rt_with_environment": "Use benchmark_metadata.bundle_contents.environment_geometry.scene_path when present; otherwise the bundle is self-contained for human-only simulation and measured-ADC DSP validation."
+      },
+      "motion": {
+        "file": "amass_sequence.npz",
+        "format": "canonical AMASS-like base-SMPL window",
+        "mesh_sequence_included": false,
+        "mesh_generation": "generated from the AMASS parameters and a licensed SMPL model when simulation is run",
+        "parameter_source": "poses, translations, timing, and producer fields copied from the selected fitted segment without refitting; participant-specific betas and gender were replaced with zero betas and neutral gender for this public fixture",
+        "shape_method": "neutral_zero_public_fixture",
+        "timing_fields": {
+          "times": "Original selected-segment local sample times in seconds.",
+          "source_capture_times": "Absolute source capture times in seconds.",
+          "bundle_times": "Times relative to the selected radar frame, which is t=0.",
+          "radar_capture_times": "Absolute RT-Pose radar frame times in seconds."
+        }
+      },
+      "id": "rtpose_seq10_frame0020",
+      "note": "Walk; sequence 10 clip at radar frame 000020.",
+      "location": "Indoor",
+      "occlusion": "Nothing",
+      "pose_frame_id": "000056",
+      "radar_frame_id": "000020",
+      "rtpose_sequence_id": "10",
+      "scenario": "Cluttered",
+      "single_subject": true,
+      "source_subject_type": "Single-Person",
+      "subject_count": "single"
+    },
+    "dataset": "RT-Pose",
+    "sequence_id": "10",
+    "source_adc": "Data/sequences/10/radar/npy_raw/frame0020_adc.npz",
+    "source_amass_npz": "Data/sequences/10/smpl/segment_000/fit.npz",
+    "source_adc_shape": [
+      256,
+      64,
+      16,
+      12
+    ],
+    "exported_adc_shape": [
+      1,
+      64,
+      256,
+      192
+    ],
+    "source_adc_axes": [
+      "adc_sample",
+      "chirp_loop",
+      "rx",
+      "tx"
+    ],
+    "exported_adc_axes": [
+      "frame",
+      "chirp_loop",
+      "adc_sample",
+      "virtual_channel_tx_major"
+    ],
+    "source_rx_order": [
+      13,
+      14,
+      15,
+      16,
+      1,
+      2,
+      3,
+      4,
+      9,
+      10,
+      11,
+      12,
+      5,
+      6,
+      7,
+      8
+    ],
+    "exported_rx_order": [
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10,
+      11,
+      12,
+      13,
+      14,
+      15,
+      16
+    ],
+    "rx_order": [
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10,
+      11,
+      12,
+      13,
+      14,
+      15,
+      16
+    ],
+    "rx_order_note": "Receiver values are physical 1-based AWR2243 labels. Each TX-major block is exported in ascending RX1..RX16 order.",
+    "range_resolution_m": 0.04508251904285605,
+    "velocity_resolution_mps": 0.03804105828853951,
+    "face_winding": "corrected_with_smpl_model_faces_to_rtpose_frame",
+    "tdm_virtual_adc": true,
+    "tx_to_enable": [
+      12,
+      11,
+      10,
+      9,
+      8,
+      7,
+      6,
+      5,
+      4,
+      3,
+      2,
+      1
+    ],
+    "tdm_schedule_note": "RT-Pose AWR2243 cascade physical chirp order; ADC bundle stores chirp loops with TX slots separated into tx-major virtual channels and physical receivers ordered RX1 through RX16 within each block.",
+    "source_adc_conversion": "prepared RT-Pose ADC cache",
+    "radar_acquisition_duration_s": 0.049855000000000003,
+    "frame_mapping": {
+      "source": "RT-Pose Train.json pose-frame to Radar_frameID mapping",
+      "real_radar_frame_id": "000020",
+      "real_radar_time_s": 2.0,
+      "source_radar_frame_id": "000020",
+      "source_radar_time_s": 2.0,
+      "source_frame_id": "000056",
+      "source_smpl_index": 18,
+      "source_smpl_time_s": 1.8,
+      "pose_to_real_radar_time_offset_s": 0.19999999999999996,
+      "source_lidar_valid": 0,
+      "mapping_override": false
+    },
+    "motion_source": "amass_sequence.npz",
+    "amass_sequence_included": true,
+    "mesh_sequence_included": false,
+    "neutral_shape": true,
+    "shape_method": "neutral_zero_public_fixture",
+    "geometry_outputs": {
+      "scene_path": "environment_geometry/environment_scene.xml",
+      "geometry_source": "dataset_cache"
+    },
+    "amass_motion_timing": "amass_source_capture_times",
+    "amass_motion_relative_times_s": [
+      -0.10000000000000009,
+      0.0,
+      0.09999999999999987
+    ],
+    "scene_path": "environment_geometry/environment_scene.xml"
+  }
+}
