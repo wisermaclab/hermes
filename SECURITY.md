@@ -1,3 +1,6 @@
+<!-- SPDX-License-Identifier: CC-BY-NC-4.0 -->
+<!-- Copyright (c) 2026 Wireless System Research Group, McMaster University -->
+
 # Security Policy
 
 Please do not disclose security vulnerabilities in a public issue.

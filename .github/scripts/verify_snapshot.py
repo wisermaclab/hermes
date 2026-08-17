@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
+# Copyright (c) 2026 Wireless System Research Group, McMaster University
 """Verify that the public tree is an audited, self-contained snapshot."""
 
 from __future__ import annotations
@@ -53,7 +55,6 @@ REQUIRED_MANAGED_FILES = {
     "pyproject.toml",
 }
 FORBIDDEN_PREFIXES = (
-    "data/",
     "device/",
     "docs/itu_p2040/",
     "models/",
@@ -159,6 +160,17 @@ def bootstrap_allowed(path: str) -> bool:
 
 def target_owned(path: str) -> bool:
     return path in TARGET_OWNED_FILES or path.startswith(TARGET_OWNED_PREFIXES)
+
+
+def snapshot_managed_data(path: str) -> bool:
+    """Return whether a snapshot-managed file belongs to public data.
+
+    The authoritative private exporter audits and byte-pins released data.
+    This target-side verifier therefore treats ``data/`` entries as binary-
+    safe snapshot payloads while still checking their recorded hash and mode.
+    """
+
+    return path.startswith("data/")
 
 
 def validate_relative_path(value: object) -> str:
@@ -416,19 +428,20 @@ def main() -> None:
         relative = PurePosixPath(path)
         file_path = ROOT / path
         normalized_path = path.casefold()
-        if any(
+        managed_data = snapshot_managed_data(path)
+        if not managed_data and any(
             normalized_path.startswith(prefix.casefold())
             for prefix in FORBIDDEN_PREFIXES
         ):
             errors.append(f"{path}: forbidden public path")
-        if relative.suffix.lower() in FORBIDDEN_SUFFIXES:
+        if not managed_data and relative.suffix.lower() in FORBIDDEN_SUFFIXES:
             errors.append(f"{path}: forbidden public file type")
-        if relative.suffix.lower() not in TEXT_SUFFIXES:
+        if not managed_data and relative.suffix.lower() not in TEXT_SUFFIXES:
             errors.append(f"{path}: file type is not on the public text allowlist")
         if not file_path.is_file() or file_path.is_symlink():
             errors.append(f"{path}: must be a regular non-symlink file")
             continue
-        if file_path.stat().st_size > MAX_MANAGED_FILE_BYTES:
+        if not managed_data and file_path.stat().st_size > MAX_MANAGED_FILE_BYTES:
             errors.append(f"{path}: exceeds public file-size limit")
         actual_hash = sha256(file_path)
         if actual_hash != expected_hash:
@@ -438,6 +451,8 @@ def main() -> None:
             errors.append(
                 f"{path}: Git mode {actual_mode} does not match snapshot mode {mode}"
             )
+        if relative.suffix.lower() not in TEXT_SUFFIXES:
+            continue
         try:
             text = file_path.read_text(encoding="utf-8")
         except UnicodeDecodeError:
