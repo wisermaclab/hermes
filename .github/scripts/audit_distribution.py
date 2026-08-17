@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
+# Copyright (c) 2026 Wireless System Research Group, McMaster University
 """Reject release archives that contain prohibited or missing payloads."""
 
 from __future__ import annotations
