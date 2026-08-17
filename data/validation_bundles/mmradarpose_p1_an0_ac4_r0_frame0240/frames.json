@@ -1,0 +1,46 @@
+{
+  "frames": [
+    {
+      "benchmark_index": 0,
+      "motion_time_s": 0.0,
+      "radar_frame_id": "000240",
+      "pose_frame_id": "000240",
+      "camera_frame_id": null,
+      "dataset_frame_id": "p1_an0_ac4_r0:000240",
+      "metadata": {
+        "source_smpl_index": 240,
+        "source_smpl_time_s": 16.0,
+        "frame_mapping": {
+          "source": "mmRadarPose common zero-based trial frame index",
+          "radar_frame_id": "000240",
+          "radar_time_s": 16.0,
+          "pose_frame_id": "000240",
+          "source_smpl_index": 240,
+          "source_smpl_time_s": 16.0,
+          "pose_to_radar_time_offset_s": 0.0,
+          "mapping_override": false
+        },
+        "mesh_center_xyz_m": [
+          -0.029358335211197205,
+          3.267012951682026,
+          0.1471264025631681
+        ],
+        "mesh_range_min_m": 2.8686582513411034,
+        "mesh_range_median_m": 3.379947921694886,
+        "mesh_range_max_m": 3.7076360351121793,
+        "benchmark": {
+          "id": "mmradarpose_p1_an0_ac4_r0_frame0240",
+          "dataset": "mmRadarPose",
+          "action": "Bicep curls",
+          "environment": "empty",
+          "subject_count": "single",
+          "pose_frame_id": "000240",
+          "radar_frame_id": "000240",
+          "camera_frame_id": null,
+          "rtpose_sequence_id": null,
+          "mmradarpose_trial_id": "p1_an0_ac4_r0"
+        }
+      }
+    }
+  ]
+}

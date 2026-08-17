@@ -1,0 +1,53 @@
+{
+  "schema_version": 1,
+  "id": "mmradarpose_p1_an0_ac4_r0_frame0240",
+  "dataset": "mmRadarPose",
+  "trial": "p1_an0_ac4_r0",
+  "mmradarpose_trial_id": "p1_an0_ac4_r0",
+  "participant": 1,
+  "participant_id": 1,
+  "angle": 0,
+  "orientation_id": 0,
+  "activity": 4,
+  "activity_id": 4,
+  "recording": 0,
+  "recording_id": 0,
+  "action": "Bicep curls",
+  "environment": "empty",
+  "environment_is_clean": false,
+  "environment_is_cluttered": false,
+  "subject_count": "single",
+  "single_subject": true,
+  "pose_frame_id": "000240",
+  "radar_frame_id": "000240",
+  "camera_frame_id": null,
+  "contract_status": "current",
+  "current_validation_bundle": true,
+  "rtpose_sequence_id": null,
+  "source": "mmRadarPose trial p1_an0_ac4_r0 with an AMASS-like base-SMPL sequence",
+  "note": "Limited example adapted from mmRadarPose trial p1_an0_ac4_r0 at frame 000240.",
+  "evaluation_notes": {
+    "po_human_only": "Use amass_sequence.npz and the packaged empty environment.",
+    "shape": "The distributed motion uses neutral gender and zero betas; it is not participant-specific shape."
+  },
+  "motion": {
+    "file": "amass_sequence.npz",
+    "format": "canonical AMASS-like base-SMPL window",
+    "mesh_sequence_included": false,
+    "mesh_generation": "generated from the AMASS parameters and a separately licensed SMPL model when simulation is run",
+    "parameter_source": "poses, translations, timing, topology, and producer fields come from the selected fitted sequence; betas and gender were neutralized for release",
+    "timing_fields": {
+      "times": "Original selected-window source times in seconds.",
+      "source_capture_times": "Absolute source capture times in seconds.",
+      "bundle_times": "Times relative to the selected radar frame, which is t=0."
+    }
+  },
+  "bundle_contents": {
+    "descriptor": "bundle.json",
+    "adc": "radar_adc.npz",
+    "frames": "frames.json",
+    "amass_motion_sequence": "amass_sequence.npz",
+    "sensor": "sensor.json",
+    "environment": "environment.json"
+  }
+}

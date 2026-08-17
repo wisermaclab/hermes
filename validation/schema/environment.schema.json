@@ -1,0 +1,32 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/wisermaclab/hermes/validation/schema/environment.schema.json",
+  "title": "HERMES Bundle v1 environment",
+  "type": "object",
+  "properties": {
+    "scene_path": {"$ref": "#/$defs/relativePath"},
+    "motion_parameters": {"$ref": "#/$defs/relativePath"},
+    "motion_mesh": {"$ref": "#/$defs/relativePath"},
+    "scene_source": {"type": "string", "minLength": 1},
+    "environment_mesh_sequence": {"$ref": "#/$defs/relativePath"},
+    "geometry_outputs": {
+      "type": "object",
+      "additionalProperties": {"$ref": "#/$defs/relativePath"}
+    },
+    "metadata": {"type": "object"}
+  },
+  "$defs": {
+    "relativePath": {
+      "type": "string",
+      "minLength": 1,
+      "not": {
+        "anyOf": [
+          {"pattern": "^/"},
+          {"pattern": "^[A-Za-z]:[\\\\/]"},
+          {"pattern": "(^|[\\\\/])\\.\\.([\\\\/]|$)"}
+        ]
+      }
+    }
+  },
+  "additionalProperties": true
+}

@@ -1,0 +1,61 @@
+.venv/
+.venv-*/
+.venv_arm/
+.DS_Store
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+build/
+dist/
+*.egg-info/
+
+# Local data/model/output artifacts. Only the documented, byte-pinned fixtures
+# below are tracked; all neighboring files remain local.
+/data/**
+!/data/AMASS/
+!/data/AMASS/README.md
+!/data/AMASS/walking_poses_cmu_105_02.npz
+!/data/validation_bundles/
+!/data/validation_bundles/README.md
+!/data/validation_bundles/rtpose_seq10_frame0020/
+!/data/validation_bundles/rtpose_seq10_frame0020/README.md
+!/data/validation_bundles/rtpose_seq10_frame0020/NOTICE.md
+!/data/validation_bundles/rtpose_seq10_frame0020/benchmark_metadata.json
+!/data/validation_bundles/rtpose_seq10_frame0020/bundle.json
+!/data/validation_bundles/rtpose_seq10_frame0020/environment.json
+!/data/validation_bundles/rtpose_seq10_frame0020/frames.json
+!/data/validation_bundles/rtpose_seq10_frame0020/amass_sequence.npz
+!/data/validation_bundles/rtpose_seq10_frame0020/radar_adc.npz
+!/data/validation_bundles/rtpose_seq10_frame0020/sensor.json
+!/data/validation_bundles/rtpose_seq10_frame0020/camera/
+!/data/validation_bundles/rtpose_seq10_frame0020/camera/left/
+!/data/validation_bundles/rtpose_seq10_frame0020/camera/left/000056_face_occluded.png
+!/data/validation_bundles/rtpose_seq10_frame0020/camera/right/
+!/data/validation_bundles/rtpose_seq10_frame0020/camera/right/000056_face_occluded.png
+!/data/validation_bundles/rtpose_seq10_frame0020/environment_geometry/
+!/data/validation_bundles/rtpose_seq10_frame0020/environment_geometry/environment_scene.xml
+!/data/validation_bundles/mmradarpose_p1_an0_ac4_r0_frame0240/
+!/data/validation_bundles/mmradarpose_p1_an0_ac4_r0_frame0240/README.md
+!/data/validation_bundles/mmradarpose_p1_an0_ac4_r0_frame0240/NOTICE.md
+!/data/validation_bundles/mmradarpose_p1_an0_ac4_r0_frame0240/benchmark_metadata.json
+!/data/validation_bundles/mmradarpose_p1_an0_ac4_r0_frame0240/bundle.json
+!/data/validation_bundles/mmradarpose_p1_an0_ac4_r0_frame0240/environment.json
+!/data/validation_bundles/mmradarpose_p1_an0_ac4_r0_frame0240/frames.json
+!/data/validation_bundles/mmradarpose_p1_an0_ac4_r0_frame0240/amass_sequence.npz
+!/data/validation_bundles/mmradarpose_p1_an0_ac4_r0_frame0240/radar_adc.npz
+!/data/validation_bundles/mmradarpose_p1_an0_ac4_r0_frame0240/sensor.json
+
+# License-gated models downloaded by each user. Demos look here by default.
+/models/
+/outputs/
+/benchmarks/**/results/
+
+# Local walk-through slide deck build artifacts
+/docs/walk_through/
+
+# Ad hoc research notebooks, scripts, and scratch artifacts are local-only.
+/research/
+/tests/research/
