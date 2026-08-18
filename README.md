@@ -45,9 +45,10 @@ HERMES prefers `cuda_ad_mono_polarized` when a compatible NVIDIA CUDA/OptiX
 runtime is available and otherwise uses the CPU
 `llvm_ad_mono_polarized` variant included by the upstream Mitsuba package.
 Public CI currently installs and tests HERMES on Ubuntu with Python 3.10 and
-3.12. macOS and Windows are best-effort platforms until equivalent CI jobs are
-added; consult the pinned Mitsuba and Dr.Jit release files before choosing a
-Python version or machine architecture.
+3.12. HERMES has also been tested manually on macOS with Apple M4 processors.
+macOS remains manually tested rather than CI-enforced, and Windows remains a
+best-effort platform; consult the pinned Mitsuba and Dr.Jit release files before
+choosing a Python version or machine architecture.
 
 Point-target, radar-hardware, DSP, and precomputed-mesh workflows do not require
 SMPL. For AMASS conversion or SMPL-family mesh generation, install the optional
@@ -113,189 +114,40 @@ Dynamic Scenes additionally needs the SMPL adapters:
 python -m pip install "hermes-radar-sim[gui,smpl]"
 ```
 
-The GUI has three top-level workflows: **Static Target**, **Dynamic Scenes**,
-and **Bundle Comparison**. The header Settings dialog holds the TI
-hardware, active Tx/Rx antenna elements, FMCW waveform, antenna pattern, and
-solver budgets shared by subsequent runs. The radar phase center is fixed at
-`(0, 0, 0)`; all scene and target positions are expressed relative to it.
-Static and dynamic runs keep separate radar yaw, pitch, and roll controls.
+The GUI provides three workflows:
 
-- **Static Target** runs both RT and PO for a plate, trihedral corner
-  reflector, or uploaded human `.obj`/`.npz` mesh. Cartesian target position,
-  geometry, orientation, material, and diffuse-reflection controls recompute
-  the absolute-power RT/PO range and angle views. The header settings menu
-  controls adaptive parent-facet PO integration plus RT ray, path, and depth
-  budgets, and saves them in browser-local storage. Its local radar orientation
-  rotates the fixed-origin sensor used by both solvers. Settings selects a
-  digitized TI profile, omnidirectional response, or cosine response with a
-  user-specified full 3 dB beamwidth. It can also simulate any nonempty subset
-  of the selected board's Tx and Rx elements. TDM is off by default, so every
-  selected Tx/Rx channel is sampled simultaneously once per chirp repetition;
-  enabling TDM evaluates each transmitter in its physical chirp slot and uses
-  the full Tx cycle as the per-channel slow-time interval. Plain mouse drag
-  orbits the camera; Shift-drag previews physical
-  target yaw/pitch and triggers one RT/PO run on release. Closed human meshes
-  are normalized to outward face winding at import; their scene view shades
-  PO power and highlights RT-hit faces plus RT/PO overlap. An on-demand
-  diagnostics view overlays the strongest
-  target-touching RT paths and strongest PO facets, with RT interaction-depth
-  plots and compact path/facet counts.
-- **Dynamic Scenes** uses either the prepared bedroom or an uploaded
-  Sionna/Mitsuba scene XML. It accepts pickle-free AMASS-like motion parameters
-  (`poses`, `trans`, `betas`, and `times`, `bundle_times`, or
-  `mocap_framerate`) and evaluates them with a separately licensed SMPL-family
-  model. The scene preview provides synchronized frame-slider and playback
-  controls; playback updates geometry only and does not rerun the solver.
-  High-rate motion is displayed at a source-dividing rate near 20--25 Hz, so
-  playback follows real motion time without flooding the browser. Orbit and
-  zoom gestures remain usable during playback; every mesh update carries the
-  live Plotly camera, while redraws are coalesced during each gesture and catch
-  up to the newest frame afterward. The
-  simulation controls select any combination of full per-chirp RT, coherent RT,
-  human-only PO, and Hybrid PO over an inclusive begin/end motion-frame window
-  bounded by the loaded sequence. A newly loaded motion defaults to a one-frame
-  window, and the end-frame label shows the maximum available source index.
-  Four square checkboxes select the modes; each has a question-mark tooltip
-  describing its solver policy.
-  **Start** launches them and **Stop** cancels at the next safe RT/PO solver
-  boundary. While active, the status reports only the current mode and frame.
-  Results are grouped by product rather than by mode: one range-
-  profile comparison overlays all completed modes, while the range-time and
-  frame-selectable range-Doppler pages show every selected mode together. The
-  result-frame selector is one-based (`1` through the simulated frame count)
-  and has explicit Previous/Next frame actions for short runs.
-  Switching product tabs restores those plots' default axes. Hybrid PO always
-  includes human blocking and human/environment coupling, and its PO and
-  coupling components are placed on the coherent-RT power scale by the
-  sequence calibration stage. The
-  controls also expose human placement, yaw, and diffuse coefficient.
-  The prepared bedroom uses a tightly bounded, open-front shell with furniture
-  outside the included CMU walking trial and modest rough-wall scattering for
-  visible room returns. After a run, the scene page can retrace
-  the displayed simulated frame on demand: Full or Coherent RT enables the top-
-  K target-touching ray overlay, while Human-only or Hybrid PO colors the human
-  facets by PO power. These compact overlays do not retain Sionna's full path
-  object during normal simulations.
-  Arbitrary uploaded XML is used by
-  the solver but is not rebuilt in
-  the lightweight Plotly preview; a browser-uploaded XML should be
-  self-contained because referenced assets are not uploaded with it.
-  Component range profiles distinguish direct human PO, blocked static-
-  environment RT, and the two coupling directions. Public installs include the
-  prepared room and a redistributable AMASS-like example, but no licensed SMPL
-  model. This workflow has its own radar-orientation controls and uses the
-  global hardware, antenna, and waveform Settings.
-- **Bundle Comparison** loads and validates a
-  [HERMES Bundle v1](https://github.com/wisermaclab/hermes/blob/main/validation/BUNDLE_SPEC.md) directory or GUI-exported ZIP,
-  displays its primary scene, ADC, range profile, range-time, and range-Doppler
-  products in product-specific tabs, and either runs a bundle-configured human
-  RT/PO simulation or loads previously saved ADC from the bundle, an external
-  archive, or another HERMES bundle. A fresh run may select several simulation
-  modes, plus an optional channel-0-only path that simulates the corresponding
-  physical TX/RX pair and compares it with primary channel 0. Candidate ADC,
-  range-time, and range-Doppler plots appear beside their primary counterparts;
-  every primary and candidate range profile is overlaid in one shared plot.
-  The scene remains primary-only, and object hover labels include the referenced
-  material. Parameter-only
-  AMASS bundles evaluate the human with the configured licensed SMPL model and
-  display it at the primary bundle frame time; bundles with evaluated motion
-  use that mesh directly. A fresh run can be stopped after confirmation at the
-  next safe solver boundary. The compact download action beside the run button
-  exports one completed raw ADC as NPZ or several mode results together as a
-  ZIP of NPZ archives. Inputs use one combined drag-and-drop/click-to-browse
-  control; folders are supported when dropped. Theme changes preserve the
-  selected static-target controls and mesh upload; shared radar settings;
-  dynamic-scene controls, motion and XML uploads, displayed frame, selected
-  result product, and completed static/dynamic solver products. They also
-  preserve the selected bundle path, processing controls, comparison source
-  and modes, channel-0 setting, external ADC path, active product tab, and
-  automatically reload filesystem-backed bundles and saved comparisons.
+- **Static Target** compares RT and PO for plates, corner reflectors, and
+  uploaded meshes, with range, angle, and path/facet diagnostics.
+- **Dynamic Scenes** runs full or coherent RT, human-only PO, and Hybrid PO for
+  a prepared or uploaded room with AMASS-compatible motion.
+- **Bundle Comparison** validates a
+  [HERMES Bundle v1](https://github.com/wisermaclab/hermes/blob/main/validation/BUNDLE_SPEC.md),
+  explores its ADC and DSP products, and compares them with fresh or saved
+  simulations.
 
-GUI exports and measurement fixtures use the same public `hermes` profile.
-Each ADC artifact declares whether it is a measurement, simulation, background,
-or processed cube. Exports include primary raw ADC, separate RT and PO
-comparison cubes, target geometry, scene XML and its referenced OBJ,
-sensor/frame metadata, diagnostics, and reproducible experiment manifests.
-Static Target bundles store separate RT and PO cubes.
-Dynamic Scenes bundles store the preferred selected mode as primary data and
-retain every selected mode as `simulated_adc_<mode>.npz`; HERMES RT/PO aliases
-remain available for the comparison screen. They also store the evaluated
-motion as `human_motion.npz`. AMASS-driven exports retain
-the source parameters as `amass_sequence.npz`; the inclusive source-frame
-window and per-frame source indices are recorded in bundle metadata. Licensed
-model files are never embedded. Uploaded XML is preserved as `scene.xml`. Both
-workflows store the
-selected zero-based Tx/Rx board-element indices in `sensor.json`, allowing the
-same loader to reconstruct the virtual array regardless of ADC origin.
-The validation runner's `simulated_adc_<label>.npz` outputs remain compatible
-as external comparison inputs.
+The Settings dialog configures TI hardware, active Tx/Rx elements, the FMCW
+waveform, antenna response, and solver budgets. The radar phase center remains
+at `(0, 0, 0)`; scene and target positions are relative to it.
 
-The rough PEC RT preset uses a diffuse scattering coefficient and
-backscattering-pattern mixture parameter of `0.20`; the smooth aluminum preset
-uses `0.0` for both, and concrete uses the heuristic value `0.35`. The
-human-mesh coefficient is user controlled and defaults to `0.35`. The
-diffuse-energy coefficient and backscattering-pattern mixture parameter are
-stored separately. These are RT rough-surface terms; PO uses the selected
-conductivity/permittivity material model without them.
+GUI exports are portable HERMES Bundle v1 archives containing the ADC products,
+sensor and frame metadata, scene inputs, diagnostics, and reproducible
+experiment manifests. Dynamic exports retain each selected simulation mode;
+licensed model files are never embedded.
 
-Sionna RT 2.0.1 internally discards propagation paths containing segments
-shorter than 1 cm. This safeguard improves numerical robustness by rejecting
-near-degenerate paths. In trihedral corner-reflector simulations, however,
-physically valid triple-bounce paths can contain face-to-face segments below
-this threshold, particularly with millimeter-scale MIMO antenna spacing.
-Consequently, Sionna RT may report no specular return from the reflector even
-with sufficient samples and `max_depth >= 3`. The PO calculation is unaffected.
-HERMES retains Sionna's upstream behavior rather than overriding the internal
-threshold.
+The launcher binds to `127.0.0.1` by default and protects each launch with a
+random password. Remote binding requires the explicit `--unsafe-allow-remote`
+override and an origin allowlist. Use it only on a trusted, access-controlled
+network: the launcher is not a TLS endpoint or multi-user identity system.
 
-The server binds to `127.0.0.1` by default. The official launcher prints a
-random per-launch password and requires it before Bokeh constructs a GUI
-session. Its signed authentication cookie is `HttpOnly` and `SameSite=Strict`;
-cross-site document/login requests fail closed before session construction,
-and GUI responses deny framing. This protects a loopback server from hostile
-web pages that try to create expensive sessions, but it is not TLS or a
-multi-user identity system.
-
-Normal operation is loopback-only. The launcher rejects non-loopback
-`--address` values unless an operator deliberately enables
-`--unsafe-allow-remote`. In that mode HERMES prints an additional warning,
-locks browser-controlled server paths, uses only the server-configured
-`MMWAVE_SMPL_MODEL_DIR`, and disables custom scene XML. Use the override only
-on a trusted, access-controlled network; do not expose it directly to the
-public internet or transmit its password over an untrusted network.
-Wildcard binds additionally require an explicit browser-origin allowlist, for
-example:
-
-```bash
-hermes-gui --address 0.0.0.0 --port 5006 --no-browser \
-  --unsafe-allow-remote --allow-websocket-origin radar-lab.example:5006
-```
-
-Repeat `--allow-websocket-origin HOST[:PORT]` when several concrete origins
-are needed; `*`, URL schemes, paths, and wildcard addresses are rejected. If
-you embed Panel directly, or place HERMES behind a reverse proxy or tunnel,
-call `build_app(remote_access=True)`. The official CLI infers this restriction
-from its bind address, but direct application embedding cannot infer whether a
-browser is remote. Direct Panel embedding must also supply authentication and
-equivalent cross-site/framing protections; those launcher-layer controls are
-not installed by `build_app` itself.
-
-Browser uploads are bounded: individual dropped bundle/ADC files are limited
-to 256 MiB, a dropped group to 512 MiB and 1,024 files, static meshes and
-AMASS-like motion to 64 MiB each, and scene XML to 2 MiB. Check dependencies
-and source-checkout fixture availability with:
+Check optional dependencies and source-checkout fixtures with:
 
 ```bash
 hermes-gui --self-check
 ```
 
-SMPL model files are required only when Dynamic Scenes evaluates AMASS-like
-motion. Configure the licensed model directory in that tab or through
-`MMWAVE_SMPL_MODEL_DIR`. Static Target mesh simulation and measurement
-comparison do not require it. The public release does not contain a licensed
-body model. Dynamic exports contain the source AMASS-like parameters and the
-evaluated mesh sequence used in the result; redistribution rights remain the
-exporter's responsibility.
+Dynamic Scenes requires an authorized SMPL-family model configured in the GUI
+or through `MMWAVE_SMPL_MODEL_DIR`. Static Target and measurement-only bundle
+comparison do not. The public release contains no licensed body model.
 
 ## Data and external models
 
