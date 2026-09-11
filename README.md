@@ -77,6 +77,19 @@ Do not commit or redistribute these model files.
 
 ## Examples
 
+Ensure that jupyter is running within the virtual environment
+
+```bash
+$ source .venv/bin/activate
+$ realpath --relative-to . `which pip`  # check that the right `pip` is in use
+.venv/bin/pip
+$ pip install jupyter
+$ pip install jupyter_collaboration  # needed due to a bug in jupyter as of this writing
+$ source .venv/bin/activate  # reactivate the environment for jupyter
+$ realpath --relative-to . `which jupyter`  # check that the right `jupyter` is in use
+.venv/bin/jupyter
+```
+
 The notebooks are source-checkout examples. Clone the public repository, enter
 its root, and start with the data-free point-target notebook:
 
