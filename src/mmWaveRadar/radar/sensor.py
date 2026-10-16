@@ -5,7 +5,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import numpy as np
 
@@ -90,6 +90,11 @@ class RadarSensor:
                 f"transmitter count ({self.hardware.num_tx})"
             )
 
+        # Include the board's analog IF limit in receiver filtering.
+        board_if = (self.hardware.board_metadata or {}).get("adc", {}).get("if_bandwidth_hz")
+        if board_if is not None:
+            limit = min(float(board_if), self.fmcw.if_bandwidth_hz or float(board_if))
+            object.__setattr__(self, "fmcw", replace(self.fmcw, if_bandwidth_hz=limit))
         object.__setattr__(self, "position", position)
         object.__setattr__(self, "orientation", orientation)
         object.__setattr__(self, "tx_power_dbm", tx_power_dbm)
@@ -112,18 +117,7 @@ class RadarSensor:
             pattern_mode=pattern_mode,
             cosine_half_power_angle_deg=cosine_half_power_angle_deg,
         )
-        fmcw = FMCWConfig(
-            carrier_frequency=fmcw.carrier_frequency,
-            slope=fmcw.slope,
-            chirp_duration=fmcw.chirp_duration,
-            chirp_repetition_time=fmcw.chirp_repetition_time,
-            sampling_frequency=fmcw.sampling_frequency,
-            num_adc_samples=fmcw.num_adc_samples,
-            num_chirps_per_frame=fmcw.num_chirps_per_frame,
-            frame_period=fmcw.frame_period,
-            num_tx=hardware.num_tx,
-            tdm_enabled=fmcw.tdm_enabled,
-        )
+        fmcw = replace(fmcw, num_tx=hardware.num_tx)
         power = spec.tx_power_dbm if tx_power_dbm is None else float(tx_power_dbm)
         return cls(name=name,
                    position=tuple(position),
@@ -166,18 +160,7 @@ class RadarSensor:
             scalar_antenna_gain_dbi=scalar_antenna_gain_dbi,
             antenna_pattern=antenna_pattern,
         )
-        fmcw = FMCWConfig(
-            carrier_frequency=fmcw.carrier_frequency,
-            slope=fmcw.slope,
-            chirp_duration=fmcw.chirp_duration,
-            chirp_repetition_time=fmcw.chirp_repetition_time,
-            sampling_frequency=fmcw.sampling_frequency,
-            num_adc_samples=fmcw.num_adc_samples,
-            num_chirps_per_frame=fmcw.num_chirps_per_frame,
-            frame_period=fmcw.frame_period,
-            num_tx=1,
-            tdm_enabled=False,
-        )
+        fmcw = replace(fmcw, num_tx=1, tdm_enabled=False)
         return cls(name=name,
                    position=tuple(position),
                    orientation=tuple(orientation),
@@ -208,17 +191,7 @@ class RadarSensor:
             hardware = RadarHardware.from_xwr68xx(hardware_model)
         if enabled_tx_indices is not None:
             hardware = hardware.subset_tx(enabled_tx_indices)
-        fmcw = FMCWConfig(
-            carrier_frequency=fmcw.carrier_frequency,
-            slope=fmcw.slope,
-            chirp_duration=fmcw.chirp_duration,
-            chirp_repetition_time=fmcw.chirp_repetition_time,
-            sampling_frequency=fmcw.sampling_frequency,
-            num_adc_samples=fmcw.num_adc_samples,
-            num_chirps_per_frame=fmcw.num_chirps_per_frame,
-            frame_period=fmcw.frame_period,
-            num_tx=hardware.num_tx,
-            tdm_enabled=fmcw.tdm_enabled)
+        fmcw = replace(fmcw, num_tx=hardware.num_tx)
         return cls(name=name,
                    position=tuple(position),
                    orientation=tuple(orientation),
@@ -322,6 +295,7 @@ def _parse_ti_cli_config(filename: str,
     profiles: dict[int, dict[str, float | int]] = {}
     chirp_configs: list[dict[str, object]] = []
     frame_config: tuple[int, int, int, float] | None = None
+    sampling_mode = "complex1x"
 
     with open(filename, "r", encoding="utf-8") as f:
         for raw in f:
@@ -329,7 +303,13 @@ def _parse_ti_cli_config(filename: str,
             if not line or line.startswith("%") or line.startswith("#"):
                 continue
             toks = line.split()
-            if toks[0] == "profileCfg":
+            if toks[0] == "adcCfg":
+                # TI CLI: 0 = real, 1 = complex 1x, 2 = complex 2x.
+                try:
+                    sampling_mode = {0: "real", 1: "complex1x", 2: "complex2x"}[int(toks[2])]
+                except (IndexError, ValueError, KeyError) as exc:
+                    raise ValueError(f"Could not parse adcCfg: {line}") from exc
+            elif toks[0] == "profileCfg":
                 try:
                     profile_id = int(float(toks[1]))
                     profiles[profile_id] = {
@@ -500,5 +480,6 @@ def _parse_ti_cli_config(filename: str,
         num_tx=(len(enabled_tx_indices)
                 if enabled_tx_indices is not None else num_chirps_per_loop),
         tdm_enabled=tdm_enabled,
+        adc_mode=sampling_mode,
     )
     return fmcw, enabled_tx_indices

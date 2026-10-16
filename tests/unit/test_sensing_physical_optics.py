@@ -8,6 +8,7 @@ from __future__ import annotations
 from sensing_test_helpers import *  # noqa: F401,F403
 import mmWaveRadar.simulation.env_human_coupling as env_human_coupling
 import mmWaveRadar.simulation.physical_optics as physical_optics_module
+from mmWaveRadar.radar.ti import SimpleCosinePattern
 from mmWaveRadar.simulation.physical_optics import (
     _visibility_adjacent_face_pairs,
     _visibility_edge_faces,
@@ -248,6 +249,74 @@ def test_batched_po_face_contributions_match_scalar_pairs():
         )
         assert np.allclose(batched_coefficients[pair_index], scalar_coefficients)
         assert np.allclose(batched_tau[pair_index], scalar_tau)
+
+
+@pytest.mark.parametrize("solver", ["numpy", "numpy_pairs", "torch"])
+def test_po_channel_has_negative_propagation_phase(solver, monkeypatch):
+    if solver == "torch":
+        torch = pytest.importorskip("torch")
+        monkeypatch.setattr(physical_optics_module, "_use_torch_backend",
+                            lambda backend, precision: backend == "torch")
+        monkeypatch.setattr(
+            physical_optics_module, "_torch_device_and_dtypes",
+            lambda precision: (torch.device("cpu"), torch.float64,
+                               torch.complex128, np.float64, np.complex128),
+        )
+    frequency_hz = 60e9
+    wavelength = c / frequency_hz
+    distances = [1.0, 1.0 + wavelength / 16]
+    coefficients = []
+    for distance in distances:
+        kwargs = dict(
+            face_indices=np.array([0]), centroids=np.array([[distance, 0., 0.]]),
+            normals=np.array([[-1., 0., 0.]]), areas=np.array([1e-4]),
+            frequency_hz=frequency_hz,
+            material=PhysicalOpticsMaterial(1., 0., model="pec"),
+        )
+        if solver == "numpy_pairs":
+            value, _ = vector_facet_face_contributions_for_pairs(
+                **kwargs, tx_positions=np.zeros((1, 3)),
+                rx_positions=np.zeros((1, 3)),
+            )
+        else:
+            value, _ = vector_facet_face_contributions(
+                **kwargs, tx_position=np.zeros(3), rx_position=np.zeros(3),
+                backend=solver, precision="float64",
+            )
+        coefficients.append(value.item())
+    # Only the propagation phase and two-leg spreading change: the PEC
+    # material, incidence, polarization, and face area are identical.
+    ratio = coefficients[1] / coefficients[0] * (distances[1] / distances[0])**2
+    np.testing.assert_allclose(ratio, np.exp(-1j * np.pi / 4), rtol=1e-10)
+
+
+@pytest.mark.parametrize("integration_mode", [
+    "face_centroid", "parent_face_quadrature", "parent_face_far_field_analytic",
+    "parent_face_adaptive_analytic",
+])
+def test_po_integration_backends_agree_for_complex_material(integration_mode, monkeypatch):
+    torch = pytest.importorskip("torch")
+    monkeypatch.setattr(physical_optics_module, "_use_torch_backend",
+                        lambda backend, precision: backend == "torch")
+    monkeypatch.setattr(
+        physical_optics_module, "_torch_device_and_dtypes",
+        lambda precision: (torch.device("cpu"), torch.float64,
+                           torch.complex128, np.float64, np.complex128),
+    )
+    kwargs = dict(
+        vertices=_front_facing_triangle(2., scale=.03, y_shift=.01),
+        faces=np.array([[0, 1, 2]], dtype=np.uint32),
+        tx_positions=np.zeros((1, 3)), rx_positions=np.array([[.1, .2, -.2]]),
+        frequency_hz=60e9, material=PhysicalOpticsMaterial(4., .1, model="interface"),
+        visibility="none", po_integration_mode=integration_mode,
+        po_quadrature_phase_span_scale_rad=np.pi / 8,
+        po_quadrature_max_refinement_depth=3,
+        po_quadrature_max_subfaces_per_parent=64, compute_precision="float64",
+    )
+    numpy_result = po_channel(**kwargs, compute_backend="numpy")
+    torch_result = po_channel(**kwargs, compute_backend="torch")
+    np.testing.assert_allclose(torch_result.coefficients, numpy_result.coefficients,
+                               rtol=1e-9, atol=1e-15)
 
 
 def test_parent_face_quadrature_po_keeps_parent_face_visibility_id():
@@ -507,22 +576,205 @@ def test_env_human_coupling_returns_single_reflection_terms():
     assert result.env_human_delays_s[0] > direct.delays_s[0]
 
 
-def test_coupling_calibrated_reflector_gain_preserves_env_bounce_phase():
-    reflection_points = np.array([[0.0, 0.0, 0.0], [0.0, 0.1, 0.0]])
-    face_points = np.array([[1.0, 0.0, 0.0], [1.0, 0.1, 0.0]])
+@pytest.mark.parametrize("num_tx", [1, 2])
+@pytest.mark.parametrize("orientation", [
+    (0., 0., 0.), (np.pi / 3, 0., 0.), (.7, -.4, .2),
+])
+def test_coupling_hardware_gain_uses_real_legs_and_applies_scalar_phase_once(
+    num_tx, orientation,
+):
+    # Human at (2, 0, 0), floor at z=-1: the reflected leg is at 45 degrees
+    # for a centered antenna, while the direct human leg is on boresight.
+    human = _front_facing_triangle(2.0, scale=0.03, z_shift=-0.01)
+    floor = np.array([[-5., -5., -1.], [5., -5., -1.], [0., 5., -1.]])
+    from sionna.rt.utils import rotation_matrix
 
-    amplitude = env_human_coupling._reflection_amplitude(
-        reflection_points=reflection_points,
-        face_points=face_points,
-        reflector_normal=np.array([1.0, 0.0, 0.0]),
-        reflector_area=1.0,
-        material=PhysicalOpticsMaterial(1.0, 0.0, model="pec"),
-        frequency_hz=60e9,
-        scale=0.5,
-        calibrated_gain=3.0 + 4.0j,
+    rotation = np.asarray(rotation_matrix(mi.Point3f(*orientation))).reshape(3, 3)
+    position = np.array([3., -2., 0.5])
+    human = human @ rotation.T + position
+    floor = floor @ rotation.T + position
+    faces = np.array([[0, 1, 2]], dtype=np.uint32)
+    reflectors = EnvironmentReflectorBank(
+        vertices=floor[None], centroids=floor.mean(axis=0, keepdims=True),
+        normals=np.array([[0., 0., 1.]]) @ rotation.T, areas=np.array([50.]),
+        materials=(PhysicalOpticsMaterial(1., 0., model="pec"),),
+        object_names=("floor",), face_indices=np.array([0]),
+        reflection_gains=np.array([0.8 + 0.2j]),
     )
+    tx_positions = np.zeros((num_tx, 3))
+    if num_tx == 2:
+        tx_positions[:, 2] = [-0.1, 0.1]
+    signs = np.array([-1., 1.])[:num_tx]
+    hardware = replace(
+        RadarHardware.from_positions(tx_positions, [[0., 0., 0.]]),
+        scalar_antenna_gain_dbi=6.0,
+        virtual_channel_phase_signs=signs,
+        antenna_pattern=SimpleCosinePattern(num_tx, half_power_angle_deg=45.),
+    )
+    radar = RadarSensor(
+        name="coupling-gain", position=tuple(position), orientation=orientation,
+        hardware=hardware, fmcw=replace(_phase_one_radar().fmcw, num_tx=num_tx),
+    )
+    kwargs = dict(
+        vertices=human, faces=faces, tx_positions=radar.world_tx_positions(),
+        rx_positions=radar.world_rx_positions(), frequency_hz=60e9,
+        human_material=human_skin_material("coupling-gain-human"),
+        reflectors=reflectors,
+        human_visibility_scene=HumanVisibilityScene(faces, human, name="coupling-gain"),
+        polarization_axis=rotation[:, 2],
+    )
+    raw = compute_env_human_coupling_channels(**kwargs)
+    weighted = compute_env_human_coupling_channels(**kwargs, radar=radar)
+    cached = compute_env_human_coupling_channels(
+        **kwargs, radar=radar,
+        human_env_active_sets=weighted.human_env_active_sets,
+        env_human_active_sets=weighted.env_human_active_sets,
+    )
+    height = tx_positions[:, 2]
+    expected_cosines = {
+        "human_env": (2. / np.sqrt(4. + height**2), 1. / np.sqrt(2.)),
+        "env_human": (2. / np.sqrt(4. + (2. + height)**2), 1.),
+    }
+    for order, (cos_tx, cos_rx) in expected_cosines.items():
+        expected = signs * 10. ** (6. / 20.) * np.sqrt(cos_tx * cos_rx)
+        coefficients = getattr(raw, order + "_coefficients")
+        assert np.all(np.abs(coefficients) > 0.)
+        np.testing.assert_allclose(
+            getattr(weighted, order + "_coefficients"),
+            coefficients * expected[:, None], rtol=1e-6, atol=1e-15,
+        )
+        np.testing.assert_allclose(
+            getattr(cached, order + "_coefficients"),
+            getattr(weighted, order + "_coefficients"), rtol=1e-6, atol=1e-15,
+        )
+        np.testing.assert_allclose(
+            getattr(weighted, order + "_delays_s"), getattr(raw, order + "_delays_s"),
+        )
 
-    np.testing.assert_allclose(amplitude, np.full(2, 1.5 + 2.0j))
+
+@pytest.mark.parametrize("num_tx", [1, 2])
+@pytest.mark.parametrize("integration_mode", [
+    "parent_face_quadrature", "parent_face_far_field_analytic",
+    "parent_face_adaptive_analytic",
+])
+def test_coupling_matches_human_po_with_image_endpoints(num_tx, integration_mode):
+    human = _front_facing_triangle(2.0, scale=0.03, z_shift=-0.01)
+    faces = np.array([[0, 1, 2]], dtype=np.uint32)
+    floor = np.array([[-5., -5., -1.], [5., -5., -1.], [0., 5., -1.]])
+    # Static RT diagnostics must not multiply the actual Fresnel reflection.
+    reflection_gain = 1e6j
+    reflectors = EnvironmentReflectorBank(
+        vertices=floor[None], centroids=floor.mean(axis=0, keepdims=True),
+        normals=np.array([[0., 0., 1.]]), areas=np.array([50.]),
+        materials=(PhysicalOpticsMaterial(1., 0., model="pec"),),
+        object_names=("floor",), face_indices=np.array([0]),
+        reflection_gains=np.array([reflection_gain]),
+    )
+    tx = np.zeros((num_tx, 3))
+    if num_tx == 2:
+        tx[:, 1] = [-0.1, 0.1]
+    rx = np.zeros((1, 3))
+    image_tx, image_rx = tx.copy(), rx.copy()
+    image_tx[:, 2] = image_rx[:, 2] = -2.0
+    events = []
+    config = HumanPOMobilityConfig(
+        po_integration_mode=integration_mode,
+        po_quadrature_phase_span_scale_rad=np.pi / 8,
+        po_quadrature_max_refinement_depth=3,
+        po_quadrature_max_subfaces_per_parent=64,
+        progress_callback=events.append,
+    )
+    kwargs = dict(
+        vertices=human, faces=faces, tx_positions=tx, rx_positions=rx,
+        frequency_hz=60e9, human_material=human_skin_material("image-po-human"),
+        reflectors=reflectors, po_config=config,
+        human_visibility_scene=HumanVisibilityScene(faces, human, name="image-po"),
+        reflection_scale=0.7,
+    )
+    result = compute_env_human_coupling_channels(**kwargs)
+    cached = compute_env_human_coupling_channels(
+        **kwargs, human_env_active_sets=result.human_env_active_sets,
+        env_human_active_sets=result.env_human_active_sets,
+    )
+    for order, tx_for_po, rx_for_po in (
+        ("human_env", tx, image_rx), ("env_human", image_tx, rx),
+    ):
+        expected = po_channel(
+            vertices=human, faces=faces, tx_positions=tx_for_po,
+            rx_positions=rx_for_po, frequency_hz=60e9,
+            material=kwargs["human_material"], visibility="none",
+            po_integration_mode=integration_mode,
+            po_quadrature_phase_span_scale_rad=np.pi / 8,
+            po_quadrature_max_refinement_depth=3,
+            po_quadrature_max_subfaces_per_parent=64,
+        )
+        np.testing.assert_allclose(
+            getattr(result, order + "_coefficients"),
+            0.7 * expected.coefficients, rtol=1e-10, atol=1e-15,
+        )
+        np.testing.assert_allclose(
+            getattr(result, order + "_delays_s"), expected.delays_s,
+        )
+        np.testing.assert_allclose(
+            getattr(cached, order + "_coefficients"),
+            getattr(result, order + "_coefficients"), rtol=1e-10, atol=1e-15,
+        )
+        assert getattr(result, order + "_coefficients").shape == (num_tx, 1)
+
+    stage = ("quadrature" if integration_mode == "parent_face_quadrature"
+             else "far_field")
+    completed = [event for event in events
+                 if event["stage"] == f"{stage}_aggregate_done"]
+    assert len(completed) == 4  # Both orders, fresh and cached visibility.
+    assert all(event["parent_faces_total"] == 1 for event in completed)
+    assert all(0 < event["subfaces_total"] <= 64 for event in completed)
+    if integration_mode == "parent_face_quadrature":
+        assert all(event["subfaces_total"] == 64 for event in completed)
+
+
+def test_coupling_quadrature_resolves_phase_cancellation_against_dense_surface():
+    # An oblique image path spans several wavelengths across this one face.
+    # Independently subdivide it uniformly for a dense numerical reference.
+    human = _front_facing_triangle(2.0, scale=0.03).astype(np.float64)
+    faces = np.array([[0, 1, 2]], dtype=np.uint32)
+    centroids, normals, areas = face_geometry(human, faces)
+    tx, image_rx = np.array([0., 0., 0.]), np.array([0., 0., -2.])
+    triangles = human[None]
+    for _ in range(7):
+        a, b, d = triangles[:, 0], triangles[:, 1], triangles[:, 2]
+        ab, bd, da = (a + b) / 2, (b + d) / 2, (d + a) / 2
+        triangles = np.concatenate([
+            np.stack([a, ab, da], axis=1), np.stack([ab, b, bd], axis=1),
+            np.stack([da, bd, d], axis=1), np.stack([ab, bd, da], axis=1),
+        ])
+    dense_vertices = triangles.reshape(-1, 3)
+    dense_faces = np.arange(dense_vertices.shape[0]).reshape(-1, 3)
+    dc, dn, da = face_geometry(dense_vertices, dense_faces)
+    material = PhysicalOpticsMaterial(1., 0., model="pec")
+    reference, _ = vector_facet_face_contributions(
+        face_indices=np.arange(len(da)), centroids=dc, normals=dn, areas=da,
+        tx_position=tx, rx_position=image_rx, frequency_hz=60e9, material=material,
+    )
+    kwargs = dict(
+        vertices=human, faces=faces, face_indices=np.array([0]),
+        centroids=centroids, normals=normals, areas=areas,
+        tx_position=tx, rx_position=image_rx,
+        tx_positions=tx[None], rx_positions=image_rx[None],
+        frequency_hz=60e9, material=material, backend="numpy", precision="float64",
+    )
+    centroid, _ = env_human_coupling._coupling_face_contributions(
+        **kwargs, po_config=HumanPOMobilityConfig(),
+    )
+    refined, _ = env_human_coupling._coupling_face_contributions(
+        **kwargs, po_config=HumanPOMobilityConfig(
+            po_integration_mode="parent_face_quadrature",
+            po_quadrature_phase_span_scale_rad=np.pi / 8,
+            po_quadrature_max_refinement_depth=6,
+            po_quadrature_max_subfaces_per_parent=4096,
+        ),
+    )
+    np.testing.assert_allclose(refined[0], reference.sum(), rtol=0.01, atol=1e-15)
+    assert abs(refined[0]) < 0.1 * abs(centroid[0])
 
 
 def test_env_human_coupling_reuses_phase_center_visibility_for_virtual_channels(monkeypatch):
@@ -619,7 +871,8 @@ def test_env_human_coupling_reuses_phase_center_visibility_for_virtual_channels(
         permuted.env_human_delays_s,
         result.env_human_delays_s[::-1],
     )
-    assert call_count == 5
+    # Three geometric legs per order; virtual channels reuse that visibility.
+    assert call_count == 6
 
 
 def test_env_human_coupling_can_reuse_active_sets_without_segment_visibility(monkeypatch):

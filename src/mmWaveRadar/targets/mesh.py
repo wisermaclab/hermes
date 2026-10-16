@@ -5,8 +5,9 @@
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Iterator
 
 import numpy as np
 
@@ -251,6 +252,25 @@ class MeshTarget:
         elif obj.scene is not scene:
             raise ValueError("Mesh target already belongs to another scene")
         return obj
+
+    @contextmanager
+    def detached_from_scene(self, scene) -> Iterator[None]:
+        """Temporarily removes this target's mesh from ``scene``.
+
+        RT runs leave their targets in the scene. Static-environment passes
+        must not trace or occlude with a frozen copy of the moving mesh, so
+        they detach it here; it is restored on exit.
+        """
+        obj = self.scene_object
+        if obj is None or obj.scene is not scene or obj.name not in scene.objects:
+            yield
+            return
+        scene.edit(remove=[obj])
+        obj._scene = lambda: None  # pylint: disable=protected-access
+        try:
+            yield
+        finally:
+            scene.edit(add=[obj])
 
     def update_to_time(
         self,

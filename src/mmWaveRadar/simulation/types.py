@@ -11,7 +11,12 @@ from typing import Callable, Literal
 import numpy as np
 
 from .calibration import POCalibrationConfig
-from .physical_optics import ComputeBackend, ComputePrecision, POIntegrationMode
+from .physical_optics import (
+    ComputeBackend,
+    ComputePrecision,
+    POIntegrationMode,
+    default_phase_span_scale_rad,
+)
 
 
 CouplingMode = Literal["one_target_bounce", "one_human_bounce", "unrestricted"]
@@ -126,7 +131,10 @@ class HumanPOMobilityConfig:
     compute_backend: ComputeBackend | None = None
     compute_precision: ComputePrecision | None = None
     po_integration_mode: POIntegrationMode = "face_centroid"
-    po_quadrature_phase_span_scale_rad: float = 1.0
+    # None selects the integration mode's default; see
+    # effective_po_phase_span_scale_rad.
+    po_quadrature_phase_span_scale_rad: float | None = None
+    po_curvature_error_rad: float = 0.005
     po_quadrature_max_refinement_depth: int = 16
     po_quadrature_max_subfaces_per_parent: int = 0
     progress_callback: Callable[[dict], None] | None = field(
@@ -213,23 +221,31 @@ class HumanPOMobilityConfig:
         if self.po_integration_mode not in (
             "face_centroid",
             "parent_face_quadrature",
+            "parent_face_adaptive_analytic",
             "parent_face_far_field_analytic",
         ):
             raise ValueError(
                 "po_integration_mode must be 'face_centroid', "
-                "'parent_face_quadrature', or "
+                "'parent_face_quadrature', 'parent_face_adaptive_analytic', or "
                 "'parent_face_far_field_analytic'"
             )
-        quadrature_scale = _validate_finite(
-            "po_quadrature_phase_span_scale_rad",
-            self.po_quadrature_phase_span_scale_rad,
-            minimum=0.0,
-            inclusive=False,
+        quadrature_scale = (
+            None if self.po_quadrature_phase_span_scale_rad is None
+            else _validate_finite(
+                "po_quadrature_phase_span_scale_rad",
+                self.po_quadrature_phase_span_scale_rad,
+                minimum=0.0,
+                inclusive=False,
+            )
         )
         refinement_depth = _validate_integer(
             "po_quadrature_max_refinement_depth",
             self.po_quadrature_max_refinement_depth,
             minimum=0,
+        )
+        curvature_error = _validate_finite(
+            "po_curvature_error_rad", self.po_curvature_error_rad,
+            minimum=0.0, inclusive=False,
         )
         max_subfaces = _validate_integer(
             "po_quadrature_max_subfaces_per_parent",
@@ -321,6 +337,7 @@ class HumanPOMobilityConfig:
             "po_quadrature_phase_span_scale_rad",
             quadrature_scale,
         )
+        object.__setattr__(self, "po_curvature_error_rad", curvature_error)
         object.__setattr__(
             self,
             "po_quadrature_max_refinement_depth",
@@ -331,6 +348,14 @@ class HumanPOMobilityConfig:
             "po_quadrature_max_subfaces_per_parent",
             max_subfaces,
         )
+
+    @property
+    def effective_po_phase_span_scale_rad(self) -> float:
+        """Returns the explicit phase span or the integration mode's default."""
+
+        if self.po_quadrature_phase_span_scale_rad is not None:
+            return float(self.po_quadrature_phase_span_scale_rad)
+        return default_phase_span_scale_rad(self.po_integration_mode)
 
 
 @dataclass(frozen=True)
@@ -344,7 +369,10 @@ class HybridStaticEnvPOConfig:
     blocking_ray_epsilon_m: float = 1e-5
     blocking_ray_chunk_size: int = 65536
     coupling_enabled: bool = False
-    coupling_max_reflectors: int = 16
+    # Keep image powers within this level of the strongest, then take at most
+    # coupling_max_reflectors, with a hard supported maximum of four.
+    coupling_power_threshold_db: float = -20.0
+    coupling_max_reflectors: int = 4
     coupling_min_reflector_area_m2: float = 1e-4
     coupling_reflection_scale: float = 1.0
     coupling_incremental_update: bool | None = None
@@ -372,9 +400,18 @@ class HybridStaticEnvPOConfig:
         ray_chunk_size = _validate_integer(
             "blocking_ray_chunk_size", self.blocking_ray_chunk_size, minimum=1
         )
-        max_reflectors = _validate_integer(
-            "coupling_max_reflectors", self.coupling_max_reflectors, minimum=0
-        )
+        power_threshold = self.coupling_power_threshold_db
+        if isinstance(power_threshold, (bool, np.bool_)) or power_threshold is None:
+            raise ValueError("coupling_power_threshold_db must be finite and <= 0")
+        try:
+            power_threshold = float(power_threshold)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("coupling_power_threshold_db must be finite and <= 0") from exc
+        if not np.isfinite(power_threshold) or power_threshold > 0.:
+            raise ValueError("coupling_power_threshold_db must be finite and <= 0")
+        max_reflectors = _validate_integer("coupling_max_reflectors", self.coupling_max_reflectors, minimum=1)
+        if max_reflectors > 4:
+            raise ValueError("coupling_max_reflectors must be between 1 and 4")
         min_reflector_area = _validate_finite(
             "coupling_min_reflector_area_m2",
             self.coupling_min_reflector_area_m2,
@@ -442,6 +479,7 @@ class HybridStaticEnvPOConfig:
         object.__setattr__(self, "blocking_aabb_margin_m", aabb_margin)
         object.__setattr__(self, "blocking_ray_epsilon_m", ray_epsilon)
         object.__setattr__(self, "blocking_ray_chunk_size", ray_chunk_size)
+        object.__setattr__(self, "coupling_power_threshold_db", power_threshold)
         object.__setattr__(self, "coupling_max_reflectors", max_reflectors)
         object.__setattr__(
             self,
@@ -502,6 +540,7 @@ class SensingMetadata:
     env_human_min_path_lengths_m: np.ndarray | None = None
     env_human_mean_path_lengths_m: np.ndarray | None = None
     env_human_max_path_lengths_m: np.ndarray | None = None
+    adc_if_filter: dict | None = None
     po_calibration: dict | None = None
     rt_transition_persistent_path_counts: np.ndarray | None = None
     rt_transition_birth_path_counts: np.ndarray | None = None

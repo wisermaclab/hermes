@@ -6,6 +6,39 @@
 from __future__ import annotations
 
 from sensing_test_helpers import *  # noqa: F401,F403
+from mmWaveRadar.radar.ti import SimpleCosinePattern
+
+
+def test_static_path_bank_keeps_propagation_before_off_axis_hardware_loss():
+    coefficient = 0.5 + 0.25j
+
+    class StaticPaths:
+        theta_t = np.array([np.pi])
+        phi_t = np.array([0.0])
+        vertices = np.array([[[0.0, 0.0, -1.0]]])
+        interactions = np.array([[InteractionType.SPECULAR]], dtype=np.uint32)
+
+        def cir(self, **kwargs):
+            return (
+                np.full((1, 1, 1, 1, 1, 1), coefficient, dtype=complex),
+                np.array([[[2.0 / c]]]),
+            )
+
+    radar = _phase_one_radar(num_chirps=1)
+    radar = replace(radar, hardware=replace(
+        radar.hardware,
+        scalar_antenna_gain_dbi=6.0,
+        virtual_channel_phase_signs=np.array([-1.0]),
+        antenna_pattern=SimpleCosinePattern(1),
+    ))
+
+    bank = extract_static_path_bank(StaticPaths(), radar)
+
+    np.testing.assert_allclose(bank.propagation_coefficients, [[coefficient]])
+    np.testing.assert_allclose(
+        bank.coefficients, [[-coefficient * 10.0 ** ((6.0 - 80.0) / 20.0)]],
+        rtol=1e-12, atol=0.0,
+    )
 
 
 def test_static_path_blocking_detects_crossing_segment():

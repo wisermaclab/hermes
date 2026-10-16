@@ -179,6 +179,27 @@ def test_mesh_target_updates_scene_mesh_vertices():
     assert np.allclose(vertices[:, 0], [1.1, 1.1, 1.1])
 
 
+def test_mesh_target_detaches_from_scene_and_restores():
+    scene = load_scene()
+    target = MeshTarget("target", _mesh_sequence(displacement=0.1),
+                        material=human_skin_material("detach-material"))
+    obj = target.add_to_scene(scene)
+
+    with target.detached_from_scene(scene):
+        assert "target" not in scene.objects
+        assert obj.scene is None
+    assert "target" in scene.objects
+    assert obj.scene is scene
+
+    # A scene that does not hold the target is left untouched.
+    with target.detached_from_scene(load_scene()):
+        assert "target" in scene.objects
+    with pytest.raises(RuntimeError):
+        with target.detached_from_scene(scene):
+            raise RuntimeError("stage failed")
+    assert "target" in scene.objects
+
+
 def test_mesh_target_update_refreshes_rt_visibility():
     scene = load_scene()
     vertices0 = np.array([
@@ -437,6 +458,42 @@ def test_adc_synthesis_matches_single_path_beat():
     t = np.arange(fmcw.num_adc_samples) / fmcw.sampling_frequency
     expected = np.exp(1j * 2.0 * np.pi * fmcw.slope * tau[0] * t)
     assert np.allclose(y[:, 0], expected)
+
+
+@pytest.mark.parametrize("backend", ["numpy", "torch"])
+@pytest.mark.parametrize("channel_delays", [False, True])
+def test_adc_mixer_conjugates_physical_channel_once(backend, channel_delays, monkeypatch):
+    if backend == "torch":
+        torch = pytest.importorskip("torch")
+        monkeypatch.setattr(adc_synthesis_module, "_use_torch_backend",
+                            lambda backend, precision: backend == "torch")
+        monkeypatch.setattr(
+            adc_synthesis_module, "_torch_device_and_dtypes",
+            lambda precision: (torch.device("cpu"), torch.float64,
+                               torch.complex128, np.float64, np.complex128),
+        )
+    fmcw = replace(_phase_one_radar(num_chirps=1).fmcw, num_adc_samples=8)
+    delays = np.array([2e-9, 3e-9])
+    if channel_delays:
+        delays = np.array([delays, delays + 0.1e-9])
+    reflection = np.array([[.4 + .3j, -.2 + .1j], [.1 - .5j, .3 + .2j]])
+    coefficients = reflection * np.exp(-2j * np.pi * fmcw.carrier_frequency * delays)
+    adc = MmWaveRadarSimulator.synthesize_adc_from_paths(
+        coefficients, delays, fmcw, backend=backend,
+    )
+    t = np.arange(fmcw.num_adc_samples) / fmcw.sampling_frequency
+    expected = np.zeros_like(adc)
+    for channel in range(2):
+        for path in range(2):
+            delay = delays[channel, path] if channel_delays else delays[path]
+            # Tx * conj(Rx) reverses both propagation and reflection phases.
+            mixed_carrier = reflection[channel, path].conjugate() * np.exp(
+                2j * np.pi * fmcw.carrier_frequency * delay,
+            )
+            expected[:, channel] += mixed_carrier * np.exp(
+                2j * np.pi * fmcw.slope * delay * t,
+            )
+    np.testing.assert_allclose(adc, expected, rtol=1e-12, atol=1e-14)
 
 
 def test_torch_fast_time_reuses_immutable_sampling_tensor():

@@ -24,6 +24,8 @@ def steering_matrix(
     ``[num_channels, 1]``, or ``[num_channels, 2]``. The first coordinate is the
     horizontal aperture coordinate and the optional second coordinate is the
     vertical aperture coordinate. ``u`` and ``v`` are direction cosines.
+    Vectors match ``tx(t) * conj(rx(t))`` ADC snapshots, whose element phase
+    for a source at ``(u, v)`` is ``exp(-j 2 pi p . (u, v))``.
     """
 
     positions = _as_positions_lambda(virtual_positions_lambda)
@@ -37,7 +39,7 @@ def steering_matrix(
             positions[:, 0, None, None] * uu[None, :, :]
             + positions[:, 1, None, None] * vv[None, :, :]
         )
-    steering = np.exp(1j * 2.0 * np.pi * phase)
+    steering = np.exp(-1j * 2.0 * np.pi * phase)
     if normalize:
         steering = steering / np.sqrt(float(positions.shape[0]))
     return steering

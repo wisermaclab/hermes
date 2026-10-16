@@ -9,6 +9,7 @@ from types import SimpleNamespace
 
 from sensing_test_helpers import *  # noqa: F401,F403
 import mmWaveRadar.simulation.hybrid_pipeline as hybrid_pipeline
+import mmWaveRadar.simulation.hybrid_passes as hybrid_passes
 from mmWaveRadar.simulation.hybrid_pipeline import (
     CalibratedHybridPOResult,
     HybridCouplingRecomputeResult,
@@ -382,6 +383,10 @@ def test_cached_hybrid_pipeline_preserves_multi_tx_motion_phase_timing(
             env_human_coefficients=coefficients,
             env_human_delays_s=delays,
             env_human_valid=valid,
+            human_env_delay_response=None,
+            env_human_delay_response=None,
+            human_env_active_sets=(),
+            env_human_active_sets=(),
             runtime_profile_s={},
             runtime_profile_counts={},
         )
@@ -392,24 +397,19 @@ def test_cached_hybrid_pipeline_preserves_multi_tx_motion_phase_timing(
         lambda self, scene: (None, None),
     )
     monkeypatch.setattr(
-        hybrid_pipeline,
-        "extract_static_path_bank",
-        lambda *args, **kwargs: object(),
-    )
-    monkeypatch.setattr(
-        hybrid_pipeline,
-        "extract_rt_reflector_bank",
+        hybrid_passes,
+        "select_image_source_reflectors",
         lambda *args, **kwargs: SimpleNamespace(
             vertices=np.zeros((1, 3, 3)),
         ),
     )
     monkeypatch.setattr(
-        hybrid_pipeline,
+        hybrid_passes,
         "HumanVisibilityScene",
         TestVisibilityScene,
     )
     monkeypatch.setattr(
-        hybrid_pipeline,
+        hybrid_passes,
         "compute_env_human_coupling_channels",
         fake_coupling,
     )
@@ -507,7 +507,9 @@ def test_run_calibrated_hybrid_po_wraps_base_and_coupling(monkeypatch, capsys):
 
     calibration_calls = []
 
-    def fake_full_rt_baseline(*, scene, radar, targets, simulator, num_frames):
+    def fake_full_rt_baseline(
+        *, scene, radar, targets, simulator, num_frames, calibration_reference_component,
+    ):
         del scene, simulator
         calibration_calls.append({
             "num_frames": int(num_frames),
@@ -554,12 +556,18 @@ def test_run_calibrated_hybrid_po_wraps_base_and_coupling(monkeypatch, capsys):
             human_env_coupled_path_power=np.zeros(shape[:2], dtype=np.float64),
             human_multi_touch_path_power=np.zeros(shape[:2], dtype=np.float64),
             retrace_count=int(num_frames),
+            reference_adc_power={
+                calibration_reference_component: np.mean(np.abs(adc) ** 2, axis=2),
+            },
         )
 
+    static_scene_objects = []
+
     def fake_static_pass(*, scene, radar, target, times, simulator, config):
-        del scene, radar, target, simulator, config
+        static_scene_objects.append(set(scene.objects))
+        del radar, target, simulator, config
         adc_shape = times.shape + (4, 1)
-        return hybrid_pipeline._StaticEnvironmentPass(
+        return hybrid_passes._StaticEnvironmentPass(
             static_unblocked_adc=5.0 * np.ones(adc_shape, dtype=np.complex128),
             static_blocked_adc=3.0 * np.ones(adc_shape, dtype=np.complex128),
             visibility_weights=np.ones(times.shape + (1,), dtype=float),
@@ -579,7 +587,7 @@ def test_run_calibrated_hybrid_po_wraps_base_and_coupling(monkeypatch, capsys):
     def fake_coupling_pass(**kwargs):
         times = kwargs["times"]
         adc_shape = times.shape + (4, 1)
-        return hybrid_pipeline._CouplingPass(
+        return hybrid_passes._CouplingPass(
             human_env_adc=7.0 * np.ones(adc_shape, dtype=np.complex128),
             env_human_adc=11.0 * np.ones(adc_shape, dtype=np.complex128),
             human_env_counts=np.ones(times.shape, dtype=np.int64),
@@ -615,6 +623,15 @@ def test_run_calibrated_hybrid_po_wraps_base_and_coupling(monkeypatch, capsys):
         material=human_skin_material("hybrid-flow-human"),
     )
 
+    rt_sequence = POCalibrationConfig(
+        mode="rt_sequence",
+        gain_type="amplitude",
+        sample_mode="all_chirps",
+        reference_component="single_human_only",
+        alignment="same_index",
+        keep_rt_baseline=False,
+        rt_retrace_once_per_frame=True,
+    )
     result = run_calibrated_hybrid_po(
         scene=load_scene(),
         coupling_scene=load_scene(),
@@ -628,15 +645,19 @@ def test_run_calibrated_hybrid_po_wraps_base_and_coupling(monkeypatch, capsys):
         compute_precision="float64",
         progress=True,
         print_reflector_summary=False,
+        calibration_config=rt_sequence,
     )
 
     assert isinstance(result, CalibratedHybridPOResult)
     assert result.base_config.coupling_enabled is False
     assert result.hybrid_config.coupling_enabled is False
     assert result.calibration_config.mode == "rt_sequence"
+    assert result.calibration_config.reference_component == "single_human_only"
     assert calibration_calls == [{"num_frames": 1, "start_time_s": 0.0}]
     assert result.num_chirps == int(np.prod(result.cube.adc.shape[:2]))
-    assert np.allclose(result.cube.adc, 23.0)
+    assert result.calibration["reference_power_kind"] == "adc_rms_power"
+    assert result.calibration["human_po_amplitude_gain"] == pytest.approx(0.5)
+    assert np.allclose(result.cube.adc, 22.0)
     assert np.allclose(
         result.cube.adc,
         result.cube.components["human_po"]
@@ -670,12 +691,40 @@ def test_run_calibrated_hybrid_po_wraps_base_and_coupling(monkeypatch, capsys):
         compute_precision="float64",
         progress=False,
         print_reflector_summary=False,
+        calibration_config=rt_sequence,
     )
     assert calibration_calls[0]["num_frames"] == 1
     assert calibration_calls[0]["start_time_s"] == pytest.approx(
         radar.fmcw.chirp_time(1, 0)
     )
     assert shifted.calibration["calibration_frame_range"] == (1, 2)
+
+    # By default the absolute PO is used unchanged and no RT reference runs.
+    # A mesh left behind by an earlier RT run must not reach the static pass.
+    calibration_calls.clear()
+    static_scene_objects.clear()
+    environment = load_scene()
+    target.add_to_scene(environment)
+    uncalibrated = run_calibrated_hybrid_po(
+        scene=load_scene(),
+        coupling_scene=environment,
+        radar=radar,
+        target=target,
+        num_frames=2,
+        coupling_enabled=False,
+        rt_samples_per_src=1,
+        rt_max_num_paths_per_src=1,
+        compute_backend="numpy",
+        compute_precision="float64",
+        progress=False,
+        print_reflector_summary=False,
+    )
+    assert uncalibrated.calibration_config.mode == "none"
+    assert calibration_calls == []
+    assert uncalibrated.calibration["human_po_amplitude_gain"] == 1.0
+    assert np.allclose(uncalibrated.cube.adc, 23.0)
+    assert static_scene_objects == [set()]
+    assert target.name in environment.objects
 
 
 def test_run_calibrated_hybrid_po_rejects_invalid_calibration_frame_range():

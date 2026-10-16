@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+from contextlib import ExitStack
 from dataclasses import dataclass, replace
 from typing import Callable, Iterable
 import time
@@ -35,6 +36,7 @@ from .physical_optics import (
     _fractional_face_visibility,
     _update_visibility_state,
     face_geometry,
+    parent_face_adaptive_analytic_geometry,
     parent_face_far_field_analytic_geometry,
     parent_face_far_field_edge_rule,
     parent_face_quadrature_geometry,
@@ -42,18 +44,18 @@ from .physical_optics import (
     project_phase_center_contributions_to_virtual_channels,
     vector_facet_face_contributions,
 )
-from .env_human_coupling import (
-    compute_env_human_coupling_channels,
-    extract_rt_reflector_bank,
-)
+from .hybrid_passes import _run_coupling_pass, _run_static_environment_pass
 from ..targets import MeshTarget
 from ..radar import RadarSensor
+from ..radar.sensor import _rotation_matrix_numpy
 from ..radar.hardware import resolve_virtual_channel_pairs
 from .runtime import configure_mitsuba_variant
-from .static_blocking import (
-    PathVisibilityState,
-    blocked_path_visibility,
-    extract_static_path_bank,
+from .po_wideband import PODelayResponse
+from .po_incremental import (
+    POFacetState,
+    match_sorted_face_positions as _match_sorted_face_positions,
+    phase_update_coefficients,
+    update_po_facets,
 )
 from .rt_coherence import (
     CoherentRTPathBank,
@@ -65,9 +67,10 @@ from .rt_coherence import (
 )
 from .calibration import (
     POCalibrationConfig,
+    POCalibrationReference,
     calibration_gain_array,
     fit_first_pose_adc_calibration,
-    fit_sequence_path_power_calibration,
+    fit_sequence_adc_calibration,
     po_path_power_from_coefficients,
     rt_calibration_enabled,
 )
@@ -137,28 +140,7 @@ class _POIncrementalState:
     sample_count_per_face: int
     far_field_max_edge_m: float | None = None
     far_field_nearest_distance_m: float | None = None
-
-
-def _match_sorted_face_positions(
-    previous_faces: np.ndarray,
-    selected_faces: np.ndarray,
-) -> np.ndarray:
-    """Maps sorted selected face ids to sorted previous-bank positions."""
-
-    previous_faces = np.asarray(previous_faces, dtype=np.int64).reshape(-1)
-    selected_faces = np.asarray(selected_faces, dtype=np.int64).reshape(-1)
-    positions = np.full(selected_faces.shape, -1, dtype=np.int64)
-    if previous_faces.size == 0 or selected_faces.size == 0:
-        return positions
-    candidate_positions = np.searchsorted(previous_faces, selected_faces)
-    in_bounds = candidate_positions < previous_faces.size
-    matched = np.zeros(selected_faces.shape, dtype=bool)
-    matched[in_bounds] = (
-        previous_faces[candidate_positions[in_bounds]]
-        == selected_faces[in_bounds]
-    )
-    positions[matched] = candidate_positions[matched]
-    return positions
+    delay_response: PODelayResponse | None = None
 
 
 def _path_value_numpy(value) -> np.ndarray:
@@ -335,6 +317,7 @@ class MmWaveRadarSimulator:
             else hybrid_static_env_po_config
         )
         self.last_target_face_hit_counts: dict[str, np.ndarray] = {}
+        self.adc_if_filter: dict = {}
 
     def run(
         self,
@@ -348,6 +331,7 @@ class MmWaveRadarSimulator:
         self.check_cancelled()
         targets = list(targets)
         self.last_target_face_hit_counts = {}
+        self.adc_if_filter = {}
         if num_frames <= 0:
             raise ValueError("num_frames must be positive")
         if tdm_expansion_required(radar):
@@ -366,12 +350,17 @@ class MmWaveRadarSimulator:
                 rt_reference_scene=scene,
             )
         if self.mobility_mode == "hybrid_static_env_po":
-            return self._run_hybrid_static_env_po(
-                scene,
-                radar,
-                targets,
-                num_frames=int(num_frames),
-            )
+            # RT modes leave targets in the scene; the static trace must not
+            # include a frozen copy of the moving mesh.
+            with ExitStack() as stack:
+                for target in targets:
+                    stack.enter_context(target.detached_from_scene(scene))
+                return self._run_hybrid_static_env_po(
+                    scene,
+                    radar,
+                    targets,
+                    num_frames=int(num_frames),
+                )
         if self.mobility_mode == "rt_coherent_bank":
             return self._run_rt_coherent_bank(
                 scene, radar, targets, num_frames=int(num_frames))
@@ -399,6 +388,28 @@ class MmWaveRadarSimulator:
                     "solver_mode": str(mode),
                     "frame_index": int(frame),
                     "num_frames": int(num_frames),
+                }
+            )
+
+    def report_chirp_progress(
+        self,
+        *,
+        mode: str,
+        frame: int,
+        num_frames: int,
+        chirp: int,
+        num_chirps: int,
+    ) -> None:
+        """Reports the active chirp within the current solver pass."""
+
+        if self.progress_callback is not None:
+            self.progress_callback(
+                {
+                    "solver_mode": str(mode),
+                    "frame_index": int(frame),
+                    "num_frames": int(num_frames),
+                    "chirp_index": int(chirp),
+                    "num_chirps": int(num_chirps),
                 }
             )
 
@@ -741,10 +752,11 @@ class MmWaveRadarSimulator:
                     a,
                     paths=paths,
                     frequency_hz=fmcw.carrier_frequency,
+                    radar_orientation=radar.orientation,
                 )
                 path_counts[frame, chirp] = int(np.count_nonzero(valid))
                 coherent_channel[frame, chirp] = self._coherent_channel(a, valid)
-                adc[frame, chirp] = self._synthesize_adc(
+                adc[frame, chirp] = self.synthesize_adc(
                     a,
                     tau,
                     valid,
@@ -763,6 +775,7 @@ class MmWaveRadarSimulator:
 
         phase_jumps = self._phase_jump_diagnostics(coherent_channel)
         metadata = SensingMetadata(
+            adc_if_filter=dict(self.adc_if_filter),
             events=events,
             path_counts=path_counts,
             max_displacements=max_displacements,
@@ -1135,7 +1148,7 @@ class MmWaveRadarSimulator:
                 coherent_channel[frame, chirp] = self._coherent_channel(
                     synth.coefficients, valid)
                 adc_t0 = time.perf_counter()
-                adc[frame, chirp] = self._synthesize_adc(
+                adc[frame, chirp] = self.synthesize_adc(
                     synth.coefficients,
                     synth.delays_s,
                     valid,
@@ -1158,6 +1171,7 @@ class MmWaveRadarSimulator:
 
         phase_jumps = self._phase_jump_diagnostics(coherent_channel)
         metadata = SensingMetadata(
+            adc_if_filter=dict(self.adc_if_filter),
             events=events,
             path_counts=path_counts,
             max_displacements=max_displacements,
@@ -1210,58 +1224,10 @@ class MmWaveRadarSimulator:
             "hybrid_env_human_adc_synthesis": 0.0,
             "hybrid_assembly": 0.0,
         }
-        runtime_profile_counts = {
-            "hybrid_static_trace": 0,
-            "hybrid_segment_extraction": 0,
-            "hybrid_reflector_extraction": 0,
-            "hybrid_rt_baseline": 0,
-            "hybrid_po_calibration": 0,
-            "hybrid_human_po": 0,
-            "hybrid_blocking_rays": 0,
-            "hybrid_static_adc_synthesis": 0,
-            "hybrid_coupling_channel": 0,
-            "hybrid_coupling_setup": 0,
-            "hybrid_human_env_channel": 0,
-            "hybrid_env_human_channel": 0,
-            "hybrid_coupling_adc_synthesis": 0,
-            "hybrid_human_env_adc_synthesis": 0,
-            "hybrid_env_human_adc_synthesis": 0,
-            "hybrid_assembly": 0,
-        }
+        runtime_profile_counts = dict.fromkeys(runtime_profile_s, 0)
 
+        fmcw = radar.fmcw
         radar.configure_scene(scene)
-        trace_t0 = time.perf_counter()
-        paths = self._trace(scene)
-        runtime_profile_s["hybrid_static_trace"] = time.perf_counter() - trace_t0
-        runtime_profile_counts["hybrid_static_trace"] = 1
-
-        extraction_t0 = time.perf_counter()
-        static_bank = extract_static_path_bank(
-            paths,
-            radar,
-            virtual_channel_order=radar.hardware.virtual_channel_order,
-        )
-        runtime_profile_s["hybrid_segment_extraction"] = (
-            time.perf_counter() - extraction_t0
-        )
-        runtime_profile_counts["hybrid_segment_extraction"] = 1
-
-        reflector_t0 = time.perf_counter()
-        reflector_bank = extract_rt_reflector_bank(
-            scene,
-            static_bank,
-            max_reflectors=(
-                config.coupling_max_reflectors if config.coupling_enabled else -1
-            ),
-            min_area_m2=config.coupling_min_reflector_area_m2,
-            frequency_hz=radar.fmcw.carrier_frequency,
-        )
-        runtime_profile_s["hybrid_reflector_extraction"] = (
-            time.perf_counter() - reflector_t0
-        )
-        runtime_profile_counts["hybrid_reflector_extraction"] = 1
-        coupling_reflector_count = int(reflector_bank.vertices.shape[0])
-
         human_t0 = time.perf_counter()
         human_cube = self._run_human_only_po(
             radar,
@@ -1279,289 +1245,27 @@ class MmWaveRadarSimulator:
             for key, value in human_cube.metadata.runtime_profile_counts.items():
                 runtime_profile_counts[f"human_{key}"] = int(value)
 
-        fmcw = radar.fmcw
         times = human_cube.times.copy()
+        static_pass = _run_static_environment_pass(
+            scene=scene, radar=radar, target=targets[0], times=times,
+            simulator=self, config=config,
+        )
+        runtime_profile_s.update(static_pass.runtime_profile_s)
+        runtime_profile_counts.update(static_pass.runtime_profile_counts)
+        static_bank = static_pass.static_bank
+        reflector_bank = static_pass.reflector_bank
+        coupling_reflector_count = int(reflector_bank.vertices.shape[0])
+        static_path_count = int(np.count_nonzero(static_bank.valid))
+        static_unblocked_adc = static_pass.static_unblocked_adc
+        static_blocked_adc = static_pass.static_blocked_adc
+        path_visibility_weights = static_pass.visibility_weights
+        static_path_counts = static_pass.static_path_counts
+        blocked_counts = static_pass.blocked_counts
+        mean_visibility = static_pass.mean_visibility
+
         _, adc_complex_dtype = self._numpy_dtypes_for_precision(
             self.adc_compute_precision
         )
-        coupling_po_config = config.human_po_config
-        coupling_compute_backend = (
-            self.compute_backend if coupling_po_config.compute_backend is None
-            else coupling_po_config.compute_backend
-        )
-        coupling_compute_precision = (
-            self.compute_precision if coupling_po_config.compute_precision is None
-            else coupling_po_config.compute_precision
-        )
-        coupling_incremental_update = (
-            bool(coupling_po_config.incremental_update)
-            if config.coupling_incremental_update is None
-            else bool(config.coupling_incremental_update)
-        )
-        coupling_visibility_refresh_chirps = (
-            int(coupling_po_config.incremental_visibility_refresh_chirps)
-            if config.coupling_visibility_refresh_chirps is None
-            else int(config.coupling_visibility_refresh_chirps)
-        )
-        static_unblocked_adc = np.zeros_like(human_cube.adc, dtype=adc_complex_dtype)
-        static_blocked_adc = np.zeros_like(human_cube.adc, dtype=adc_complex_dtype)
-        human_env_adc = np.zeros_like(human_cube.adc, dtype=adc_complex_dtype)
-        env_human_adc = np.zeros_like(human_cube.adc, dtype=adc_complex_dtype)
-        path_visibility_weights = np.zeros(
-            times.shape + static_bank.delays_s.shape,
-            dtype=np.float64,
-        )
-        static_path_count = int(np.count_nonzero(static_bank.valid))
-        static_path_counts = np.full(times.shape, static_path_count, dtype=np.int64)
-        blocked_counts = np.zeros(times.shape, dtype=np.int64)
-        mean_visibility = np.zeros(times.shape, dtype=np.float64)
-        human_env_counts = np.zeros(times.shape, dtype=np.int64)
-        env_human_counts = np.zeros(times.shape, dtype=np.int64)
-        human_env_min_lengths = np.full(times.shape, np.nan, dtype=np.float64)
-        human_env_mean_lengths = np.full(times.shape, np.nan, dtype=np.float64)
-        human_env_max_lengths = np.full(times.shape, np.nan, dtype=np.float64)
-        env_human_min_lengths = np.full(times.shape, np.nan, dtype=np.float64)
-        env_human_mean_lengths = np.full(times.shape, np.nan, dtype=np.float64)
-        env_human_max_lengths = np.full(times.shape, np.nan, dtype=np.float64)
-
-        unblocked_weights = static_bank.valid.astype(np.float64)
-        unblocked_adc = self._synthesize_adc(
-            static_bank.coefficients,
-            static_bank.delays_s,
-            static_bank.valid,
-            fmcw,
-            backend=self.adc_compute_backend,
-            precision=self.adc_compute_precision,
-        )
-        static_unblocked_adc[:] = unblocked_adc[None, None, :, :]
-
-        visibility_scene = HumanVisibilityScene(
-            targets[0].mesh_sequence.faces,
-            targets[0].mesh_sequence.vertices_at(float(times.reshape(-1)[0])),
-            name="hybrid-static-blocking-human",
-        )
-        visibility_state: PathVisibilityState | None = None
-        cached_human_env_active_sets = None
-        cached_env_human_active_sets = None
-        frame_start_s = time.perf_counter()
-
-        for frame in range(num_frames):
-            self.report_frame_progress(
-                mode="hybrid_static_env_po",
-                frame=frame,
-                num_frames=num_frames,
-            )
-            if frame > 0:
-                self._log_frame_progress(
-                    mode="hybrid_static_env_po",
-                    frame=frame - 1,
-                    num_frames=num_frames,
-                    frame_start_s=frame_start_s,
-                    extra=f"static_paths={static_path_count}",
-                )
-            for chirp in range(fmcw.num_chirps_per_frame):
-                self.check_cancelled()
-                chirp_time = float(times[frame, chirp])
-                vertices = targets[0].mesh_sequence.vertices_at(chirp_time)
-                visibility_scene.update_vertices(vertices)
-
-                if config.blocking_enabled:
-                    blocking_t0 = time.perf_counter()
-                    visibility = blocked_path_visibility(
-                        static_bank,
-                        visibility_scene,
-                        blocker_vertices=vertices,
-                        aabb_culling=config.blocking_aabb_culling,
-                        aabb_margin_m=config.blocking_aabb_margin_m,
-                        state=visibility_state,
-                        fade_chirps=config.blocking_fade_chirps,
-                        ray_epsilon_m=config.blocking_ray_epsilon_m,
-                        ray_chunk_size=config.blocking_ray_chunk_size,
-                    )
-                    runtime_profile_s["hybrid_blocking_rays"] += (
-                        time.perf_counter() - blocking_t0
-                    )
-                    runtime_profile_counts["hybrid_blocking_rays"] += 1
-                    visibility_state = visibility.state
-                    weights = visibility.visibility_weights
-                    blocked_counts[frame, chirp] = int(
-                        np.count_nonzero(visibility.blocked_paths & static_bank.valid)
-                    )
-                else:
-                    weights = unblocked_weights
-                    blocked_counts[frame, chirp] = 0
-
-                path_visibility_weights[frame, chirp] = weights
-                if static_path_count > 0:
-                    mean_visibility[frame, chirp] = float(
-                        np.mean(weights[static_bank.valid])
-                    )
-                else:
-                    mean_visibility[frame, chirp] = 0.0
-
-                static_adc_t0 = time.perf_counter()
-                weighted_a = static_bank.coefficients * weights[None, :]
-                valid = static_bank.valid & (weights > 0.0)
-                static_blocked_adc[frame, chirp] = self._synthesize_adc(
-                    weighted_a,
-                    static_bank.delays_s,
-                    valid,
-                    fmcw,
-                    backend=self.adc_compute_backend,
-                    precision=self.adc_compute_precision,
-                )
-                runtime_profile_s["hybrid_static_adc_synthesis"] += (
-                    time.perf_counter() - static_adc_t0
-                )
-                runtime_profile_counts["hybrid_static_adc_synthesis"] += 1
-
-                if config.coupling_enabled and coupling_reflector_count > 0:
-                    chirp_index = frame * fmcw.num_chirps_per_frame + chirp
-                    refresh_coupling_visibility = (
-                        not coupling_incremental_update
-                        or cached_human_env_active_sets is None
-                        or cached_env_human_active_sets is None
-                        or chirp_index % coupling_visibility_refresh_chirps == 0
-                    )
-                    coupling_t0 = time.perf_counter()
-                    coupling = compute_env_human_coupling_channels(
-                        vertices=vertices,
-                        faces=targets[0].mesh_sequence.faces,
-                        tx_positions=radar.world_tx_positions(),
-                        rx_positions=radar.world_rx_positions(),
-                        virtual_channel_tx_indices=(
-                            radar.hardware.virtual_tx_indices()
-                        ),
-                        virtual_channel_rx_indices=(
-                            radar.hardware.virtual_rx_indices()
-                        ),
-                        virtual_channel_order=(
-                            radar.hardware.virtual_channel_order
-                        ),
-                        frequency_hz=fmcw.carrier_frequency,
-                        human_material=targets[0].material,
-                        reflectors=reflector_bank,
-                        human_visibility_scene=visibility_scene,
-                        static_visibility_scene=scene.mi_scene,
-                        reflection_scale=config.coupling_reflection_scale,
-                        backend=coupling_compute_backend,
-                        precision=coupling_compute_precision,
-                        human_env_active_sets=(
-                            None if refresh_coupling_visibility
-                            else cached_human_env_active_sets
-                        ),
-                        env_human_active_sets=(
-                            None if refresh_coupling_visibility
-                            else cached_env_human_active_sets
-                        ),
-                    )
-                    cached_human_env_active_sets = coupling.human_env_active_sets
-                    cached_env_human_active_sets = coupling.env_human_active_sets
-                    coupling_elapsed_s = time.perf_counter() - coupling_t0
-                    runtime_profile_s["hybrid_coupling_channel"] += coupling_elapsed_s
-                    runtime_profile_counts["hybrid_coupling_channel"] += 1
-                    coupling_profile_s = coupling.runtime_profile_s or {}
-                    coupling_profile_counts = coupling.runtime_profile_counts or {}
-                    runtime_profile_s["hybrid_coupling_setup"] += (
-                        coupling_profile_s.get("coupling_setup", 0.0)
-                        + coupling_profile_s.get("coupling_assembly", 0.0)
-                    )
-                    runtime_profile_counts["hybrid_coupling_setup"] += (
-                        coupling_profile_counts.get("coupling_setup", 0)
-                        + coupling_profile_counts.get("coupling_assembly", 0)
-                    )
-                    runtime_profile_s["hybrid_human_env_channel"] += (
-                        coupling_profile_s.get("human_env_channel", 0.0)
-                    )
-                    runtime_profile_counts["hybrid_human_env_channel"] += (
-                        coupling_profile_counts.get("human_env_channel", 0)
-                    )
-                    runtime_profile_s["hybrid_env_human_channel"] += (
-                        coupling_profile_s.get("env_human_channel", 0.0)
-                    )
-                    runtime_profile_counts["hybrid_env_human_channel"] += (
-                        coupling_profile_counts.get("env_human_channel", 0)
-                    )
-                    human_env_counts[frame, chirp] = int(
-                        np.count_nonzero(coupling.human_env_valid)
-                    )
-                    env_human_counts[frame, chirp] = int(
-                        np.count_nonzero(coupling.env_human_valid)
-                    )
-                    human_env_delays = np.asarray(coupling.human_env_delays_s)
-                    if human_env_delays.ndim == 2:
-                        human_env_delays = np.mean(human_env_delays, axis=0)
-                    human_env_lengths = c * human_env_delays[
-                        coupling.human_env_valid
-                    ]
-                    if human_env_lengths.size:
-                        human_env_min_lengths[frame, chirp] = float(
-                            np.min(human_env_lengths)
-                        )
-                        human_env_mean_lengths[frame, chirp] = float(
-                            np.mean(human_env_lengths)
-                        )
-                        human_env_max_lengths[frame, chirp] = float(
-                            np.max(human_env_lengths)
-                        )
-                    env_human_delays = np.asarray(coupling.env_human_delays_s)
-                    if env_human_delays.ndim == 2:
-                        env_human_delays = np.mean(env_human_delays, axis=0)
-                    env_human_lengths = c * env_human_delays[
-                        coupling.env_human_valid
-                    ]
-                    if env_human_lengths.size:
-                        env_human_min_lengths[frame, chirp] = float(
-                            np.min(env_human_lengths)
-                        )
-                        env_human_mean_lengths[frame, chirp] = float(
-                            np.mean(env_human_lengths)
-                        )
-                        env_human_max_lengths[frame, chirp] = float(
-                            np.max(env_human_lengths)
-                        )
-
-                    human_env_adc_t0 = time.perf_counter()
-                    human_env_adc[frame, chirp] = self._synthesize_adc(
-                        coupling.human_env_coefficients,
-                        coupling.human_env_delays_s,
-                        coupling.human_env_valid,
-                        fmcw,
-                        backend=self.adc_compute_backend,
-                        precision=self.adc_compute_precision,
-                    )
-                    human_env_adc_elapsed_s = time.perf_counter() - human_env_adc_t0
-                    env_human_adc_t0 = time.perf_counter()
-                    env_human_adc[frame, chirp] = self._synthesize_adc(
-                        coupling.env_human_coefficients,
-                        coupling.env_human_delays_s,
-                        coupling.env_human_valid,
-                        fmcw,
-                        backend=self.adc_compute_backend,
-                        precision=self.adc_compute_precision,
-                    )
-                    env_human_adc_elapsed_s = time.perf_counter() - env_human_adc_t0
-                    runtime_profile_s["hybrid_human_env_adc_synthesis"] += (
-                        human_env_adc_elapsed_s
-                    )
-                    runtime_profile_counts["hybrid_human_env_adc_synthesis"] += 1
-                    runtime_profile_s["hybrid_env_human_adc_synthesis"] += (
-                        env_human_adc_elapsed_s
-                    )
-                    runtime_profile_counts["hybrid_env_human_adc_synthesis"] += 1
-                    runtime_profile_s["hybrid_coupling_adc_synthesis"] += (
-                        human_env_adc_elapsed_s + env_human_adc_elapsed_s
-                    )
-                    runtime_profile_counts["hybrid_coupling_adc_synthesis"] += 1
-
-        self._log_frame_progress(
-            mode="hybrid_static_env_po",
-            frame=num_frames - 1,
-            num_frames=num_frames,
-            frame_start_s=frame_start_s,
-            extra=f"static_paths={static_path_count}",
-        )
-
         po_calibration = {"mode": config.human_po_config.calibration.mode}
         human_po_gain = 1.0
         rt_baseline_components = {}
@@ -1585,6 +1289,10 @@ class MmWaveRadarSimulator:
                 radar,
                 targets,
                 num_frames=calibration_num_frames,
+                calibration_reference_component=(
+                    config.human_po_config.calibration.reference_component
+                    if config.human_po_config.calibration.mode == "rt_sequence" else None
+                ),
                 periodic_retrace=(
                     config.human_po_config.calibration.rt_periodic_retrace
                 ),
@@ -1604,10 +1312,10 @@ class MmWaveRadarSimulator:
                 )
             calibration_t0 = time.perf_counter()
             if config.human_po_config.calibration.mode == "rt_sequence":
-                human_po_gain, po_calibration = fit_sequence_path_power_calibration(
+                human_po_gain, po_calibration = fit_sequence_adc_calibration(
                     rt_baseline=rt_baseline,
                     po_times=human_cube.times,
-                    po_path_power=human_cube.metadata.total_path_power,
+                    po_adc=human_cube.adc,
                     config=config.human_po_config.calibration,
                 )
             else:
@@ -1701,14 +1409,24 @@ class MmWaveRadarSimulator:
             adc_complex_dtype,
             copy=False,
         )
-        human_env_adc = (human_env_adc * chirp_gain).astype(
-            adc_complex_dtype,
-            copy=False,
+        coupling_pass = _run_coupling_pass(
+            scene=scene, radar=radar, target=targets[0], times=times,
+            simulator=self, config=config, reflector_bank=reflector_bank,
+            gain_map=human_po_gain_map, progress=self.progress,
+            progress_every_frames=self.progress_interval,
         )
-        env_human_adc = (env_human_adc * chirp_gain).astype(
-            adc_complex_dtype,
-            copy=False,
-        )
+        human_env_adc = coupling_pass.human_env_adc
+        env_human_adc = coupling_pass.env_human_adc
+        human_env_counts = coupling_pass.human_env_counts
+        env_human_counts = coupling_pass.env_human_counts
+        human_env_min_lengths = coupling_pass.human_env_min_lengths
+        human_env_mean_lengths = coupling_pass.human_env_mean_lengths
+        human_env_max_lengths = coupling_pass.human_env_max_lengths
+        env_human_min_lengths = coupling_pass.env_human_min_lengths
+        env_human_mean_lengths = coupling_pass.env_human_mean_lengths
+        env_human_max_lengths = coupling_pass.env_human_max_lengths
+        runtime_profile_s.update(coupling_pass.runtime_profile_s)
+        runtime_profile_counts.update(coupling_pass.runtime_profile_counts)
 
         assembly_t0 = time.perf_counter()
         adc = (
@@ -1723,6 +1441,8 @@ class MmWaveRadarSimulator:
         runtime_profile_counts["hybrid_total"] = 1
 
         metadata = SensingMetadata(
+
+            adc_if_filter=dict(self.adc_if_filter),
             events=[
                 {
                     "reason": "static_environment_trace",
@@ -1733,8 +1453,10 @@ class MmWaveRadarSimulator:
                     "blocking_aabb_margin_m": float(config.blocking_aabb_margin_m),
                     "coupling_enabled": bool(config.coupling_enabled),
                     "coupling_reflector_count": coupling_reflector_count,
-                    "coupling_candidate_source": "static_rt_paths",
+                    "coupling_candidate_source": "scene_geometry_image_source_power",
+                    "coupling_power_threshold_db": config.coupling_power_threshold_db,
                     "coupling_max_reflectors": int(config.coupling_max_reflectors),
+                    "reflector_selection": getattr(reflector_bank, "selection_metadata", None),
                     "po_calibration_mode": po_calibration.get("mode"),
                     "po_calibration_gain": po_calibration.get(
                         "human_po_amplitude_gain", 1.0),
@@ -1806,6 +1528,7 @@ class MmWaveRadarSimulator:
         periodic_retrace: bool | None = None,
         periodic_retrace_period_chirps: int | None = None,
         retrace_once_per_frame: bool | None = None,
+        calibration_reference_component: POCalibrationReference | None = None,
     ) -> dict:
         """Runs a full-scene RT baseline and extracts first-frame human paths."""
 
@@ -1847,6 +1570,7 @@ class MmWaveRadarSimulator:
                 targets=targets,
                 simulator=self,
                 num_frames=num_frames,
+                calibration_reference_component=calibration_reference_component,
             )
         finally:
             self.mobility_mode = old_mobility_mode
@@ -1856,6 +1580,7 @@ class MmWaveRadarSimulator:
         return {
             "cube": result.cube,
             "human_reference_adc": result.human_reference_adc,
+            "reference_adc_power": result.reference_adc_power,
             "human_reference_path_counts": result.human_reference_path_counts,
             "human_touch_path_counts": result.human_touch_path_counts,
             "one_human_touch_path_counts": result.one_human_touch_path_counts,
@@ -1941,6 +1666,7 @@ class MmWaveRadarSimulator:
         )
         po_parent_face_integration = config.po_integration_mode in (
             "parent_face_quadrature",
+            "parent_face_adaptive_analytic",
             "parent_face_far_field_analytic",
         )
         if len(targets) > 1:
@@ -2029,8 +1755,9 @@ class MmWaveRadarSimulator:
             "visibility_fade_chirps": config.visibility_fade_chirps,
             "po_integration_mode": config.po_integration_mode,
             "po_quadrature_phase_span_scale_rad": (
-                config.po_quadrature_phase_span_scale_rad
+                config.effective_po_phase_span_scale_rad
             ),
+            "po_curvature_error_rad": config.po_curvature_error_rad,
             "po_quadrature_max_refinement_depth": (
                 config.po_quadrature_max_refinement_depth
             ),
@@ -2041,6 +1768,7 @@ class MmWaveRadarSimulator:
 
         if not targets:
             metadata = SensingMetadata(
+                adc_if_filter=dict(self.adc_if_filter),
                 events=events,
                 path_counts=path_counts,
                 max_displacements=max_displacements,
@@ -2096,6 +1824,13 @@ class MmWaveRadarSimulator:
             for chirp in range(num_chirps):
                 self.check_cancelled()
                 t0 = time.perf_counter()
+                self.report_chirp_progress(
+                    mode="human_only_po",
+                    frame=frame,
+                    num_frames=num_frames,
+                    chirp=chirp,
+                    num_chirps=num_chirps,
+                )
                 chirp_time = fmcw.chirp_time(frame, chirp)
                 times[frame, chirp] = chirp_time
                 mesh_t0 = time.perf_counter()
@@ -2180,7 +1915,8 @@ class MmWaveRadarSimulator:
                             visible_sample_counts_override),
                         po_integration_mode=config.po_integration_mode,
                         po_quadrature_phase_span_scale_rad=(
-                            config.po_quadrature_phase_span_scale_rad),
+                            config.effective_po_phase_span_scale_rad),
+                        po_curvature_error_rad=config.po_curvature_error_rad,
                         po_quadrature_max_refinement_depth=(
                             config.po_quadrature_max_refinement_depth),
                         po_quadrature_max_subfaces_per_parent=(
@@ -2188,6 +1924,12 @@ class MmWaveRadarSimulator:
                         progress_callback=config.progress_callback,
                         compute_backend=po_compute_backend,
                         compute_precision=po_compute_precision,
+                        polarization_axis=_rotation_matrix_numpy(radar.orientation)[:, 2],
+                        receiver_fmcw=fmcw,
+                        max_frequency_offset_hz=(
+                            fmcw.slope * (fmcw.num_adc_samples - 1)
+                            / fmcw.sampling_frequency
+                        ),
                     )
                     incremental_state = self._po_incremental_state_from_result(
                         result,
@@ -2247,7 +1989,8 @@ class MmWaveRadarSimulator:
                                 config.adaptive_visibility_edge_margin),
                             po_integration_mode=config.po_integration_mode,
                             po_quadrature_phase_span_scale_rad=(
-                                config.po_quadrature_phase_span_scale_rad),
+                                config.effective_po_phase_span_scale_rad),
+                            po_curvature_error_rad=config.po_curvature_error_rad,
                             po_quadrature_max_refinement_depth=(
                                 config.po_quadrature_max_refinement_depth),
                             po_quadrature_max_subfaces_per_parent=(
@@ -2257,6 +2000,12 @@ class MmWaveRadarSimulator:
                             compute_precision=po_compute_precision,
                             runtime_profile_s=runtime_profile_s,
                             runtime_profile_counts=runtime_profile_counts,
+                            polarization_axis=_rotation_matrix_numpy(radar.orientation)[:, 2],
+                            receiver_fmcw=fmcw,
+                            max_frequency_offset_hz=(
+                                fmcw.slope * (fmcw.num_adc_samples - 1)
+                                / fmcw.sampling_frequency
+                            ),
                         )
                     )
                     add_runtime_profile(
@@ -2280,19 +2029,22 @@ class MmWaveRadarSimulator:
                 result = self._apply_po_hardware_gain(result, radar)
 
                 valid = np.any(np.abs(result.coefficients) > 0.0, axis=0)
+                if result.delay_response is not None:
+                    valid |= result.delay_response.valid_paths
                 path_counts[frame, chirp] = int(np.count_nonzero(valid))
                 po_path_power[frame, chirp] = po_path_power_from_coefficients(
                     result.coefficients,
                     valid,
                 )
                 adc_t0 = time.perf_counter()
-                adc[frame, chirp] = self._synthesize_adc(
+                adc[frame, chirp] = self.synthesize_adc(
                     result.coefficients,
                     result.delays_s,
                     valid,
                     fmcw,
                     backend=self.adc_compute_backend,
                     precision=self.adc_compute_precision,
+                    delay_response=result.delay_response,
                 )
                 add_runtime_profile(
                     "adc_synthesis",
@@ -2375,6 +2127,10 @@ class MmWaveRadarSimulator:
                     radar,
                     targets,
                     num_frames=calibration_num_frames,
+                    calibration_reference_component=(
+                        config.calibration.reference_component
+                        if config.calibration.mode == "rt_sequence" else None
+                    ),
                     periodic_retrace=config.calibration.rt_periodic_retrace,
                     periodic_retrace_period_chirps=(
                         config.calibration.rt_periodic_retrace_period_chirps
@@ -2394,10 +2150,10 @@ class MmWaveRadarSimulator:
                     )
                 fit_t0 = time.perf_counter()
                 if config.calibration.mode == "rt_sequence":
-                    gain, po_calibration = fit_sequence_path_power_calibration(
+                    gain, po_calibration = fit_sequence_adc_calibration(
                         rt_baseline=rt_baseline,
                         po_times=times,
-                        po_path_power=po_path_power,
+                        po_adc=adc,
                         config=config.calibration,
                     )
                 else:
@@ -2499,6 +2255,7 @@ class MmWaveRadarSimulator:
 
         phase_jumps = self._phase_jump_diagnostics(phase_center_channel)
         metadata = SensingMetadata(
+            adc_if_filter=dict(self.adc_if_filter),
             events=events,
             path_counts=path_counts,
             max_displacements=max_displacements,
@@ -2554,6 +2311,8 @@ class MmWaveRadarSimulator:
         return replace(
             result,
             coefficients=coefficients.astype(result.coefficients.dtype, copy=False),
+            delay_response=(None if result.delay_response is None else
+                            result.delay_response.with_channel_gains(result.delay_response.channel_gains * gains)),
             phase_center_contributions=phase_center_contributions.astype(
                 result.phase_center_contributions.dtype,
                 copy=False,
@@ -2590,6 +2349,7 @@ class MmWaveRadarSimulator:
         )
         return _POIncrementalState(
             face_indices=result.face_indices.copy(),
+            delay_response=result.delay_response,
             coefficients=result.coefficients.copy(),
             delays_s=result.delays_s.copy(),
             phase_center_contributions=(
@@ -2644,6 +2404,7 @@ class MmWaveRadarSimulator:
         adaptive_visibility_edge_margin: float,
         po_integration_mode: str,
         po_quadrature_phase_span_scale_rad: float,
+        po_curvature_error_rad: float,
         po_quadrature_max_refinement_depth: int,
         po_quadrature_max_subfaces_per_parent: int,
         progress_callback,
@@ -2651,6 +2412,9 @@ class MmWaveRadarSimulator:
         compute_precision: ComputePrecision,
         runtime_profile_s: dict[str, float] | None = None,
         runtime_profile_counts: dict[str, int] | None = None,
+        polarization_axis: np.ndarray | None = None,
+        max_frequency_offset_hz: float | None = None,
+        receiver_fmcw=None,
     ) -> tuple[POChannelResult, _POIncrementalState, int]:
         """Updates cached PO state and exactly recomputes changed faces."""
 
@@ -2744,208 +2508,91 @@ class MmWaveRadarSimulator:
             time.perf_counter() - path_geometry_t0,
         )
 
-        bank_merge_t0 = time.perf_counter()
-        old_positions = _match_sorted_face_positions(
-            state.face_indices,
-            selected,
-        )
-        existing_mask = old_positions >= 0
-        num_vc = int(np.asarray(tx_positions).shape[0]
-                     * np.asarray(rx_positions).shape[0])
-        coefficients = np.zeros(
-            (num_vc, selected.shape[0]),
-            dtype=state.coefficients.dtype,
-        )
-        phase_center_contrib = np.zeros(
-            selected.shape[0],
-            dtype=state.phase_center_contributions.dtype,
-        )
-        add_profile(
-            "po_incremental_bank_merge",
-            time.perf_counter() - bank_merge_t0,
-        )
+        delay_response = None
+        if max_frequency_offset_hz is not None and po_integration_mode != "face_centroid":
+            delay_response = PODelayResponse.for_mesh(
+                vertices, faces, selected.size, max_frequency_offset_hz,
+                receiver_fmcw=receiver_fmcw,
+                channel_delay_margin_s=(
+                    np.max(np.linalg.norm(tx_positions-np.mean(tx_positions, axis=0), axis=1))
+                    + np.max(np.linalg.norm(rx_positions-np.mean(rx_positions, axis=0), axis=1))) / c)
+            delay_response.set_reference(np.arange(selected.size), selected_centroids,
+                                         np.mean(tx_positions, axis=0), np.mean(rx_positions, axis=0))
 
-        if np.any(existing_mask):
-            phase_update_t0 = time.perf_counter()
-            existing_positions = np.flatnonzero(existing_mask)
-            cached_positions = old_positions[existing_positions]
-            existing_faces = selected[existing_positions]
-            old_selected_weights = state.effective_weights[
-                existing_faces
-            ].copy()
-            new_selected_weights = effective_weights[existing_faces]
-            weight_scale = np.divide(
-                new_selected_weights,
-                np.maximum(old_selected_weights, 1e-18),
-            )
-            coefficients[:, existing_positions] = (
-                self._phase_update_coefficients(
-                    state.coefficients[:, cached_positions]
-                    * weight_scale[None, :],
-                    old_lengths_m=state.path_lengths_m[:, cached_positions],
-                    new_lengths_m=path_lengths[:, existing_positions],
-                    old_spreads_m2=(
-                        state.spread_products_m2[:, cached_positions]),
-                    new_spreads_m2=spreads[:, existing_positions],
-                    frequency_hz=frequency_hz,
-                )
-            )
-            phase_center_contrib[existing_positions] = (
-                self._phase_update_coefficients(
-                    (state.phase_center_contributions[cached_positions]
-                     * weight_scale)[None, :],
-                    old_lengths_m=(
-                        state.phase_center_lengths_m[cached_positions]
-                    )[None, :],
-                    new_lengths_m=phase_lengths[existing_positions][None, :],
-                    old_spreads_m2=(
-                        state.phase_center_spreads_m2[cached_positions]
-                    )[None, :],
-                    new_spreads_m2=phase_spreads[existing_positions][None, :],
-                    frequency_hz=frequency_hz,
-                ).reshape(-1)
-            )
-            add_profile(
-                "po_incremental_phase_update",
-                time.perf_counter() - phase_update_t0,
-            )
-
-        drift_check_t0 = time.perf_counter()
-        recompute_mask = ~existing_mask
-        exact_centroids = selected_centroids.copy()
-        exact_normals = selected_normals.copy()
-        exact_areas = selected_areas.copy()
-        if np.any(existing_mask):
-            existing_positions = np.flatnonzero(existing_mask)
-            cached_positions = old_positions[existing_positions]
-            exact_centroids[existing_positions] = (
-                state.exact_face_centroids[cached_positions]
-            )
-            exact_normals[existing_positions] = (
-                state.exact_face_normals[cached_positions]
-            )
-            exact_areas[existing_positions] = (
-                state.exact_face_areas[cached_positions]
-            )
-            normal_cos = np.einsum(
-                "ij,ij->i",
-                np.asarray(state.exact_face_normals[cached_positions],
-                           dtype=float),
-                selected_normals[existing_positions],
-            )
-            normal_cos = np.clip(normal_cos, -1.0, 1.0)
-            if normal_threshold_rad <= 0.0:
-                recompute_mask[existing_positions] = True
-            else:
-                recompute_mask[existing_positions] = (
-                    normal_cos < np.cos(normal_threshold_rad)
-                )
-            if (centroid_displacement_threshold_m is not None
-                    and centroid_displacement_threshold_m >= 0.0):
-                centroid_shift = np.linalg.norm(
-                    selected_centroids[existing_positions]
-                    - state.exact_face_centroids[cached_positions],
-                    axis=1,
-                )
-                recompute_mask[existing_positions] |= (
-                    centroid_shift > centroid_displacement_threshold_m
-                )
-            if (area_relative_threshold is not None
-                    and area_relative_threshold >= 0.0):
-                reference_area = np.maximum(
-                    np.abs(state.exact_face_areas[cached_positions]),
-                    1e-18,
-                )
-                area_relative_change = np.abs(
-                    selected_areas[existing_positions]
-                    - state.exact_face_areas[cached_positions]
-                ) / reference_area
-                recompute_mask[existing_positions] |= (
-                    area_relative_change > area_relative_threshold
-                )
-        recompute_positions = np.flatnonzero(recompute_mask)
         far_field_max_edge_m = state.far_field_max_edge_m
         far_field_nearest_distance_m = state.far_field_nearest_distance_m
-        if (
-            po_integration_mode == "parent_face_far_field_analytic"
-            and (refresh_visibility or far_field_max_edge_m is None)
-        ):
-            far_field_max_edge_m, far_field_nearest_distance_m = (
-                parent_face_far_field_edge_rule(
-                    vertices=vertices,
-                    faces=faces,
-                    tx_positions=tx_positions,
-                    rx_positions=rx_positions,
-                    frequency_hz=frequency_hz,
-                )
-            )
-        add_profile(
-            "po_incremental_drift_check",
-            time.perf_counter() - drift_check_t0,
-        )
+        if (po_integration_mode == "parent_face_far_field_analytic"
+                and (refresh_visibility or far_field_max_edge_m is None)):
+            far_field_max_edge_m, far_field_nearest_distance_m = parent_face_far_field_edge_rule(
+                vertices=vertices, faces=faces, tx_positions=tx_positions,
+                rx_positions=rx_positions, frequency_hz=frequency_hz)
 
-        if recompute_positions.size > 0:
-            exact_recompute_t0 = time.perf_counter()
-            recompute_faces = selected[recompute_positions]
+        def integrate_changed(recompute_positions):
+            nonlocal far_field_max_edge_m, far_field_nearest_distance_m
             phase_contrib, far_field_max_edge_m, far_field_nearest_distance_m = (
                 self._exact_po_parent_face_contributions(
                     po_integration_mode=po_integration_mode,
-                    vertices=vertices,
-                    faces=faces,
-                    centroids=centroids,
-                    normals=normals,
-                    areas=areas,
-                    recompute_faces=recompute_faces,
+                    vertices=vertices, faces=faces, centroids=centroids,
+                    normals=normals, areas=areas,
+                    recompute_faces=selected[recompute_positions],
                     effective_weights=effective_weights,
-                    tx_positions=tx_positions,
-                    rx_positions=rx_positions,
-                    frequency_hz=frequency_hz,
-                    material=material,
-                    po_quadrature_phase_span_scale_rad=(
-                        po_quadrature_phase_span_scale_rad),
-                    po_quadrature_max_refinement_depth=(
-                        po_quadrature_max_refinement_depth),
-                    po_quadrature_max_subfaces_per_parent=(
-                        po_quadrature_max_subfaces_per_parent),
+                    tx_positions=tx_positions, rx_positions=rx_positions,
+                    frequency_hz=frequency_hz, material=material,
+                    po_quadrature_phase_span_scale_rad=po_quadrature_phase_span_scale_rad,
+                    po_curvature_error_rad=po_curvature_error_rad,
+                    po_quadrature_max_refinement_depth=po_quadrature_max_refinement_depth,
+                    po_quadrature_max_subfaces_per_parent=po_quadrature_max_subfaces_per_parent,
                     far_field_max_edge_m=far_field_max_edge_m,
                     far_field_nearest_distance_m=far_field_nearest_distance_m,
                     progress_callback=progress_callback,
-                    compute_backend=compute_backend,
-                    compute_precision=compute_precision,
+                    compute_backend=compute_backend, compute_precision=compute_precision,
+                    polarization_axis=polarization_axis, delay_response=delay_response,
+                    delay_path_indices=recompute_positions,
                 )
             )
-            # Approximation: recompute exact PO only at the phase center for
-            # drifted/new faces, then project to virtual channels using
-            # path-length phase, spreading, and per-channel delays.
-            projected_coefficients, _, _, _ = (
-                project_phase_center_contributions_to_virtual_channels(
-                    phase_contrib,
-                    selected_centroids[recompute_positions],
-                    tx_positions,
-                    rx_positions,
-                    frequency_hz,
-                    virtual_channel_tx_indices=virtual_channel_tx_indices,
-                    virtual_channel_rx_indices=virtual_channel_rx_indices,
-                    virtual_channel_order=virtual_channel_order,
-                    precision=compute_precision,
-                )
-            )
-            coefficients[:, recompute_positions] = projected_coefficients
-            phase_center_contrib[recompute_positions] = phase_contrib
-            exact_centroids[recompute_positions] = (
-                selected_centroids[recompute_positions]
-            )
-            exact_normals[recompute_positions] = (
-                selected_normals[recompute_positions]
-            )
-            exact_areas[recompute_positions] = selected_areas[
-                recompute_positions
-            ]
-            add_profile(
-                "po_incremental_exact_recompute",
-                time.perf_counter() - exact_recompute_t0,
-            )
+            projected, _, _, _ = project_phase_center_contributions_to_virtual_channels(
+                phase_contrib, selected_centroids[recompute_positions],
+                tx_positions, rx_positions, frequency_hz,
+                virtual_channel_tx_indices=virtual_channel_tx_indices,
+                virtual_channel_rx_indices=virtual_channel_rx_indices,
+                virtual_channel_order=virtual_channel_order, precision=compute_precision)
+            return projected, phase_contrib
 
+        previous_surface = POFacetState(
+            state.face_indices, state.coefficients, state.phase_center_contributions,
+            state.exact_face_centroids, state.exact_face_normals, state.exact_face_areas,
+            state.path_lengths_m, state.spread_products_m2,
+            state.phase_center_lengths_m, state.phase_center_spreads_m2,
+            state.effective_weights[state.face_indices], state.delay_response,
+            np.arange(state.face_indices.size),
+        )
+        surface, recompute_positions = update_po_facets(
+            previous=previous_surface, selected=selected, centroids=selected_centroids,
+            normals=selected_normals, areas=selected_areas,
+            path_lengths=path_lengths, spreads=spreads,
+            phase_lengths=phase_lengths, phase_spreads=phase_spreads,
+            weights=effective_weights[selected], frequency_hz=frequency_hz,
+            normal_threshold_rad=normal_threshold_rad,
+            centroid_displacement_threshold_m=centroid_displacement_threshold_m,
+            area_relative_threshold=area_relative_threshold,
+            delay_response=delay_response, response_indices=np.arange(selected.size),
+            integrate=integrate_changed, dtype=state.coefficients.dtype, add_profile=add_profile,
+        )
+        coefficients = surface.coefficients
+        phase_center_contrib = surface.phase_center_contributions
+        exact_centroids = surface.exact_face_centroids
+        exact_normals = surface.exact_face_normals
+        exact_areas = surface.exact_face_areas
+
+        if delay_response is not None:
+            gains, _, _, _ = project_phase_center_contributions_to_virtual_channels(
+                np.ones(selected.size, complex), selected_centroids, tx_positions, rx_positions,
+                frequency_hz, virtual_channel_tx_indices=virtual_channel_tx_indices,
+                virtual_channel_rx_indices=virtual_channel_rx_indices,
+                virtual_channel_order=virtual_channel_order, precision=compute_precision,
+            )
+            delay_response = delay_response.with_channel_gains(gains)
+        state.delay_response = delay_response
         state_update_t0 = time.perf_counter()
         state.face_indices = selected.copy()
         state.coefficients = coefficients
@@ -2986,6 +2633,7 @@ class MmWaveRadarSimulator:
 
         result = POChannelResult(
             coefficients=state.coefficients,
+            delay_response=state.delay_response,
             delays_s=state.delays_s,
             face_indices=state.face_indices,
             face_centroids=state.face_centroids,
@@ -3029,6 +2677,7 @@ class MmWaveRadarSimulator:
         frequency_hz: float,
         material,
         po_quadrature_phase_span_scale_rad: float,
+        po_curvature_error_rad: float,
         po_quadrature_max_refinement_depth: int,
         po_quadrature_max_subfaces_per_parent: int,
         far_field_max_edge_m: float | None,
@@ -3036,6 +2685,9 @@ class MmWaveRadarSimulator:
         progress_callback,
         compute_backend: ComputeBackend,
         compute_precision: ComputePrecision,
+        polarization_axis: np.ndarray | None = None,
+        delay_response: PODelayResponse | None = None,
+        delay_path_indices: np.ndarray | None = None,
     ) -> tuple[np.ndarray, float | None, float | None]:
         """Exactly recomputes parent-face PO contributions for one mode."""
 
@@ -3065,6 +2717,7 @@ class MmWaveRadarSimulator:
                 weights=effective_weights[sorted_faces],
                 backend=compute_backend,
                 precision=compute_precision,
+                polarization_axis=polarization_axis,
             )
         elif po_integration_mode == "parent_face_quadrature":
             (
@@ -3098,29 +2751,40 @@ class MmWaveRadarSimulator:
                 backend=compute_backend,
                 precision=compute_precision,
                 progress_callback=progress_callback,
+                polarization_axis=polarization_axis,
+                delay_response=delay_response,
+                delay_path_indices=(None if delay_path_indices is None else delay_path_indices[order]),
             )
-        elif po_integration_mode == "parent_face_far_field_analytic":
-            (
-                far_field_centroids,
-                far_field_normals,
-                far_field_areas,
-                far_field_parent_indices,
-                far_field_triangles,
-                far_field_max_edge_m,
-                far_field_nearest_distance_m,
-            ) = parent_face_far_field_analytic_geometry(
-                vertices=vertices,
-                faces=faces,
-                selected_parent_indices=sorted_faces,
-                tx_positions=tx_positions,
-                rx_positions=rx_positions,
-                frequency_hz=frequency_hz,
+        elif po_integration_mode in ("parent_face_adaptive_analytic", "parent_face_far_field_analytic"):
+            geometry_kwargs = dict(
+                vertices=vertices, faces=faces, selected_parent_indices=sorted_faces,
+                tx_positions=tx_positions, rx_positions=rx_positions, frequency_hz=frequency_hz,
                 max_refinement_depth=po_quadrature_max_refinement_depth,
                 max_subfaces_per_parent=po_quadrature_max_subfaces_per_parent,
-                far_field_max_edge_m=far_field_max_edge_m,
-                far_field_nearest_distance_m=far_field_nearest_distance_m,
                 progress_callback=progress_callback,
             )
+            if po_integration_mode == "parent_face_adaptive_analytic":
+                (
+                    far_field_centroids, far_field_normals, far_field_areas,
+                    far_field_parent_indices, far_field_triangles,
+                ) = parent_face_adaptive_analytic_geometry(
+                    **geometry_kwargs, phase_span_scale_rad=po_quadrature_phase_span_scale_rad,
+                    curvature_error_rad=po_curvature_error_rad,
+                )
+            else:
+                (
+                    far_field_centroids,
+                    far_field_normals,
+                    far_field_areas,
+                    far_field_parent_indices,
+                    far_field_triangles,
+                    far_field_max_edge_m,
+                    far_field_nearest_distance_m,
+                ) = parent_face_far_field_analytic_geometry(
+                    **geometry_kwargs,
+                    far_field_max_edge_m=far_field_max_edge_m,
+                    far_field_nearest_distance_m=far_field_nearest_distance_m,
+                )
             sorted_contrib = _aggregate_parent_face_far_field_analytic_contributions(
                 selected_parent_indices=sorted_faces,
                 integration_triangles=far_field_triangles,
@@ -3136,6 +2800,9 @@ class MmWaveRadarSimulator:
                 backend=compute_backend,
                 precision=compute_precision,
                 progress_callback=progress_callback,
+                polarization_axis=polarization_axis,
+                delay_response=delay_response,
+                delay_path_indices=(None if delay_path_indices is None else delay_path_indices[order]),
             )
         else:
             raise ValueError(f"unsupported po_integration_mode: {po_integration_mode}")
@@ -3192,13 +2859,11 @@ class MmWaveRadarSimulator:
     ) -> np.ndarray:
         """Updates coefficients for geometric phase and spreading changes."""
 
-        coefficients = np.asarray(coefficients)
-        k0 = 2.0 * pi * frequency_hz / c
-        # Keep PO phase updates in the dechirped ADC convention: increasing
-        # path length gives a positive slow-time phase slope.
-        phase = np.exp(1j * k0 * (new_lengths_m - old_lengths_m))
-        spreading = old_spreads_m2 / np.maximum(new_spreads_m2, 1e-18)
-        return (coefficients * phase * spreading).astype(coefficients.dtype)
+        return phase_update_coefficients(
+            coefficients, old_lengths_m=old_lengths_m, new_lengths_m=new_lengths_m,
+            old_spreads_m2=old_spreads_m2, new_spreads_m2=new_spreads_m2,
+            frequency_hz=frequency_hz,
+        )
 
     def trace_paths(
         self,
@@ -3236,6 +2901,7 @@ class MmWaveRadarSimulator:
         *,
         backend: ComputeBackend | None = None,
         precision: ComputePrecision | None = None,
+        delay_response: PODelayResponse | None = None,
     ) -> np.ndarray:
         """Synthesizes one chirp from path arrays and an explicit valid mask."""
 
@@ -3246,6 +2912,8 @@ class MmWaveRadarSimulator:
             fmcw,
             backend=self.adc_compute_backend if backend is None else backend,
             precision=self.adc_compute_precision if precision is None else precision,
+            delay_response=delay_response,
+            diagnostics=self.adc_if_filter,
         )
 
     def _trace(self, scene):

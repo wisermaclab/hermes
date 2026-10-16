@@ -33,6 +33,8 @@ def test_po_profile_cache_round_trip_and_match(tmp_path):
                 {"frame": 0, "chirp": 0, "reason": "initial"},
                 {"frame": 1, "chirp": 1, "reason": "displacement"},
             ],
+            adc_if_filter={"adc_mode": "complex1x", "cutoff_hz": 4.05e6,
+                           "rejected_path_channels": 5},
             po_calibration={
                 "mode": "rt_first_pose",
                 "applied": True,
@@ -71,6 +73,7 @@ def test_po_profile_cache_round_trip_and_match(tmp_path):
         {"frame": 0, "chirp": 0, "reason": "initial"},
         {"frame": 1, "chirp": 1, "reason": "displacement"},
     ]
+    assert loaded.metadata.adc_if_filter == cube.metadata.adc_if_filter
     assert loaded.metadata.po_calibration["mode"] == "rt_first_pose"
     assert loaded.metadata.po_calibration["human_po_amplitude_gain"] == 2.0
     assert np.array_equal(

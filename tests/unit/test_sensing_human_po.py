@@ -70,7 +70,8 @@ def test_human_only_po_without_targets_preserves_chirp_times():
     assert not np.any(cube.adc)
 
 
-def test_human_only_po_rt_first_pose_calibration_scales_adc_and_keeps_baseline():
+@pytest.mark.parametrize("calibration_mode", ["rt_first_pose", "rt_sequence"])
+def test_human_only_po_calibration_scales_adc_and_keeps_baseline(calibration_mode):
     class CalibrationSimulator(MmWaveRadarSimulator):
         def _run_rt_baseline_for_calibration(
             self,
@@ -82,6 +83,7 @@ def test_human_only_po_rt_first_pose_calibration_scales_adc_and_keeps_baseline()
             periodic_retrace=None,
             periodic_retrace_period_chirps=None,
             retrace_once_per_frame=None,
+            calibration_reference_component=None,
         ):
             del scene, targets
             assert periodic_retrace is True
@@ -108,6 +110,9 @@ def test_human_only_po_rt_first_pose_calibration_scales_adc_and_keeps_baseline()
             return {
                 "cube": RadarCube(adc=adc, times=np.zeros(adc.shape[:2]), metadata=metadata),
                 "human_reference_adc": adc[0],
+                "reference_adc_power": {
+                    "single_human_only": np.mean(np.abs(adc) ** 2, axis=2),
+                },
                 "human_reference_path_counts": np.ones(
                     fmcw.num_chirps_per_frame,
                     dtype=np.int64,
@@ -131,7 +136,7 @@ def test_human_only_po_rt_first_pose_calibration_scales_adc_and_keeps_baseline()
             visibility_samples_per_face=1,
             visibility_fade_chirps=1,
             calibration=POCalibrationConfig(
-                mode="rt_first_pose",
+                mode=calibration_mode,
                 rt_periodic_retrace=True,
             ),
         ),
@@ -140,6 +145,7 @@ def test_human_only_po_rt_first_pose_calibration_scales_adc_and_keeps_baseline()
     cube = sim.run(scene, radar, [target], num_frames=1)
 
     assert cube.metadata.po_calibration["applied"] is True
+    assert cube.metadata.po_calibration["reference_power_kind"] == "adc_rms_power"
     assert np.isclose(np.mean(np.abs(cube.adc[0]) ** 2), 4.0)
     assert cube.metadata.po_calibration["rt_baseline_periodic_retrace"] is True
     assert cube.metadata.po_calibration["rt_baseline_retrace_once_per_frame"] is True
@@ -410,7 +416,8 @@ def test_human_only_po_incremental_centroid_drift_triggers_recompute():
     )
 
 
-def test_human_only_po_rigid_translation_matches_expected_phase_slope():
+@pytest.mark.parametrize("incremental", [False, True])
+def test_human_only_po_rigid_translation_matches_expected_phase_slope(incremental):
     scene = load_scene()
     radar = _phase_one_radar(num_chirps=3, chirp_repetition_time=1.0)
     target = MeshTarget(
@@ -420,7 +427,10 @@ def test_human_only_po_rigid_translation_matches_expected_phase_slope():
     )
     sim = MmWaveRadarSimulator(
         mobility_mode="human_only_po",
-        human_po_config=HumanPOMobilityConfig(visibility_fade_chirps=1),
+        human_po_config=HumanPOMobilityConfig(
+            visibility_fade_chirps=1, incremental_update=incremental,
+            incremental_full_refresh_chirps=0,
+        ),
     )
 
     cube = sim.run(scene, radar, [target], num_frames=1)

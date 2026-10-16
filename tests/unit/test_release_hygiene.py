@@ -274,7 +274,8 @@ def test_hybrid_po_notebook_is_a_focused_api_tutorial():
     assert "plot_mesh_projection" in source
     assert "plot_bedroom_scene_projection" in source
     assert "BEDROOM_SCENE_XML" in source
-    assert "BEDROOM_SCENE_BOXES" in source
+    assert "derived from that shared XML automatically" in source
+    assert "BEDROOM_SCENE_BOXES" not in source
     assert "range_profile_from_cube" in source
     assert "range_doppler_map" in source
     assert "db_relative" in source
@@ -315,7 +316,8 @@ def test_full_rt_notebook_is_a_focused_api_tutorial():
     assert "plot_mesh_projection" in source
     assert "plot_bedroom_scene_projection" in source
     assert "BEDROOM_SCENE_XML" in source
-    assert "BEDROOM_SCENE_BOXES" in source
+    assert "derived from it automatically" in source
+    assert "BEDROOM_SCENE_BOXES" not in source
     assert "range_profile_from_cube" in source
     assert "range_doppler_map" in source
     assert "db_relative" in source

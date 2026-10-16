@@ -56,6 +56,7 @@ class PointTargetSynthesisResult:
     coefficients: np.ndarray
     delays_s: np.ndarray
     adc: np.ndarray
+    adc_if_filter: dict | None = None
 
 
 def make_point_target_fmcw_config(
@@ -70,6 +71,8 @@ def make_point_target_fmcw_config(
     frame_period: float = 50.0e-3,
     num_tx: int = 1,
     tdm_enabled: bool = False,
+    adc_mode: str = "complex1x",
+    if_bandwidth_hz: float | None = None,
 ) -> FMCWConfig:
     """Builds a configurable FMCW profile for analytic point-target examples."""
 
@@ -84,6 +87,8 @@ def make_point_target_fmcw_config(
         frame_period=frame_period,
         num_tx=num_tx,
         tdm_enabled=tdm_enabled,
+        adc_mode=adc_mode,
+        if_bandwidth_hz=if_bandwidth_hz,
     )
 
 
@@ -155,12 +160,14 @@ def synthesize_virtual_center_point_targets(
             target.reflectivity * spreading * gain * array_phase
         )
 
+    filter_diagnostics = {}
     adc = synthesize_adc_from_paths(
         coeffs,
         delays_s,
         fmcw,
         backend=backend,
         precision=precision,
+        diagnostics=filter_diagnostics,
     )
     return PointTargetSynthesisResult(
         hardware=hardware,
@@ -169,6 +176,7 @@ def synthesize_virtual_center_point_targets(
         coefficients=coeffs,
         delays_s=delays_s,
         adc=adc,
+        adc_if_filter=filter_diagnostics,
     )
 
 

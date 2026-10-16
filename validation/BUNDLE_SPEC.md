@@ -133,6 +133,13 @@ source motion-frame index and selected inclusive frame window.
 
 ## ADC arrays
 
+The sensor's `fmcw.adc_mode` may be `complex1x` (default), `complex2x`, or
+`real`. Declare the acquisition mode explicitly for hardware captures; complex
+array storage alone does not distinguish Complex 1x from Complex 2x. Optional
+`fmcw.if_bandwidth_hz` caps the simulated receiver IF bandwidth. Synthesized
+returns outside the usable IF band are removed before sampling; the range FFT
+retains all bins for Complex 1x and half for Complex 2x/real.
+
 Every ADC NPZ must load with `numpy.load(..., allow_pickle=False)` and contain:
 
 | Key | Shape | Meaning |

@@ -158,6 +158,8 @@ def _build_launch_auth_provider(password: str):
     from bokeh.server.auth_provider import AuthProvider
     from tornado.web import RequestHandler
 
+    from .login import render_login_page
+
     cookie_name = "hermes_gui_user"
     expected_cookie = b"hermes"
 
@@ -167,16 +169,7 @@ def _build_launch_auth_provider(password: str):
 
         def get(self) -> None:
             self.set_header("Content-Type", "text/html; charset=UTF-8")
-            self.write(
-                "<!doctype html><html><head><title>HERMES access</title></head>"
-                "<body><main><h1>HERMES</h1><p>Enter the per-launch password "
-                "printed by the server.</p><form method='post' "
-                "action='/__hermes_login'><label>Password "
-                "<input name='password' type='password' required "
-                "autocomplete='current-password'></label> "
-                "<button type='submit'>Open HERMES</button></form></main>"
-                "</body></html>"
-            )
+            self.write(render_login_page())
 
         def post(self) -> None:
             # Fetch Metadata is checked before accepting a credential so a
@@ -191,7 +184,10 @@ def _build_launch_auth_provider(password: str):
             supplied = self.get_body_argument("password", default="")
             if not hmac.compare_digest(supplied, password):
                 self.set_status(403)
-                self.write("Invalid HERMES launch password.")
+                self.set_header("Content-Type", "text/html; charset=UTF-8")
+                self.write(render_login_page(
+                    "Incorrect launch password."
+                ))
                 return
             self.set_secure_cookie(
                 cookie_name,
@@ -211,7 +207,20 @@ def _build_launch_auth_provider(password: str):
                     "Sec-Fetch-Site",
                     "",
                 ).casefold()
-                if fetch_site not in {"none", "same-origin"}:
+                headers = request_handler.request.headers
+                websocket_upgrade = (
+                    headers.get("Upgrade", "").casefold() == "websocket"
+                    and "upgrade" in {
+                        token.strip().casefold()
+                        for token in headers.get("Connection", "").split(",")
+                    }
+                )
+                # Chrome omits Fetch Metadata on WebSocket handshakes. The
+                # signed cookie and Bokeh's Origin allowlist still protect
+                # these requests; explicit cross-site metadata stays denied.
+                if fetch_site not in {"none", "same-origin"} and not (
+                    not fetch_site and websocket_upgrade
+                ):
                     return None
                 user = request_handler.get_secure_cookie(
                     cookie_name,

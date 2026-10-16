@@ -77,7 +77,7 @@ class POCalibrationConfig:
 
     Attributes:
         mode: ``"none"`` disables fitting, ``"rt_first_pose"`` uses the first
-            RT/PO ADC frame, and ``"rt_sequence"`` fits from path-power samples
+            RT/PO ADC frame, and ``"rt_sequence"`` fits from coherent ADC powers
             selected across the available sequence.
         gain_type: Gain domain. Only amplitude gains are currently supported.
         reference_power_floor: Minimum RT/PO power allowed when forming a gain;
@@ -88,7 +88,7 @@ class POCalibrationConfig:
             schedule. ``rt_retrace_once_per_frame`` is the legacy alias.
         rt_periodic_retrace_period_chirps: Optional chirp period for retraces.
         sample_mode: Which PO chirps contribute to sequence fitting.
-        reference_component: RT path-power component used as the reference.
+        reference_component: RT path component used to synthesize the reference.
         alignment: How selected PO chirps are matched to RT reference chirps.
     """
 
@@ -292,14 +292,30 @@ def po_path_power_from_coefficients(
     return float(np.sum(path_power[np.asarray(valid, dtype=bool)]))
 
 
-def rt_reference_power_array(rt_baseline: dict, component: str) -> np.ndarray | None:
-    """Returns the RT path-power array used by a sequence calibration.
+def rt_reference_power_array(
+    rt_baseline: dict,
+    component: str,
+    *,
+    power_kind: str = "path_coefficient_power",
+) -> np.ndarray | None:
+    """Return RT powers for the requested received-signal or path diagnostic metric.
 
-    The lookup first checks the baseline dictionary, then falls back to matching
-    metadata attributes on ``rt_baseline["cube"]``. ``None`` means the requested
-    reference component was not recorded by the RT run.
+    Coherent ADC powers come from the baseline's per-component channel powers.
+    Legacy path powers also support lookup in cube metadata. ``None`` means
+    the requested reference component was not recorded by the RT run.
     """
 
+    if power_kind == "adc_rms_power":
+        value = rt_baseline.get("reference_adc_power", {}).get(component)
+        if value is None:
+            return None
+        # Retain channel powers separately until physical TDM slots are packed.
+        power = np.asarray(value, dtype=np.float64)
+        if power.ndim != 3:
+            raise ValueError("RT reference ADC power must have shape [frames, chirps, channels]")
+        return np.mean(power, axis=-1)
+    if power_kind != "path_coefficient_power":
+        raise ValueError(f"unsupported reference power kind: {power_kind!r}")
     key = {
         "single_human_only": "single_human_only_path_power",
         "one_human_touch": "one_human_touch_path_power",
@@ -433,6 +449,7 @@ def _sequence_power_samples(
     po_times: np.ndarray,
     po_path_power: np.ndarray,
     config: POCalibrationConfig,
+    reference_power_kind: str = "path_coefficient_power",
 ) -> tuple[dict[str, np.ndarray], dict]:
     """Builds aligned finite RT/PO power samples for gain fitting."""
 
@@ -440,7 +457,9 @@ def _sequence_power_samples(
     if cube is None:
         return {}, {"warnings": ["rt_baseline_cube_missing"]}
     rt_times = np.asarray(cube.times, dtype=float)
-    rt_power = rt_reference_power_array(rt_baseline, config.reference_component)
+    rt_power = rt_reference_power_array(
+        rt_baseline, config.reference_component, power_kind=reference_power_kind,
+    )
     if rt_power is None:
         return {}, {"warnings": ["rt_reference_power_missing"]}
     po_times = np.asarray(po_times, dtype=float)
@@ -508,7 +527,7 @@ def _sequence_power_samples(
         "effective_alignment": effective_alignment,
         "sample_mode": config.sample_mode,
         "reference_component": config.reference_component,
-        "reference_power_kind": "path_coefficient_power",
+        "reference_power_kind": reference_power_kind,
     }
     return samples, meta
 
@@ -608,14 +627,15 @@ def _time_varying_gain_map(
     return gain_map, meta, warnings
 
 
-def fit_sequence_path_power_calibration(
+def _fit_sequence_power_calibration(
     *,
     rt_baseline: dict,
     po_times: np.ndarray,
     po_path_power: np.ndarray,
     config: POCalibrationConfig,
+    reference_power_kind: str,
 ) -> tuple[float, dict]:
-    """Fits PO amplitude gains from an aligned RT path-power sequence.
+    """Fit PO amplitude gains from aligned RT and PO power samples.
 
     A scalar gain is always returned for compatibility with older call sites.
     When ``sample_mode="retrace_chirps"`` and ``alignment="last_retrace"``, the
@@ -628,6 +648,7 @@ def fit_sequence_path_power_calibration(
         po_times=po_times,
         po_path_power=po_path_power,
         config=config,
+        reference_power_kind=reference_power_kind,
     )
     warnings = list(meta.pop("warnings", []))
     rt_values = np.asarray(samples.get("rt_power", []), dtype=float)
@@ -676,6 +697,60 @@ def fit_sequence_path_power_calibration(
             np.mean(np.asarray(po_path_power, dtype=float) * gain_map * gain_map)
         )
     return gain, out
+
+
+def fit_sequence_adc_calibration(
+    *,
+    rt_baseline: dict,
+    po_times: np.ndarray,
+    po_adc: np.ndarray,
+    config: POCalibrationConfig,
+) -> tuple[float, dict]:
+    """Fit from coherent received waveforms, averaging power across ADC samples.
+
+    Path contributions must already be summed in each channel's waveform.
+    Channels and chirps contribute powers, not a further coherent field sum.
+    No incoherent path-power fallback is allowed for an absent RT reference.
+    """
+
+    po_adc = np.asarray(po_adc)
+    if po_adc.ndim != 4 or po_adc.shape[:2] != np.shape(po_times):
+        raise ValueError("PO ADC must have shape [frames, chirps, samples, channels]")
+    if rt_reference_power_array(
+        rt_baseline, config.reference_component, power_kind="adc_rms_power",
+    ) is None:
+        raise ValueError(
+            f"missing coherent RT ADC power for {config.reference_component!r}"
+        )
+    # Reduce one chirp at a time to avoid allocating another full ADC cube.
+    po_power = np.empty(np.shape(po_times), dtype=np.float64)
+    for index in np.ndindex(po_power.shape):
+        po_power[index] = adc_rms_power(po_adc[index])
+    return _fit_sequence_power_calibration(
+        rt_baseline=rt_baseline,
+        po_times=po_times,
+        po_path_power=po_power,
+        config=config,
+        reference_power_kind="adc_rms_power",
+    )
+
+
+def fit_sequence_path_power_calibration(
+    *,
+    rt_baseline: dict,
+    po_times: np.ndarray,
+    po_path_power: np.ndarray,
+    config: POCalibrationConfig,
+) -> tuple[float, dict]:
+    """Legacy fit from incoherent path powers; simulation uses ADC calibration."""
+
+    return _fit_sequence_power_calibration(
+        rt_baseline=rt_baseline,
+        po_times=po_times,
+        po_path_power=po_path_power,
+        config=config,
+        reference_power_kind="path_coefficient_power",
+    )
 
 
 def calibration_gain_array(

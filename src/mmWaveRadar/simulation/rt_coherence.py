@@ -128,6 +128,7 @@ def extract_coherent_rt_path_bank(
         coefficients,
         paths=paths,
         frequency_hz=radar.fmcw.carrier_frequency,
+        radar_orientation=radar.orientation,
     )
     num_paths = int(delays_s.size)
     path_vertices = _path_vertices(paths)
@@ -305,7 +306,7 @@ def update_coherent_rt_path_bank(
     freq = bank.frequency_hz if frequency_hz is None else float(frequency_hz)
     k0 = 2.0 * pi * freq / c
     length_delta = path_lengths - bank.anchor_path_lengths_m
-    phase = np.exp(1j * k0 * length_delta)
+    phase = np.exp(-1j * k0 * length_delta)
     spread_ratio = bank.anchor_spread_products_m / np.maximum(spreads, 1e-18)
     coefficients = bank.coefficients * phase * spread_ratio
     return CoherentRTPathUpdate(
@@ -785,7 +786,7 @@ def _update_coherent_rt_path_bank_torch(
     anchor_lengths = bank_data["anchor_path_lengths"]
     anchor_spreads = bank_data["anchor_spreads"]
     coefficients = bank_data["coefficients"]
-    phase = torch.exp(1j * wave_number * (path_lengths - anchor_lengths))
+    phase = torch.exp(-1j * wave_number * (path_lengths - anchor_lengths))
     spread_ratio = anchor_spreads / torch.clamp(spreads, min=1e-18)
     coefficients = coefficients * phase * spread_ratio
     path_lengths_np = path_lengths.cpu().numpy()

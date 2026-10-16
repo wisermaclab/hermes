@@ -45,7 +45,10 @@ from ..targets import (
     MeshTarget,
     ensure_outward_face_winding,
 )
-from ..tutorial_support import BEDROOM_SCENE_BOXES
+from ..tutorial_support import (
+    BEDROOM_SCENE_BOXES,
+    bedroom_scene_xml_for_boxes,
+)
 from .manifest import (
     ExperimentManifest,
     RadarExperimentConfig,
@@ -71,17 +74,6 @@ _ROOM_RADAR_HEIGHT_M = 1.0
 _MAX_SCENE_XML_BYTES = 8 * 1024**2
 _SUPPORTED_SMPL_MODEL_TYPES = frozenset({"smpl", "smplh", "smplx"})
 _SUPPORTED_SMPL_GENDERS = frozenset({"female", "male", "neutral"})
-_ROOM_MATERIALS = {
-    "floor": "mat-wood",
-    "back_wall": "mat-wall",
-    "left_wall": "mat-wall",
-    "right_wall": "mat-reflective-wall",
-    "bed": "mat-fabric",
-    "nightstand": "mat-wood",
-    "wardrobe": "mat-wood",
-}
-
-
 @dataclass(frozen=True)
 class HumanRoomPreview:
     """Transformed motion sequence plus lightweight prepared-room geometry."""
@@ -95,6 +87,7 @@ class HumanRoomPreview:
     motion_payload: Mapping[str, np.ndarray] | None = None
     scene_xml: bytes | None = None
     scene_source_name: str = "tutorial_bedroom"
+    motion_coordinate_settings: Mapping[str, object] | None = None
 
 
 @dataclass(frozen=True)
@@ -136,10 +129,10 @@ class HumanRoomDiagnostics:
 
 @dataclass(frozen=True)
 class LoadedAMASSMotion:
-    """Validated AMASS-like parameters plus a lazily evaluated SMPL sequence."""
+    """Validated human motion from pose parameters or evaluated mesh frames."""
 
     sequence: object
-    payload: Mapping[str, np.ndarray]
+    payload: Mapping[str, np.ndarray] | None
     source_name: str
 
 
@@ -164,9 +157,17 @@ class _TransformedMotionSequence:
         ):
             raise ValueError("output_signs must contain three finite nonzero values")
         self.times = np.asarray(base.times, dtype=float)
+        faces = np.asarray(base.faces)
+        transform = np.eye(3)[
+            self._axes if self._axes is not None else np.arange(3)
+        ]
+        if self._signs is not None:
+            transform = transform * self._signs[:, None]
+        if np.linalg.det(transform) < 0.0:
+            faces = faces[:, [0, 2, 1]]
         self.faces = ensure_outward_face_winding(
             self.vertices_at(float(self.times[0])),
-            np.asarray(base.faces),
+            faces,
         )
 
     @property
@@ -408,6 +409,42 @@ def _vector3(name: str, value) -> np.ndarray:
     return vector
 
 
+def motion_source_to_radar_transform(
+    up_axis: str,
+    forward_axis: str,
+    *,
+    handedness: str = "right",
+    length_unit: str = "m",
+) -> np.ndarray:
+    """Map a declared source frame to radar +x forward, +y left, +z up.
+
+    The returned matrix acts on column vectors and includes the conversion
+    to metres. Source axes describe a fixed reference frame, not the person's
+    changing heading. Apply this to evaluated meshes, not local joint angles.
+    """
+
+    directions = {
+        f"{sign}{axis}": multiplier * np.eye(3)[index]
+        for index, axis in enumerate("xyz")
+        for sign, multiplier in (("+", 1.0), ("-", -1.0))
+    }
+    if up_axis not in directions or forward_axis not in directions:
+        raise ValueError("motion axes must be one of +x, -x, +y, -y, +z, -z")
+    up = directions[up_axis]
+    forward = directions[forward_axis]
+    if np.dot(up, forward) != 0.0:
+        raise ValueError("motion up and forward axes must be perpendicular")
+    if handedness not in {"right", "left"}:
+        raise ValueError("motion handedness must be 'right' or 'left'")
+    scales = {"m": 1.0, "cm": 0.01, "mm": 0.001}
+    if length_unit not in scales:
+        raise ValueError("motion length_unit must be 'm', 'cm', or 'mm'")
+    left = np.cross(up, forward)
+    if handedness == "left":
+        left = -left
+    return scales[length_unit] * np.stack((forward, left, up))
+
+
 def _npz_scalar_string(data, key: str, default: str) -> str:
     if key not in data.files:
         return default
@@ -461,22 +498,97 @@ def _template_faces(
     return np.asarray(model.faces, dtype=np.uint32)
 
 
+def _load_evaluated_mesh_motion(source, arrays, *, source_name: str):
+    """Load supplied mesh frames without pairing their faces with SMPL."""
+
+    vertices = require_array(
+        arrays,
+        "vertices",
+        allowed_ndim=(3,),
+        dtype_kinds=frozenset({"i", "u", "f"}),
+        trailing_shape=(3,),
+        max_elements=120_000_000,
+    )
+    require_array(
+        arrays,
+        "faces",
+        allowed_ndim=(2,),
+        dtype_kinds=frozenset({"i", "u"}),
+        trailing_shape=(3,),
+        max_elements=6_000_000,
+        max_bytes=32 * 1024**2,
+    )
+    for name in ("times", "bundle_times"):
+        if name in arrays:
+            timing = require_array(
+                arrays,
+                name,
+                allowed_ndim=(1,),
+                dtype_kinds=frozenset({"i", "u", "f"}),
+                max_elements=10_000_000,
+            )
+            if timing.shape != (vertices.shape[0],):
+                raise ValueError(f"mesh motion {name} must match its frame count")
+    if "mocap_framerate" in arrays:
+        require_array(
+            arrays,
+            "mocap_framerate",
+            allowed_ndim=(0, 1),
+            dtype_kinds=frozenset({"i", "u", "f"}),
+            max_elements=1,
+        )
+    for name, kinds in (
+        ("output_axes", frozenset({"i", "u"})),
+        ("output_signs", frozenset({"i", "u", "f"})),
+    ):
+        if name in arrays:
+            require_array(
+                arrays,
+                name,
+                allowed_ndim=(1,),
+                dtype_kinds=kinds,
+                trailing_shape=(3,),
+                max_elements=3,
+            )
+
+    raw_source = BytesIO(source) if isinstance(source, (bytes, bytearray)) else source
+    with np.load(raw_source, allow_pickle=False) as data:
+        base = MeshSequence(
+            vertices=data["vertices"],
+            faces=data["faces"],
+            times=_amass_times(data, vertices.shape[0]),
+        )
+        axes = data["output_axes"] if "output_axes" in data.files else None
+        signs = data["output_signs"] if "output_signs" in data.files else None
+    return LoadedAMASSMotion(
+        sequence=_TransformedMotionSequence(base, axes=axes, signs=signs),
+        payload=None,
+        source_name=source_name,
+    )
+
+
 def load_amass_motion(
     source: str | Path | bytes | bytearray | BytesIO,
     *,
     filename: str | None = None,
     smpl_model_dir: str | Path | None = None,
 ) -> LoadedAMASSMotion:
-    """Load an AMASS-like archive for lazy SMPL evaluation."""
+    """Load evaluated mesh frames, or evaluate pose-only archives using SMPL."""
 
     inferred_name = filename
     if inferred_name is None and isinstance(source, (str, Path)):
         inferred_name = Path(source).name
     suffix = Path(inferred_name or "").suffix.casefold()
     if suffix and suffix != ".npz":
-        raise ValueError("human motion must be an AMASS-like .npz archive")
+        raise ValueError("human motion must be a .npz archive")
 
     arrays = preflight_npz(source, limits=DEFAULT_NPZ_LIMITS)
+    if "vertices" in arrays:
+        return _load_evaluated_mesh_motion(
+            source,
+            arrays,
+            source_name=Path(inferred_name or "human_motion.npz").name,
+        )
     poses_info = require_array(
         arrays,
         "poses",
@@ -695,7 +807,7 @@ def load_human_motion(
     filename: str | None = None,
     smpl_model_dir: str | Path | None = None,
 ):
-    """Backward-compatible alias returning the evaluated AMASS motion object."""
+    """Backward-compatible alias returning the evaluated human motion object."""
 
     return load_amass_motion(
         source,
@@ -773,8 +885,12 @@ def prepare_human_room_preview(
     scene_xml_filename: str | None = None,
     human_position_m: tuple[float, float, float] = (1.6, 0.0, 0.0),
     human_yaw_deg: float = 0.0,
+    motion_source_up_axis: str | None = None,
+    motion_source_forward_axis: str | None = None,
+    motion_source_handedness: str = "right",
+    motion_source_length_unit: str = "m",
 ) -> HumanRoomPreview:
-    """Place AMASS-like motion in a prepared or uploaded static scene."""
+    """Place pose-driven or evaluated mesh motion in a static scene."""
 
     if room_preset not in PREPARED_ROOM_PRESETS:
         raise ValueError(
@@ -799,6 +915,34 @@ def prepare_human_room_preview(
         sequence = loaded.sequence
         motion_payload = loaded.payload
         source_name = loaded.source_name
+    coordinate_settings = None
+    if motion_source_up_axis is not None or motion_source_forward_axis is not None:
+        transform = motion_source_to_radar_transform(
+            motion_source_up_axis,
+            motion_source_forward_axis,
+            handedness=motion_source_handedness,
+            length_unit=motion_source_length_unit,
+        )
+        # Manual declarations refer to the original evaluated source mesh,
+        # overriding output_axes/output_signs rather than applying them twice.
+        base = (
+            sequence._base
+            if isinstance(sequence, _TransformedMotionSequence)
+            else sequence
+        )
+        axes = np.argmax(np.abs(transform), axis=1)
+        sequence = _TransformedMotionSequence(
+            base,
+            axes=axes,
+            signs=transform[np.arange(3), axes],
+        )
+        coordinate_settings = {
+            "up_axis": motion_source_up_axis,
+            "forward_axis": motion_source_forward_axis,
+            "handedness": motion_source_handedness,
+            "length_unit": motion_source_length_unit,
+            "source_to_radar_matrix": transform.tolist(),
+        }
     position = _vector3("human_position_m", human_position_m)
     placed = _PlacedMotionSequence(
         sequence,
@@ -824,6 +968,7 @@ def prepare_human_room_preview(
         motion_payload=motion_payload,
         scene_xml=scene_payload,
         scene_source_name=scene_source_name,
+        motion_coordinate_settings=coordinate_settings,
     )
 
 
@@ -838,6 +983,8 @@ def _radar(
     chirp_duration_s: float,
     chirp_repetition_time_s: float,
     sampling_frequency_hz: float,
+    adc_mode: str = "complex1x",
+    if_bandwidth_hz: float | None = None,
     num_adc_samples: int,
     num_chirps_per_frame: int,
     frame_period_s: float,
@@ -868,6 +1015,8 @@ def _radar(
         chirp_duration=float(chirp_duration_s),
         chirp_repetition_time=float(chirp_repetition_time_s),
         sampling_frequency=float(sampling_frequency_hz),
+        adc_mode=adc_mode,
+        if_bandwidth_hz=if_bandwidth_hz,
         num_adc_samples=int(num_adc_samples),
         num_chirps_per_frame=int(num_chirps_per_frame),
         frame_period=float(frame_period_s),
@@ -895,37 +1044,7 @@ def _load_environment_scene(room_boxes, *, scene_xml: bytes | None = None):
             merge_shapes=False,
         )
 
-    shapes = []
-    for box in room_boxes:
-        scale = tuple(float(value) for value in box["scale"])
-        translate = tuple(float(value) for value in box["translate"])
-        shapes.append(
-            f"""
-    <shape type="cube" id="{box['id']}">
-        <transform name="to_world">
-            <scale x="{scale[0]}" y="{scale[1]}" z="{scale[2]}"/>
-            <translate x="{translate[0]}" y="{translate[1]}" z="{translate[2]}"/>
-        </transform>
-        <ref name="bsdf" id="{_ROOM_MATERIALS[str(box['id'])]}"/>
-    </shape>"""
-        )
-    xml = """
-<scene version="2.1.0">
-    <bsdf type="itu-radio-material" id="mat-wall">
-        <string name="type" value="plasterboard"/>
-        <float name="scattering_coefficient" value="0.2"/>
-    </bsdf>
-    <bsdf type="itu-radio-material" id="mat-reflective-wall">
-        <string name="type" value="metal"/>
-        <float name="scattering_coefficient" value="0.2"/>
-    </bsdf>
-    <bsdf type="itu-radio-material" id="mat-wood">
-        <string name="type" value="wood"/>
-    </bsdf>
-    <bsdf type="itu-radio-material" id="mat-fabric">
-        <string name="type" value="chipboard"/>
-    </bsdf>
-""" + "\n".join(shapes) + "\n</scene>"
+    xml = bedroom_scene_xml_for_boxes(room_boxes)
     return load_scene_from_string(xml, merge_shapes=False)
 
 
@@ -989,6 +1108,8 @@ def run_human_room_diagnostics(
         chirp_repetition_time_s=float(
             radar_parameters.get("chirp_repetition_time_s", 65e-6)
         ),
+        adc_mode=radar_parameters.get("adc_mode", "complex1x"),
+        if_bandwidth_hz=radar_parameters.get("if_bandwidth_hz"),
         sampling_frequency_hz=float(
             radar_parameters.get("sampling_frequency_hz", 4.5e6)
         ),
@@ -1051,6 +1172,7 @@ def run_human_room_diagnostics(
                     "po_quadrature_phase_span_scale_rad", 1.0
                 )
             ),
+            po_curvature_error_rad=float(solver_parameters.get("po_curvature_error_rad", 0.01)),
             po_quadrature_max_refinement_depth=int(
                 solver_parameters.get(
                     "po_quadrature_max_refinement_depth", 2
@@ -1180,6 +1302,10 @@ def run_human_room_experiment(
     scene_xml_filename: str | None = None,
     human_position_m: tuple[float, float, float] = (1.6, 0.0, 0.0),
     human_yaw_deg: float = 0.0,
+    motion_source_up_axis: str | None = None,
+    motion_source_forward_axis: str | None = None,
+    motion_source_handedness: str = "right",
+    motion_source_length_unit: str = "m",
     radar_orientation_deg: tuple[float, float, float] = (0.0, 0.0, 0.0),
     board_model: str = "IWR6843AOPEVM",
     carrier_frequency_hz: float = 60e9,
@@ -1187,6 +1313,8 @@ def run_human_room_experiment(
     chirp_duration_s: float = 58e-6,
     chirp_repetition_time_s: float = 65e-6,
     sampling_frequency_hz: float = 4.5e6,
+    adc_mode: str = "complex1x",
+    if_bandwidth_hz: float | None = None,
     num_adc_samples: int = 225,
     num_chirps_per_frame: int = 16,
     frame_period_s: float = 50e-3,
@@ -1201,15 +1329,17 @@ def run_human_room_experiment(
     begin_frame_index: int = 0,
     end_frame_index: int | None = None,
     coupling_enabled: bool = True,
-    coupling_max_reflectors: int = 0,
+    coupling_power_threshold_db: float = -20.0,
+    coupling_max_reflectors: int = 4,
     rt_samples_per_source: int = 100_000,
     rt_max_paths_per_source: int = 5_000,
     rt_max_depth: int = 3,
     po_visibility_samples_per_face: int = 1,
-    po_integration_mode: str = "parent_face_quadrature",
-    po_quadrature_phase_span_scale_rad: float = 1.0,
-    po_quadrature_max_refinement_depth: int = 2,
-    po_quadrature_max_subfaces_per_parent: int = 16,
+    po_integration_mode: str = "parent_face_adaptive_analytic",
+    po_quadrature_phase_span_scale_rad: float | None = None,
+    po_curvature_error_rad: float = 0.005,
+    po_quadrature_max_refinement_depth: int = 3,
+    po_quadrature_max_subfaces_per_parent: int = 64,
     compute_backend: str = "numpy",
     cancel_check: Callable[[], bool] | None = None,
     progress_callback: Callable[[dict], None] | None = None,
@@ -1237,6 +1367,10 @@ def run_human_room_experiment(
         scene_xml_filename=scene_xml_filename,
         human_position_m=human_position_m,
         human_yaw_deg=human_yaw_deg,
+        motion_source_up_axis=motion_source_up_axis,
+        motion_source_forward_axis=motion_source_forward_axis,
+        motion_source_handedness=motion_source_handedness,
+        motion_source_length_unit=motion_source_length_unit,
     )
     source_motion_frame_count = len(preview.mesh_sequence.times)
     begin_frame_index, end_frame_index = _resolve_motion_frame_window(
@@ -1246,11 +1380,28 @@ def run_human_room_experiment(
         num_frames=num_frames,
     )
     selected_frame_count = end_frame_index - begin_frame_index + 1
+    progress_frame_index = 0
+    refinement_summary = {
+        "reason": "adaptive_po_refinement", "integration_passes": 0,
+        "limited_passes": 0, "max_unresolved_parent_faces": 0,
+        "max_phase_span_rad": 0., "max_curvature_error_rad": 0.,
+    }
 
     def report_progress(event: dict) -> None:
+        nonlocal progress_frame_index
+        if event.get("stage") == "adaptive_analytic_geometry_done":
+            refinement_summary["integration_passes"] += 1
+            refinement_summary["limited_passes"] += int(event["unresolved_subfaces"] > 0)
+            refinement_summary["max_unresolved_parent_faces"] = max(
+                refinement_summary["max_unresolved_parent_faces"], event["unresolved_parent_faces"])
+            for name in ("max_phase_span_rad", "max_curvature_error_rad"):
+                refinement_summary[name] = max(refinement_summary[name], event[name])
         if progress_callback is None:
             return
         payload = dict(event)
+        if "frame_index" in payload:
+            progress_frame_index = int(payload["frame_index"])
+        payload.setdefault("frame_index", progress_frame_index)
         payload["simulation_mode"] = simulation_mode
         payload.setdefault("num_frames", selected_frame_count)
         progress_callback(payload)
@@ -1275,6 +1426,8 @@ def run_human_room_experiment(
         chirp_duration_s=chirp_duration_s,
         chirp_repetition_time_s=chirp_repetition_time_s,
         sampling_frequency_hz=sampling_frequency_hz,
+        adc_mode=adc_mode,
+        if_bandwidth_hz=if_bandwidth_hz,
         num_adc_samples=num_adc_samples,
         num_chirps_per_frame=num_chirps_per_frame,
         frame_period_s=frame_period_s,
@@ -1313,6 +1466,7 @@ def run_human_room_experiment(
         po_quadrature_phase_span_scale_rad=(
             po_quadrature_phase_span_scale_rad
         ),
+        po_curvature_error_rad=po_curvature_error_rad,
         po_quadrature_max_refinement_depth=(
             po_quadrature_max_refinement_depth
         ),
@@ -1321,6 +1475,7 @@ def run_human_room_experiment(
         ),
         compute_backend=compute_backend,
         compute_precision="float32",
+        progress_callback=report_progress,
     )
     simulator_kwargs = dict(
         max_depth=int(rt_max_depth),
@@ -1384,18 +1539,9 @@ def run_human_room_experiment(
             num_frames=selected_frame_count,
         )
     else:
-        calibration = POCalibrationConfig(
-            mode="rt_sequence",
-            gain_type="amplitude",
-            sample_mode="all_chirps",
-            reference_component="human_touch",
-            alignment="same_index",
-            keep_rt_baseline=True,
-            rt_periodic_retrace=True,
-            rt_periodic_retrace_period_chirps=int(
-                radar.fmcw.num_chirps_per_frame
-            ),
-        )
+        # Absolute PO: no RT amplitude fit, so the human terms do not depend
+        # on the ray budget or diffuse-scattering settings.
+        calibration = POCalibrationConfig(mode="none")
         calibrated = run_calibrated_hybrid_po(
             scene=environment_scene,
             radar=radar,
@@ -1406,7 +1552,8 @@ def run_human_room_experiment(
                 po_visibility_samples_per_face
             ),
             coupling_enabled=bool(coupling_enabled),
-            coupling_max_reflectors=int(coupling_max_reflectors),
+            coupling_power_threshold_db=coupling_power_threshold_db,
+            coupling_max_reflectors=coupling_max_reflectors,
             rt_samples_per_src=int(rt_samples_per_source),
             rt_max_num_paths_per_src=int(rt_max_paths_per_source),
             max_depth=int(rt_max_depth),
@@ -1423,6 +1570,9 @@ def run_human_room_experiment(
             progress_callback=report_progress,
         )
         cube = calibrated.cube
+    if refinement_summary["integration_passes"]:
+        cube = replace(cube, metadata=replace(
+            cube.metadata, events=[*(cube.metadata.events or []), dict(refinement_summary)]))
     runtime_s = time.perf_counter() - started
     components = {
         name: np.asarray(adc)
@@ -1479,6 +1629,7 @@ def run_human_room_experiment(
                 "simulation_mode": simulation_mode,
                 "human_position_m": preview.human_position_m.tolist(),
                 "human_yaw_deg": preview.human_yaw_deg,
+                "motion_coordinate_settings": preview.motion_coordinate_settings,
                 "diffuse_reflection_coefficient": diffuse,
             },
         ),
@@ -1494,6 +1645,9 @@ def run_human_room_experiment(
                 "chirp_repetition_time_s": float(
                     radar.fmcw.chirp_repetition_time
                 ),
+                "adc_mode": radar.fmcw.adc_mode,
+                "if_bandwidth_hz": radar.fmcw.if_bandwidth_hz,
+                "effective_if_cutoff_hz": radar.fmcw.effective_if_cutoff_hz,
                 "sampling_frequency_hz": float(
                     radar.fmcw.sampling_frequency
                 ),
@@ -1532,6 +1686,7 @@ def run_human_room_experiment(
                 "coupling_enabled": bool(
                     simulation_mode == "hybrid_po" and coupling_enabled
                 ),
+                "coupling_power_threshold_db": coupling_power_threshold_db,
                 "coupling_max_reflectors": int(coupling_max_reflectors),
                 "rt_samples_per_source": int(rt_samples_per_source),
                 "rt_max_paths_per_source": int(rt_max_paths_per_source),
@@ -1540,8 +1695,9 @@ def run_human_room_experiment(
                     po_visibility_samples_per_face
                 ),
                 "po_integration_mode": po_integration_mode,
-                "po_quadrature_phase_span_scale_rad": float(
-                    po_quadrature_phase_span_scale_rad
+                "po_curvature_error_rad": float(po_curvature_error_rad),
+                "po_quadrature_phase_span_scale_rad": (
+                    human_po.effective_po_phase_span_scale_rad
                 ),
                 "po_quadrature_max_refinement_depth": int(
                     po_quadrature_max_refinement_depth
@@ -1551,11 +1707,7 @@ def run_human_room_experiment(
                 ),
                 "num_frames": selected_frame_count,
                 "simulation_mode": simulation_mode,
-                "po_calibration_mode": (
-                    "rt_sequence"
-                    if simulation_mode == "hybrid_po"
-                    else "none"
-                ),
+                "po_calibration_mode": "none",
             },
         ),
     )
@@ -1591,6 +1743,7 @@ __all__ = [
     "PREPARED_ROOM_PRESETS",
     "load_amass_motion",
     "load_human_motion",
+    "motion_source_to_radar_transform",
     "load_scene_xml",
     "prepared_room_boxes",
     "prepare_human_room_preview",

@@ -120,7 +120,7 @@ def test_angle_fft_2d_uses_asymmetric_wavelength_normalized_spacing():
     y_lambda = np.arange(count_y) * spacing_y
     z_lambda = np.arange(count_z) * spacing_z
     snapshot = np.exp(
-        1j
+        -1j
         * 2.0
         * np.pi
         * (
@@ -161,7 +161,7 @@ def test_angle_fft_1d_uses_configured_axis_spacing(
     spacing_lambda = 0.25
     direction_cosine = 0.5
     phase = np.exp(
-        1j
+        -1j
         * 2.0
         * np.pi
         * np.arange(16)
@@ -188,8 +188,8 @@ def test_range_time_map_flattens_frames_and_combines_channels():
     rt_map, ranges_m = range_time_map(adc, sampling_frequency=1e6,
                                       slope=1e12, window=None)
 
-    assert rt_map.shape == (6, 4)
-    assert ranges_m.shape == (4,)
+    assert rt_map.shape == (6, 8)
+    assert ranges_m.shape == (8,)
     assert np.all(rt_map[:, 0] > 0.0)
 
 
@@ -272,8 +272,8 @@ def test_framewise_range_doppler_map_does_not_cross_frame_boundaries():
         win_doppler=None,
     )
 
-    assert rd_frames.shape == (frames, num_chirps, num_adc // 2, 1)
-    assert ranges_m.shape == (num_adc // 2,)
+    assert rd_frames.shape == (frames, num_chirps, num_adc, 1)
+    assert ranges_m.shape == (num_adc,)
     assert velocities_mps.shape == (num_chirps,)
     per_frame_power = np.sum(np.abs(rd_frames) ** 2, axis=(2, 3))
     peak_bins = np.argmax(per_frame_power, axis=1)
@@ -534,7 +534,7 @@ def test_point_cloud_3d_from_adc_detects_asymmetric_spacing_ura_target():
     el = np.deg2rad(elevation_deg)
     u = np.sin(az) * np.cos(el)
     v = np.sin(el)
-    channel_phase = np.exp(1j * 2.0 * np.pi * (positions @ np.array([u, v])))
+    channel_phase = np.exp(-1j * 2.0 * np.pi * (positions @ np.array([u, v])))
 
     tau = 2.0 * target_range / 299792458.0
     fast_time = np.arange(num_adc) / sampling_frequency
@@ -653,7 +653,7 @@ def test_music_and_mvdr_pseudospectra_peak_on_ula_source():
     positions = 0.5 * np.arange(8, dtype=float)
     true_azimuth_deg = 20.0
     true_u = np.sin(np.deg2rad(true_azimuth_deg))
-    steering = np.exp(1j * 2.0 * np.pi * positions * true_u)
+    steering = np.exp(-1j * 2.0 * np.pi * positions * true_u)
 
     rng = np.random.default_rng(4)
     amplitudes = np.exp(1j * rng.uniform(0.0, 2.0 * np.pi, size=64))
@@ -723,7 +723,7 @@ def test_music_pseudospectrum_2d_ura_peak():
     true_u = np.sin(azimuth) * np.cos(elevation)
     true_v = np.sin(elevation)
     direction = np.array([true_u, true_v])
-    steering = np.exp(1j * 2.0 * np.pi * (positions @ direction))
+    steering = np.exp(-1j * 2.0 * np.pi * (positions @ direction))
 
     rng = np.random.default_rng(5)
     amplitudes = np.exp(1j * rng.uniform(0.0, 2.0 * np.pi, size=80))
@@ -761,6 +761,39 @@ def test_analytical_array_psf_is_centered_and_sum_normalized():
     assert psf.shape == u_axis.shape
     assert int(np.argmax(psf)) == u_axis.size // 2
     assert abs(float(np.sum(psf)) - 1.0) < 1e-12
+
+
+@pytest.mark.parametrize("two_dimensional", [False, True])
+def test_complex_weight_psf_matches_beamforming_and_recovers_boresight(two_dimensional):
+    u_axis = np.linspace(-1.0, 1.0, 201)
+    if two_dimensional:
+        positions = np.asarray([
+            [0.5*x, 0.5*y] for y in range(4) for x in range(4)
+        ])
+        v_axis = u_axis
+        weight_phase = positions @ np.array([0.25, -0.15])
+    else:
+        positions = 0.5*np.arange(8)
+        v_axis = None
+        weight_phase = positions*0.25
+    weights = np.exp(-2j*np.pi*weight_phase)
+    # A physical boresight source has the same phase at every element. Complex
+    # weights make the dirty response asymmetric and expose a mirrored PSF.
+    snapshots = np.ones((1, len(positions)), dtype=complex)
+    options = dict(u=u_axis, v=v_axis, channel_weights=weights)
+    psf = analytical_array_psf(positions, **options)["psf"]
+    dirty = backprojection(
+        snapshots, positions, **options, mask_invalid_directions=False,
+    )["image"]
+    np.testing.assert_allclose(psf, dirty/dirty.sum(), rtol=1e-12, atol=1e-15)
+
+    for method in (wiener_psf_image, psf_cross_correlation_image):
+        result = method(
+            snapshots, positions, **options, mask_invalid_directions=False,
+        )
+        assert result["peak_u"] == pytest.approx(0., abs=0.01)
+        if two_dimensional:
+            assert result["peak_v"] == pytest.approx(0., abs=0.01)
 
 
 def test_backprojection_localizes_synthetic_ura_source():

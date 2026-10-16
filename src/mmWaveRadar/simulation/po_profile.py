@@ -193,6 +193,7 @@ def save_radar_cube_npz(
         "adc": cube.adc,
         "times": cube.times,
         "mode": np.asarray(cube.metadata.mode),
+        "adc_if_filter_json": np.asarray(json.dumps(cube.metadata.adc_if_filter)),
         "metadata_schema_version": np.asarray(
             int(cube.metadata.metadata_schema_version)
         ),
@@ -298,6 +299,7 @@ def load_radar_cube_npz(path: str | Path) -> tuple[RadarCube, float, int]:
         }
     metadata = SensingMetadata(
         events=_optional_json(data, "events_json") or [],
+        adc_if_filter=_optional_json(data, "adc_if_filter_json"),
         path_counts=data["path_counts"],
         max_displacements=_optional_array(data, "max_displacements"),
         virtual_channel_order=str(data["virtual_channel_order"].item())

@@ -13,6 +13,7 @@ import pytest
 from mmWaveRadar.experiments import (
     load_amass_motion,
     load_scene_xml,
+    motion_source_to_radar_transform,
     prepare_human_room_preview,
     run_human_room_diagnostics,
     run_human_room_experiment,
@@ -221,6 +222,79 @@ def test_prepared_room_motion_is_radar_relative():
     assert preview.source_name == "motion.npz"
 
 
+@pytest.mark.parametrize(
+    ("up", "forward", "expected"),
+    [
+        ("+z", "+x", np.eye(3)),
+        ("+y", "+z", np.asarray([[0, 0, 1], [1, 0, 0], [0, 1, 0]])),
+        ("+z", "-y", np.asarray([[0, -1, 0], [1, 0, 0], [0, 0, 1]])),
+        ("-z", "+x", np.diag([1, -1, -1])),
+    ],
+)
+def test_motion_frame_transform_matches_declared_source_axes(up, forward, expected):
+    transform = motion_source_to_radar_transform(up, forward)
+
+    np.testing.assert_array_equal(transform, expected)
+    assert np.linalg.det(transform) == pytest.approx(1.0)
+
+
+def test_manual_motion_frame_overrides_metadata_before_placement():
+    vertices = np.asarray(
+        [
+            [[0, 0, 0], [10, 0, 0], [0, 200, 0]],
+            [[0, 0, 10], [10, 0, 10], [0, 200, 10]],
+        ], dtype=np.float32,
+    )
+    payload = BytesIO()
+    np.savez(
+        payload, vertices=vertices, faces=np.asarray([[0, 1, 2]]),
+        times=np.asarray([0.0, 0.1]),
+        output_axes=np.asarray([1, 2, 0]),
+        output_signs=np.asarray([-1, 1, -1]),
+    )
+    loaded = load_amass_motion(payload.getvalue(), filename="cm-mesh.npz")
+    preview = prepare_human_room_preview(
+        loaded,
+        motion_source_up_axis="+y", motion_source_forward_axis="+z",
+        motion_source_length_unit="cm", human_position_m=(1.6, 0, 0),
+    )
+    placed = preview.mesh_sequence.vertices_at(0)
+    np.testing.assert_allclose(np.ptp(placed, axis=0), [0, 0.1, 2.0])
+    np.testing.assert_allclose((placed.min(0) + placed.max(0)) / 2, [1.6, 0, 0])
+    delta = preview.mesh_sequence.vertices_at(0.1) - placed
+    np.testing.assert_allclose(delta, np.tile([0.1, 0, 0], (3, 1)), atol=1e-6)
+    assert preview.motion_coordinate_settings["length_unit"] == "cm"
+    assert preview.motion_coordinate_settings["up_axis"] == "+y"
+
+
+def test_left_handed_motion_frame_preserves_open_surface_normals():
+    sequence = MeshSequence(
+        vertices=np.asarray([[[0, 0, 0], [1, 0, 0], [0, 1, 0]]], dtype=np.float32),
+        faces=np.asarray([[0, 1, 2]]), times=np.asarray([0.0]),
+    )
+    preview = prepare_human_room_preview(
+        sequence, motion_source_up_axis="+z", motion_source_forward_axis="+x",
+        motion_source_handedness="left", human_position_m=(0, 0, 0),
+    )
+    triangle = preview.mesh_sequence.vertices_at(0)[preview.mesh_sequence.faces[0]]
+    np.testing.assert_allclose(np.cross(triangle[1]-triangle[0], triangle[2]-triangle[0]),
+                               [0, 0, 1])
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"up_axis": "+z", "forward_axis": "-z"},
+        {"up_axis": "unknown", "forward_axis": "+x"},
+        {"up_axis": "+z", "forward_axis": "+x", "handedness": "unknown"},
+        {"up_axis": "+z", "forward_axis": "+x", "length_unit": "feet"},
+    ],
+)
+def test_motion_frame_transform_rejects_invalid_declarations(kwargs):
+    with pytest.raises(ValueError):
+        motion_source_to_radar_transform(**kwargs)
+
+
 def test_prepared_room_rt_scene_uses_rough_wall_scattering():
     pytest.importorskip("sionna.rt")
     scene = _load_environment_scene(prepared_room_boxes())
@@ -228,11 +302,12 @@ def test_prepared_room_rt_scene_uses_rough_wall_scattering():
     assert float(
         np.asarray(scene.radio_materials["wall"].scattering_coefficient)[0]
     ) == pytest.approx(0.2)
-    assert float(
-        np.asarray(
-            scene.radio_materials["reflective-wall"].scattering_coefficient
-        )[0]
-    ) == pytest.approx(0.2)
+    assert scene.objects["floor"].radio_material is scene.radio_materials[
+        "concrete"
+    ]
+    assert scene.objects["right_wall"].radio_material is scene.radio_materials[
+        "wall"
+    ]
 
 
 def test_custom_scene_xml_replaces_prepared_preview_geometry():
@@ -308,6 +383,72 @@ def test_amass_loader_accepts_pose_parameters(monkeypatch, tmp_path):
     assert loaded.payload["faces"].shape == (1, 3)
 
 
+def test_motion_loader_prefers_supplied_meshes_over_pose_parameters(monkeypatch):
+    def fail_if_smpl_is_used(**_kwargs):
+        pytest.fail("precomputed mesh motion must not evaluate SMPL")
+
+    monkeypatch.setattr(
+        "mmWaveRadar.experiments.human_room.AMASSSMPLMotionSequence",
+        fail_if_smpl_is_used,
+    )
+    vertices = np.asarray(
+        [
+            [[0.0, 0.0, 0.0], [0.2, 0.0, 0.0], [0.0, 0.2, 0.0], [0.0, 0.0, 0.4]],
+            [[0.1, 0.0, 0.0], [0.3, 0.0, 0.0], [0.1, 0.2, 0.0], [0.1, 0.0, 0.4]],
+        ],
+        dtype=np.float32,
+    )
+    faces = np.asarray([[0, 1, 3]], dtype=np.int32)
+    stream = BytesIO()
+    np.savez(
+        stream,
+        vertices=vertices,
+        faces=faces,
+        times=np.asarray([10.0, 10.1]),
+        poses=np.zeros((2, 72), dtype=np.float32),
+        trans=np.zeros((2, 3), dtype=np.float32),
+        betas=np.zeros(300, dtype=np.float32),
+    )
+
+    loaded = load_amass_motion(stream.getvalue(), filename="custom-mesh.npz")
+
+    assert loaded.source_name == "custom-mesh.npz"
+    assert loaded.payload is None
+    assert loaded.sequence.vertex_count == 4
+    np.testing.assert_array_equal(loaded.sequence.faces, faces)
+    np.testing.assert_allclose(loaded.sequence.vertices_at(10.0), vertices[0])
+    np.testing.assert_allclose(
+        loaded.sequence.vertices_at(10.05), np.mean(vertices, axis=0), atol=1e-7
+    )
+    preview = prepare_human_room_preview(loaded)
+    assert preview.mesh_sequence.times.tolist() == pytest.approx([0.0, 0.1])
+    assert preview.motion_payload is None
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    [
+        ("faces", np.asarray([[0, 1, 3]]), "outside vertices"),
+        ("times", np.asarray([0.0]), "match its frame count"),
+        ("times", np.asarray([0.0, 0.0]), "strictly increasing"),
+        ("vertices", np.full((2, 3, 3), np.nan), "finite values"),
+        ("output_axes", np.asarray([0, 0, 1]), "permutation"),
+    ],
+)
+def test_mesh_motion_loader_validates_supplied_geometry(field, value, message):
+    arrays = {
+        "vertices": np.zeros((2, 3, 3), dtype=np.float32),
+        "faces": np.asarray([[0, 1, 2]], dtype=np.int32),
+        "times": np.asarray([0.0, 0.1]),
+    }
+    arrays[field] = value
+    stream = BytesIO()
+    np.savez(stream, **arrays)
+
+    with pytest.raises(ValueError, match=message):
+        load_amass_motion(stream.getvalue(), filename="mesh-motion.npz")
+
+
 def test_small_human_room_run_uses_fixed_origin_and_hybrid_components():
     pytest.importorskip("sionna.rt")
     sequence = MeshSequence(
@@ -366,10 +507,10 @@ def test_small_human_room_run_uses_fixed_origin_and_hybrid_components():
 
     assert result.radar_position_m.tolist() == [0.0, 0.0, 0.0]
     assert result.simulation_mode == "hybrid_po"
-    assert result.metadata.po_calibration["mode"] == "rt_sequence"
+    assert result.metadata.po_calibration["mode"] == "none"
     assert result.manifest.solver.parameters[
         "po_calibration_mode"
-    ] == "rt_sequence"
+    ] == "none"
     assert result.manifest.scene.scenario == "custom_xml"
     assert result.manifest.scene.parameters["scene_source"] == "empty-lab.xml"
     assert result.adc.shape == (2, 1, 16, 2)
@@ -426,6 +567,76 @@ def test_small_human_room_run_uses_fixed_origin_and_hybrid_components():
     assert diagnostics.rt.segment_ends_m.shape == (
         diagnostics.rt.segment_starts_m.shape
     )
+
+
+@pytest.mark.parametrize(
+    ("integration_mode", "stage_prefix"),
+    [
+        ("parent_face_quadrature", "quadrature"),
+        ("parent_face_far_field_analytic", "far_field"),
+    ],
+)
+def test_human_room_po_face_progress_preserves_the_current_frame(
+    integration_mode, stage_prefix,
+):
+    pytest.importorskip("sionna.rt")
+    vertices = np.asarray(
+        [
+            [0.0, 0.0, 0.0],
+            [0.2, 0.0, 0.0],
+            [0.0, 0.2, 0.0],
+            [0.0, 0.0, 0.4],
+        ],
+        dtype=np.float32,
+    )
+    # Rotation triggers exact integration rather than a cached phase update.
+    angle = np.deg2rad(20.0)
+    rotation = np.asarray(
+        [[np.cos(angle), -np.sin(angle), 0.0],
+         [np.sin(angle), np.cos(angle), 0.0],
+         [0.0, 0.0, 1.0]],
+    )
+    sequence = MeshSequence(
+        vertices=np.stack([
+            vertices, vertices @ rotation.T + [0.1, 0.0, 0.0],
+        ]),
+        faces=np.asarray(
+            [(0, 2, 1), (0, 1, 3), (1, 2, 3), (2, 0, 3)],
+            dtype=np.uint32,
+        ),
+        times=np.asarray([0.0, 0.05]),
+    )
+    events = []
+
+    run_human_room_experiment(
+        human_motion=sequence,
+        scene_xml=b'<scene version="2.1.0"></scene>',
+        simulation_mode="human_only_po",
+        num_adc_samples=8,
+        num_chirps_per_frame=1,
+        selected_tx_indices=(2,),
+        selected_rx_indices=(0,),
+        begin_frame_index=0,
+        end_frame_index=1,
+        po_integration_mode=integration_mode,
+        po_quadrature_phase_span_scale_rad=np.pi / 8,
+        po_quadrature_max_refinement_depth=3,
+        po_quadrature_max_subfaces_per_parent=64,
+        progress_callback=events.append,
+    )
+
+    completed = [
+        event for event in events
+        if event.get("stage") == f"{stage_prefix}_aggregate_done"
+    ]
+    assert {event["frame_index"] for event in completed} == {0, 1}
+    assert all(event["simulation_mode"] == "human_only_po" for event in events)
+    assert all(event["num_frames"] == 2 for event in events)
+    for event in completed:
+        assert 0 < event["parent_faces_total"] <= sequence.face_count
+        assert event["parent_faces_processed"] == event["parent_faces_total"]
+        assert event["subfaces_processed"] == event["subfaces_total"]
+        assert event["subfaces_total"] >= event["parent_faces_total"]
 
 
 @pytest.mark.parametrize(

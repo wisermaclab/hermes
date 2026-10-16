@@ -17,19 +17,22 @@ import warnings
 import numpy as np
 
 from .physical_optics import ComputeBackend, ComputePrecision
+from ..radar.adc import adc_mode, max_if_delay_s, record_if_filter
 
 
 def synthesize_adc_from_paths(a: np.ndarray, tau: np.ndarray,
                               fmcw, *,
                               backend: ComputeBackend = "numpy",
-                              precision: ComputePrecision = "float64") -> np.ndarray:
+                              precision: ComputePrecision = "float64",
+                              delay_response=None, diagnostics=None) -> np.ndarray:
     r"""
     Synthesizes one chirp of dechirped ADC samples from path arrays.
 
-    The returned samples use the baseband beat model
-    ``a * exp(j 2 pi slope tau t_fast)`` and are summed over valid paths for
-    each virtual channel. Negative delays are treated as invalid path slots and
-    omitted from the sum.
+    Input coefficients are physical channel coefficients, including negative
+    carrier propagation phase ``exp(-j 2 pi carrier_frequency tau)``. The
+    ``tx(t) * conj(rx(t))`` mixer conjugates the complete coefficient once:
+    ``conj(a) * exp(j 2 pi slope tau t_fast)``. Paths are summed for each virtual
+    channel. Negative delays are treated as invalid path slots and omitted.
 
     :param a: Complex path coefficients with shape
         ``[num_virtual_channels, num_paths]``. Each row is one virtual channel
@@ -44,6 +47,12 @@ def synthesize_adc_from_paths(a: np.ndarray, tau: np.ndarray,
     :param precision: Floating/complex precision used internally and for the
         returned array. ``"float64"`` returns ``complex128`` samples;
         ``"float32"`` returns ``complex64`` samples.
+    :param delay_response: Optional delay-resolved surface response returned by
+        PO channel evaluation with ``max_frequency_offset_hz``. Retains the
+        intra-face beat phase while using compact parent paths.
+    :param diagnostics: Optional dict accumulating IF rejection counts over
+        calls. Counts are valid path-channel evaluations; delay-resolved PO
+        counts refer to original parent paths, with partial clipping separate.
     :returns: Complex ADC matrix with shape
         ``[num_adc_samples, num_virtual_channels]``.
     """
@@ -84,12 +93,14 @@ def synthesize_adc_from_paths(a: np.ndarray, tau: np.ndarray,
     if np.any(coefficient_mask & ~finite_coefficients):
         raise ValueError("a must contain finite coefficients for valid paths")
     return _synthesize_adc(
-        a, tau, valid, fmcw, backend=backend, precision=precision)
+        a, tau, valid, fmcw, backend=backend, precision=precision,
+        delay_response=delay_response, diagnostics=diagnostics)
 
 
 def _synthesize_adc(a: np.ndarray, tau: np.ndarray, valid: np.ndarray,
                     fmcw, *, backend: ComputeBackend = "numpy",
-                    precision: ComputePrecision = "float64") -> np.ndarray:
+                    precision: ComputePrecision = "float64",
+                    delay_response=None, diagnostics=None) -> np.ndarray:
     """Synthesizes one ADC frame from channel/path coefficients and delays."""
 
     float_dtype, complex_dtype = (
@@ -97,10 +108,20 @@ def _synthesize_adc(a: np.ndarray, tau: np.ndarray, valid: np.ndarray,
     )
     if backend not in ("auto", "numpy", "torch"):
         raise ValueError("backend must be 'auto', 'numpy', or 'torch'")
+    if delay_response is not None:
+        return delay_response.synthesize_adc(tau, valid, fmcw, precision=precision,
+                                             diagnostics=diagnostics)
     num_adc = fmcw.num_adc_samples
     num_vc = a.shape[0]
     out = np.zeros((num_adc, num_vc), dtype=complex_dtype)
     valid = np.asarray(valid, dtype=bool)
+    original = np.broadcast_to(valid, a.shape)
+    cutoff = max_if_delay_s(fmcw)
+    accepted = original & (np.broadcast_to(tau, a.shape) <= cutoff)
+    record_if_filter(diagnostics, fmcw, tested=np.count_nonzero(original),
+                     rejected=np.count_nonzero(original & ~accepted))
+    valid = (valid & (tau <= cutoff)
+             if tau.ndim == 1 else accepted)
     if tau.size == 0 or not np.any(valid):
         return out
 
@@ -118,7 +139,7 @@ def _synthesize_adc(a: np.ndarray, tau: np.ndarray, valid: np.ndarray,
         max_elements = 8_000_000
         chunk_size = max(1, max_elements // max(num_adc, 1))
         scale = 2.0 * np.pi * fmcw.slope
-        a_all = np.asarray(a, dtype=complex_dtype)
+        a_all = np.asarray(a, dtype=complex_dtype).conj()
         tau_all = np.asarray(tau, dtype=float_dtype)
         for start in range(0, valid_indices.size, chunk_size):
             stop = min(start + chunk_size, valid_indices.size)
@@ -130,12 +151,12 @@ def _synthesize_adc(a: np.ndarray, tau: np.ndarray, valid: np.ndarray,
                           * t_fast[None, :]).astype(complex_dtype)
             accum += a_v @ beat
         out[:, :] = accum.T.astype(complex_dtype)
-        return out
+        return _receiver_output(out, fmcw)
 
     # Channel-specific delays appear in PO/coupling paths where phase centers
     # can differ per virtual channel.  Mask and sum each channel independently.
     tau_m = np.asarray(tau, dtype=float_dtype)
-    a_m = np.asarray(a, dtype=complex_dtype)
+    a_m = np.asarray(a, dtype=complex_dtype).conj()
     valid_m = valid
     if valid_m.ndim == 1:
         if valid_m.shape != (a.shape[1],):
@@ -156,7 +177,12 @@ def _synthesize_adc(a: np.ndarray, tau: np.ndarray, valid: np.ndarray,
                       * tau_v[:, None]
                       * t_fast[None, :]).astype(complex_dtype)
         out[:, channel_index] = (a_v @ beat).astype(complex_dtype)
-    return out
+    return _receiver_output(out, fmcw)
+
+
+def _receiver_output(samples, fmcw):
+    """Real sampling observes the in-phase mixer output only."""
+    return samples.real.astype(samples.dtype) if adc_mode(fmcw) == "real" else samples
 
 
 def _numpy_dtypes_for_precision(
@@ -301,6 +327,7 @@ def _synthesize_adc_torch(a: np.ndarray, tau: np.ndarray,
         dtype,
     )
     valid = np.asarray(valid, dtype=bool)
+    valid = valid & (np.asarray(tau) <= max_if_delay_s(fmcw))
     max_elements = 8_000_000
     if tau.ndim == 1:
         valid_indices = np.flatnonzero(valid)
@@ -309,7 +336,7 @@ def _synthesize_adc_torch(a: np.ndarray, tau: np.ndarray,
         chunk_size = max(1, max_elements // max(num_adc, 1))
         out = torch.zeros((num_channels, num_adc), dtype=cdtype, device=device)
         scale = 2.0 * np.pi * float(fmcw.slope)
-        a_np = np.asarray(a, dtype=complex_dtype)
+        a_np = np.asarray(a, dtype=complex_dtype).conj()
         tau_np = np.asarray(tau, dtype=float_dtype)
         for start in range(0, valid_indices.size, chunk_size):
             stop = min(start + chunk_size, valid_indices.size)
@@ -327,9 +354,9 @@ def _synthesize_adc_torch(a: np.ndarray, tau: np.ndarray,
             phase = scale * tau_chunk[:, None] * t_fast[None, :]
             beat = torch.exp(1j * phase).to(cdtype)
             out += a_chunk @ beat
-        return out.T.cpu().numpy().astype(complex_dtype)
+        return _receiver_output(out.T.cpu().numpy().astype(complex_dtype), fmcw)
 
-    a_np = np.asarray(a, dtype=complex_dtype)
+    a_np = np.asarray(a, dtype=complex_dtype).conj()
     tau_np = np.asarray(tau, dtype=float_dtype)
     if valid.ndim == 1:
         if valid.shape != (a_np.shape[1],):
@@ -396,7 +423,7 @@ def _synthesize_adc_torch(a: np.ndarray, tau: np.ndarray,
             )
             channel_out += torch.sum(weighted, dim=1).T
         out[:, c_start:c_stop] = channel_out
-    return out.cpu().numpy().astype(complex_dtype)
+    return _receiver_output(out.cpu().numpy().astype(complex_dtype), fmcw)
 
 
 __all__ = [

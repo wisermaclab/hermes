@@ -73,6 +73,14 @@
         "ramp_time_s": {"type": "number", "exclusiveMinimum": 0},
         "chirp_repetition_time_s": {"type": "number", "exclusiveMinimum": 0},
         "sampling_frequency_hz": {"type": "number", "exclusiveMinimum": 0},
+        "adc_mode": {
+          "type": "string", "enum": ["complex1x", "complex2x", "real"],
+          "default": "complex1x"
+        },
+        "if_bandwidth_hz": {
+          "type": ["number", "null"], "exclusiveMinimum": 0,
+          "description": "Optional analog IF cap, further limited by ADC mode and board bandwidth."
+        },
         "num_adc_samples": {"type": "integer", "minimum": 1},
         "num_chirps_per_frame": {"type": "integer", "minimum": 1},
         "frame_period_s": {"type": "number", "exclusiveMinimum": 0},

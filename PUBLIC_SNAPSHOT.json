@@ -9,7 +9,7 @@
     {
       "mode": "100644",
       "path": "CHANGELOG.md",
-      "sha256": "8bb5077b902714d70a29fc9ae71be51216e7a98016fb1cc508e908860f065dc2"
+      "sha256": "4a4f2b1d51070f5731eb612a47469bdca4ce51be53b9dd28211b1d37d78aca17"
     },
     {
       "mode": "100644",
@@ -39,7 +39,7 @@
     {
       "mode": "100644",
       "path": "README.md",
-      "sha256": "c243833272204787f475f6e3d980acc8b5a51792d12cfa3d553ae66ff53a8c45"
+      "sha256": "a831df74adee563641ba8682b77866737136649882317fd240bc73b95b5baf52"
     },
     {
       "mode": "100644",
@@ -189,7 +189,7 @@
     {
       "mode": "100644",
       "path": "demo/Full-RT.ipynb",
-      "sha256": "b6ad9fbfb05670d7f51863e891f68eddb7d5d40c349cc8b399ed4a8deed76348"
+      "sha256": "e07679c7e2f22e58fa42cda750f20eaf397e891af7221c4fe73985c5c8b27932"
     },
     {
       "mode": "100644",
@@ -199,7 +199,7 @@
     {
       "mode": "100644",
       "path": "demo/Hybrid-PO.ipynb",
-      "sha256": "db8cd4a00eaf0f18c975997c131171f67eb059f3c314876e1a2277b4895b6ef4"
+      "sha256": "f0154c7798a38979d483e94fcd1ce4954af0478586bbe7dfb86f7715f49b0739"
     },
     {
       "mode": "100644",
@@ -244,12 +244,12 @@
     {
       "mode": "100644",
       "path": "src/mmWaveRadar/dsp/angle.py",
-      "sha256": "345b4c94a10c48fe1409d782d74508a82df1644319858eae0992698aa00ec202"
+      "sha256": "19718e79d3fcfac48e04a8f121a2788417606de318b416771899fd61a7e8915a"
     },
     {
       "mode": "100644",
       "path": "src/mmWaveRadar/dsp/array_processing.py",
-      "sha256": "f1a2036980b6be7999417b8e1e150d1305584c75b2cbbf963fa6a3eab23bd0f2"
+      "sha256": "40e09e8419d6f131fcde161d6ab38b0afe9cc3317700581af6b455dd16bb1791"
     },
     {
       "mode": "100644",
@@ -269,17 +269,17 @@
     {
       "mode": "100644",
       "path": "src/mmWaveRadar/dsp/doppler.py",
-      "sha256": "692e37f2db158e579d265a74ec285d86b825ba28db381ee00c6cb14d989a3207"
+      "sha256": "dd398c4d9a5781f595c6f7647d91f69c68a1a932719bfa5f9f04321130c689fa"
     },
     {
       "mode": "100644",
       "path": "src/mmWaveRadar/dsp/fft.py",
-      "sha256": "c86d8c33d9ea143bdfae5e20a629bf5ce7f5e22f0a0cb697a307dae464c8edeb"
+      "sha256": "6ac1621e37f081b75c5ac6a30f36450de41f575b168e83193b6c026ced0b8b5a"
     },
     {
       "mode": "100644",
       "path": "src/mmWaveRadar/dsp/imaging.py",
-      "sha256": "722b4bbe5cd28e2569670d7061fbff70566f82da3eac9d64afdacc07e0622152"
+      "sha256": "f5a001df8bbba4b7b9d88315fd37e9c1b31f8588ee84a108ee88e1bda389b2e1"
     },
     {
       "mode": "100644",
@@ -309,12 +309,12 @@
     {
       "mode": "100644",
       "path": "src/mmWaveRadar/experiments/__init__.py",
-      "sha256": "7f31686233df118dca316801292f7b494a4eb045e27616439677993868a8c887"
+      "sha256": "18b23a7bb79608db2f95c30ebf86ff8c76263e52104db6e197766a0a0ca3ab41"
     },
     {
       "mode": "100644",
       "path": "src/mmWaveRadar/experiments/human_room.py",
-      "sha256": "41b08740a4aae47b9b43df9e102c999384e705ffda4a88081dd51af314108abe"
+      "sha256": "cff5892a508de45f7e27c92d3ce06aa01510bd7f2a98e62a2340a1afa33f050f"
     },
     {
       "mode": "100644",
@@ -324,7 +324,7 @@
     {
       "mode": "100644",
       "path": "src/mmWaveRadar/experiments/physics_microscope.py",
-      "sha256": "9ad44d8b14255b02e148659a346837d76717bd88287e1983c95b8df82e11ab76"
+      "sha256": "7009154eeeded0ba55450e863c15b9e7c9e6b07edba13aa20fcd3fe0a57234a7"
     },
     {
       "mode": "100644",
@@ -339,12 +339,17 @@
     {
       "mode": "100644",
       "path": "src/mmWaveRadar/gui/app.py",
-      "sha256": "ac44a779f777cce0ebfc3219571e0b08aa0992653cc1361b3da98ea8d9027be7"
+      "sha256": "d0ab22c02cc93fe7b77ab044df6fecca7f91adb177405ace86d2d985ae150ee3"
     },
     {
       "mode": "100644",
       "path": "src/mmWaveRadar/gui/cli.py",
-      "sha256": "c649a3077950c1b862ba013fc2de5a93be2d5c98b59a0115998fdc3b5df1b1f9"
+      "sha256": "68152e107ef6cd1f26e868abdeee8eaafdc2f8537c951a8ad04104d573a0d6b9"
+    },
+    {
+      "mode": "100644",
+      "path": "src/mmWaveRadar/gui/login.py",
+      "sha256": "d6979b54c38bef3812bf3212b5808d70026cdac065d7ea3d2381475203e0e733"
     },
     {
       "mode": "100644",
@@ -373,8 +378,13 @@
     },
     {
       "mode": "100644",
+      "path": "src/mmWaveRadar/radar/adc.py",
+      "sha256": "bea8a2f4976a0e33364a201507086cf4e74a396b94baa62f800f27b24bb57b0d"
+    },
+    {
+      "mode": "100644",
       "path": "src/mmWaveRadar/radar/fmcw.py",
-      "sha256": "c72b9cf9e5fa7434829d4cc55765bca59f985068a26088e292642cce4268effb"
+      "sha256": "ce93fd49a6c6ac8070f7a4be5cb40bb609ec9edcbad79b1d1c102ef642293e21"
     },
     {
       "mode": "100644",
@@ -384,7 +394,7 @@
     {
       "mode": "100644",
       "path": "src/mmWaveRadar/radar/sensor.py",
-      "sha256": "ca638b51364bff9c6d17a476433795471e3a9ef88f9fbc281b296b16962ece32"
+      "sha256": "88a91cd0ccba1191aa4736b575ea0eecdcb5cc84fc4ec3f83f767a30e2c061fe"
     },
     {
       "mode": "100644",
@@ -394,32 +404,42 @@
     {
       "mode": "100644",
       "path": "src/mmWaveRadar/simulation/__init__.py",
-      "sha256": "427561d8dea6cf1b1b79434bc3dc64dcd17921710d1c7739c867cfa46449e772"
+      "sha256": "d2a2b00fe2d5ce3fc139d9f3ad2a383a5697d17713c06f736cf8df8db4996458"
     },
     {
       "mode": "100644",
       "path": "src/mmWaveRadar/simulation/adc_synthesis.py",
-      "sha256": "89bda9b14eadf7ede35964381bd6a84b8fb2e35107a6cdfb9d684682de20fb16"
+      "sha256": "f710a7f1aeb77e2941db93831ff4d660ac2cec987becabb9352499483c048021"
     },
     {
       "mode": "100644",
       "path": "src/mmWaveRadar/simulation/calibration.py",
-      "sha256": "700378ffaea116d50df167cae4cb095e8251c2f98b55ae23de20c58e84f7b281"
+      "sha256": "c0c0f544c1a8beb52ce6e24a2f9a6f54e98732ce96eac199f612f375c8dcc410"
     },
     {
       "mode": "100644",
       "path": "src/mmWaveRadar/simulation/channel_gain.py",
-      "sha256": "44b951ad3afac96a96b51dac7fdfa557317f492232ad690c4c88069f8a184061"
+      "sha256": "65d4b76ec9b4053dff2608c13c406a5a7ea1fff81b704a1e60d5b99311d6c2f1"
+    },
+    {
+      "mode": "100644",
+      "path": "src/mmWaveRadar/simulation/coupling_incremental.py",
+      "sha256": "71557da595d89669c4c7b7ea372bdbcd34da698fb2a87671a2d8e03982d44e30"
     },
     {
       "mode": "100644",
       "path": "src/mmWaveRadar/simulation/env_human_coupling.py",
-      "sha256": "3de4b0aac91fd475157990d6849fcf94cc4682e038c88ce43dcfeb25ad4754ee"
+      "sha256": "3607dad996c57f1ab8cc4ef13a395d377c6dad2bcb4911c72db39e06b3303a6b"
+    },
+    {
+      "mode": "100644",
+      "path": "src/mmWaveRadar/simulation/hybrid_passes.py",
+      "sha256": "c96a136c655d0d32adcda9e931489927723f4c8f408496a3dfd32c32715268fa"
     },
     {
       "mode": "100644",
       "path": "src/mmWaveRadar/simulation/hybrid_pipeline.py",
-      "sha256": "30cf40b34da59d8067ccad9136dcad23feefdb684b9ae08f75424c4de83b31b1"
+      "sha256": "a2beb4df234dc5f9867df1b1dd159fc430751bb6aa1d9d1064978e8dd3246124"
     },
     {
       "mode": "100644",
@@ -434,22 +454,37 @@
     {
       "mode": "100644",
       "path": "src/mmWaveRadar/simulation/physical_optics.py",
-      "sha256": "4cca5d5a88b278d08deb0187059ed7c2a5abb3795201fd8d1fd60ae364930844"
+      "sha256": "f1b8eb9516a4f5a46dd7c7aef855372d69f90e94f3709b375a5f221c116e7929"
+    },
+    {
+      "mode": "100644",
+      "path": "src/mmWaveRadar/simulation/po_incremental.py",
+      "sha256": "99fa02e549540700a1e8c12b0d917bbe4895a94e259e21affac28cf7fd9d3283"
     },
     {
       "mode": "100644",
       "path": "src/mmWaveRadar/simulation/po_profile.py",
-      "sha256": "798ea0e673669879285eaf10424871cb71f93e6f716e63b248f159498c5b7e42"
+      "sha256": "f64be14eb011a624cfe6b9fd1192dadc88ed9be507572bf339b25157ce570070"
+    },
+    {
+      "mode": "100644",
+      "path": "src/mmWaveRadar/simulation/po_wideband.py",
+      "sha256": "6fdc2fc58e364ba7a5a4a071d83829488b11142fa37c6aa553118448d6c44c2f"
     },
     {
       "mode": "100644",
       "path": "src/mmWaveRadar/simulation/point_targets.py",
-      "sha256": "3bedf47f6d039bbd3e9e2c1f0836b17c8c33c6f76002827dc9b22dc64dd5de99"
+      "sha256": "9bbf36c346cf607194d72439066895c6b7e2d62bcc12284d6c4474d971212451"
+    },
+    {
+      "mode": "100644",
+      "path": "src/mmWaveRadar/simulation/reflector_selection.py",
+      "sha256": "eb56cd6ccec5c54f040834a1ab4618fd4744c4702419154bbd9b9e2b2ecd9544"
     },
     {
       "mode": "100644",
       "path": "src/mmWaveRadar/simulation/rt_coherence.py",
-      "sha256": "1d187bdf33e813ff07d8ae2621149fb83d81cf053b795a2709e0239a2c804ea0"
+      "sha256": "7add08f3f09cf2927991aef32f57987512d294753b35cad17879f4ba99612acb"
     },
     {
       "mode": "100644",
@@ -464,12 +499,12 @@
     {
       "mode": "100644",
       "path": "src/mmWaveRadar/simulation/simulator.py",
-      "sha256": "721fc56048d7a40d2a622bb24ed29f815c984fdcefca2e338c8f633d645380a8"
+      "sha256": "5c516c103789bfffd91f85489357138bf565e6749285b595f95fcc430bc19285"
     },
     {
       "mode": "100644",
       "path": "src/mmWaveRadar/simulation/static_blocking.py",
-      "sha256": "e1cec42a0581930d161edf575a6045f7f31bdb84cb2e7a7376b2655fb9e67706"
+      "sha256": "e5a05546a4ea7959511c0487785b7e4ed03a1846feade3ef656f0d8ea336448e"
     },
     {
       "mode": "100644",
@@ -479,7 +514,7 @@
     {
       "mode": "100644",
       "path": "src/mmWaveRadar/simulation/types.py",
-      "sha256": "c1bb0210282207b4c02641abf137cbba4da45d333fbe9e158651cf39e1678170"
+      "sha256": "3e33c59575ecc65b8f9c5893386d17cf62750ac34ef47b34bae3986bcfb3d618"
     },
     {
       "mode": "100644",
@@ -494,7 +529,7 @@
     {
       "mode": "100644",
       "path": "src/mmWaveRadar/targets/mesh.py",
-      "sha256": "073b491c21e0c1b5ecc4bd674b5d61769d312729709cb600f3a1138569a11231"
+      "sha256": "99ca4172095c2549bbf83ae65ba26471fa10fcc7ab30681080b03eaac8f6d44c"
     },
     {
       "mode": "100644",
@@ -504,7 +539,7 @@
     {
       "mode": "100644",
       "path": "src/mmWaveRadar/tutorial_support.py",
-      "sha256": "442d51e35951d5c2f4c7234dcb7a10996d0d3603a2d7719ac2ad12196dde31d3"
+      "sha256": "3a7eb1b92a9e22aa714905043f523da006242d2b0c396e9ecc403b86d12f2660"
     },
     {
       "mode": "100644",
@@ -514,7 +549,12 @@
     {
       "mode": "100644",
       "path": "tests/unit/sensing_test_helpers.py",
-      "sha256": "a5e0de8598ab66fef0cb9ee273bf160562646b74874670295051bed20647fda4"
+      "sha256": "dd32c722bdf25957f41080c94037fcaf01d5109080a2c26f2c6376051a85c345"
+    },
+    {
+      "mode": "100644",
+      "path": "tests/unit/test_adc_if_filter.py",
+      "sha256": "87e05f0425f281678ca549040f29accb2d578ae8898d3eeb937880d7fe0a093d"
     },
     {
       "mode": "100644",
@@ -554,7 +594,7 @@
     {
       "mode": "100644",
       "path": "tests/unit/test_gui_app.py",
-      "sha256": "fe2fc978212c0b8a3365fc4572213d02da59a3c0ff5aa5f7b60cbc5bff5dfa43"
+      "sha256": "1d02dbfc8bd8704cdb0862a670d907c703a41d2f193a52ea885a7106639d5b54"
     },
     {
       "mode": "100644",
@@ -569,7 +609,7 @@
     {
       "mode": "100644",
       "path": "tests/unit/test_mmwave_dsp.py",
-      "sha256": "d8fe3c37cdeffc682c557fc43426f122ab35c689b3432a3869379ebad352a8dd"
+      "sha256": "3d134204e9aa4bafa55bb5c9cd07df8071435005d51c54617e23b319b886d0bc"
     },
     {
       "mode": "100644",
@@ -589,7 +629,7 @@
     {
       "mode": "100644",
       "path": "tests/unit/test_point_targets.py",
-      "sha256": "835bfcaedf97febc459da2e0ef30b41a7db6298702ac7bd2ef246dc783645bab"
+      "sha256": "4f3a1ab190d6391d88be40c7c43d682372bfa8a25381b4bdf86c9a36874451e2"
     },
     {
       "mode": "100644",
@@ -604,7 +644,7 @@
     {
       "mode": "100644",
       "path": "tests/unit/test_release_hygiene.py",
-      "sha256": "13343b019d4f1778d3fc90640b3d2ee763c360e039c3a317177c9baab92c33a5"
+      "sha256": "1902cc332fa9e2f4240c1c7460d2b46ca6efed2499ad2bc750d1f2e5358c4165"
     },
     {
       "mode": "100644",
@@ -628,43 +668,88 @@
     },
     {
       "mode": "100644",
+      "path": "tests/unit/test_sensing_adaptive_analytic.py",
+      "sha256": "7d3d11c25db29e47c8547f1a131e8108f1da9a2e1564b49c3acacb6253d5fcb0"
+    },
+    {
+      "mode": "100644",
+      "path": "tests/unit/test_sensing_channel_gain.py",
+      "sha256": "90742cb523eeeaa74094476e0ef3252e0f4ff35c59556dec939117644bf761ea"
+    },
+    {
+      "mode": "100644",
+      "path": "tests/unit/test_sensing_coherent_calibration.py",
+      "sha256": "dbf14b6032b37a0d9abab2829f1f2071a2d64807174ad89be5ed05d85429bea8"
+    },
+    {
+      "mode": "100644",
       "path": "tests/unit/test_sensing_core.py",
-      "sha256": "d4181e2a4743cb8f9215f3776145f6fd5f244ba22dbfc4a0d71358b84ead9e8b"
+      "sha256": "d75df67cb9a6bb4fd695ee7ca3f07ef2cd2c5954ccd02a52c3b3e6aeae7c4659"
+    },
+    {
+      "mode": "100644",
+      "path": "tests/unit/test_sensing_coupling_incremental.py",
+      "sha256": "f91dc71b40dfe69520727f22410127c2dc44d94103a5bbe6a0f1c6564dab2497"
     },
     {
       "mode": "100644",
       "path": "tests/unit/test_sensing_human_po.py",
-      "sha256": "737e429227b52428d858e44d64e0f1566b454f3f3faa73e3f76e2bf3b30c814e"
+      "sha256": "2c3c3bea618efe28091b8857b34a5c23326a782096896044cea8a06077295d80"
+    },
+    {
+      "mode": "100644",
+      "path": "tests/unit/test_sensing_hybrid_corrections.py",
+      "sha256": "fce3dfb8e7debb608bd00ac0a1ab4bba6d0bcd4861e8f1ec9cb6d714f0ed2974"
+    },
+    {
+      "mode": "100644",
+      "path": "tests/unit/test_sensing_hybrid_passes.py",
+      "sha256": "414cabdc78821630807e7194bd6f6bd97ebb96320731fdde1524f95e43ba08e4"
     },
     {
       "mode": "100644",
       "path": "tests/unit/test_sensing_hybrid_po.py",
-      "sha256": "78dfb00f577d2c4c902568297ccc252eacba816ffa4edc12840d76d113853fe0"
+      "sha256": "5d486907df69d067bc6656b839e8d64b5bccddb1b717a330b91ce0ab79f31a37"
     },
     {
       "mode": "100644",
       "path": "tests/unit/test_sensing_motion_calibration.py",
-      "sha256": "dcc9e526d4f767dfbc2ab3a70bc11e0ce8426f2796271479c515948b40d8345e"
+      "sha256": "f1a1d56796d5701a5cb8862090465f615b3a5608559072d8288f9ab7cd492e8e"
     },
     {
       "mode": "100644",
       "path": "tests/unit/test_sensing_physical_optics.py",
-      "sha256": "78bfd339a32ef809bbc18a6312be8f06193a555b17b411467386c69cd5355209"
+      "sha256": "13af01c086c5ef71a1b79a38a67366b8c73b82d0033c7c613bb38a9b7a6b540c"
     },
     {
       "mode": "100644",
       "path": "tests/unit/test_sensing_po_profile.py",
-      "sha256": "7a6726a0028784b51c5eab39bc77a3ac866095d4a319821dcee2f857ca8eac22"
+      "sha256": "9fafc2b1f8b2b38cdd771fb21570f0fbc4ba525ee564fad479ed9feb039fa125"
+    },
+    {
+      "mode": "100644",
+      "path": "tests/unit/test_sensing_reflection_transport.py",
+      "sha256": "278d78d055b37993e5f9b7218956a8323435eb32fb27301176b7775917ed34e4"
+    },
+    {
+      "mode": "100644",
+      "path": "tests/unit/test_sensing_reflector_selection.py",
+      "sha256": "caaba3bca30fc0bd841f1b06defb3acb1b9ea5ad2f1284a889839d4a8c28d0d6"
+    },
+    {
+      "mode": "100644",
+      "path": "tests/unit/test_sensing_reflector_surfaces.py",
+      "sha256": "8acc4829a76458cd69aa469acfe44566f41587d0adb885c0cbc6557905a19922"
     },
     {
       "mode": "100644",
       "path": "tests/unit/test_sensing_rt_coherence.py",
-      "sha256": "06953dee895bf61af98edcf76afd016750dec63b071e05bc8b9da90c0a28af06"
+      "sha256": "7bf38fcfc221420b03df887a5d3c5a9cdb4b4923ede048bf6cf6f03c218ce95f"
     },
     {
       "mode": "100644",
       "path": "tests/unit/test_sensing_static_blocking.py",
-      "sha256": "ffa5fe5a5bddeae170a60b43a60edd4d1ab566572fcfbb9a0e24819dfae2423f"
+      "sha256": "e5aef60d7c1e7f4ae8b477149f2023666780d4c24c0d00c4c78563e5a27f7841"
     },
     {
       "mode": "100644",
@@ -674,7 +759,7 @@
     {
       "mode": "100644",
       "path": "tests/unit/test_solver_diagnostics.py",
-      "sha256": "6164ce77f3d52ccae6efb4e57e7152a8e6bb0a4ffe93f2a48ac782294fbbdd10"
+      "sha256": "00aba4db96a17d0b3e6be65bc5f5ba0b49054bea0bf33e5b85a7a3e578402b48"
     },
     {
       "mode": "100644",
@@ -689,7 +774,7 @@
     {
       "mode": "100644",
       "path": "tests/unit/test_tutorial_support.py",
-      "sha256": "715351704bad61620a7b0bf46bd36eaf69c6d2c1db654e0303cb5bb7573dc777"
+      "sha256": "65912fab50ba8731fd7fa5bbd8ceb9f378317ea936dcf996b56710d2c27d6d66"
     },
     {
       "mode": "100644",
@@ -719,7 +804,7 @@
     {
       "mode": "100644",
       "path": "tools/bundle_prepare/contract.py",
-      "sha256": "5d0eb31a3304cb51e8647ea533031229988e0956556efeed34de8af5ac958b39"
+      "sha256": "80022240169eaac188446a04ec0dcd7f4c95ae3aefab27143ed5bd3345693d9a"
     },
     {
       "mode": "100644",
@@ -779,7 +864,7 @@
     {
       "mode": "100644",
       "path": "tools/hybrid_po/run_calibrated_hybrid_po.py",
-      "sha256": "5fc3d8ac4fe28246e23c3ca90bf40f94ae8e17def1fb040e8e991f19bf0f05cf"
+      "sha256": "e7465a97e76ba90eb538fc4c715f70928999ad24b850e952f39f6aed42707fee"
     },
     {
       "mode": "100644",
@@ -789,7 +874,7 @@
     {
       "mode": "100644",
       "path": "validation/BUNDLE_SPEC.md",
-      "sha256": "dc3dcd0bb6a8a602c99f3beb2c9a708a126dfb45815b767a19968890da3897f6"
+      "sha256": "2e3baedcab8dcc0d4e892bde16934c0b74d0f7e48965d63a3012ced80ea4c053"
     },
     {
       "mode": "100644",
@@ -819,7 +904,7 @@
     {
       "mode": "100644",
       "path": "validation/runner.py",
-      "sha256": "07d734ed844a99e3ba4ab3f4c8e22696395ebffca5072f18d8f59ff7cea6112e"
+      "sha256": "f5f2f5518c686ebe79010d9c9dd2cabb0a06180ddd30b3d19a43ff3703e7e83f"
     },
     {
       "mode": "100644",
@@ -839,11 +924,11 @@
     {
       "mode": "100644",
       "path": "validation/schema/sensor.schema.json",
-      "sha256": "4c5187fee768744c77059cf42e2c67c1bc1ab7fd85fcb9154dae9f929fcece74"
+      "sha256": "ade7dce42b4855146faabc6f9ca7cd4886f125fd499fe174029418ea1a80e52a"
     }
   ],
   "policy_sha256": "7e817e884d16e398732a2d6de6fb15a3b3ae8df0b07050d870887d3f5b7488c1",
   "schema_version": 1,
-  "source_commit": "bb4535cd38ad3f210cc67164202d698ebbb6db87",
-  "tree_sha256": "cb7c77e0e92c585ab518b3ca748d8c6ebc3724b9fcf26a9d5ef0666da3ae4d9b"
+  "source_commit": "488038685763fcb6d48247cfc1f95ee6ee349dd1",
+  "tree_sha256": "95477de9358952f038970c07c4d6de6b573cdf118cf76b739b9b173f2c03299a"
 }
