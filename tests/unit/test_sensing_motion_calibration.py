@@ -66,7 +66,8 @@ def test_mesh_sequence_radial_velocity_samples_face_centroid():
     assert summary["signed_max_mps"] > 0.0
 
 
-def test_rt_sequence_calibration_uses_retrace_chirps_and_last_retrace_alignment():
+@pytest.mark.parametrize("coherent", [False, True])
+def test_rt_sequence_calibration_uses_retrace_chirps_and_last_retrace_alignment(coherent):
     times = np.array([[0.0, 1.0, 2.0, 3.0]], dtype=float)
     rt_power = np.array([[1.0, 99.0, 4.0, 99.0]], dtype=float)
     metadata = SensingMetadata(
@@ -92,11 +93,19 @@ def test_rt_sequence_calibration_uses_retrace_chirps_and_last_retrace_alignment(
         alignment="last_retrace",
     )
 
-    gain, fit = fit_sequence_path_power_calibration(
-        rt_baseline={"cube": rt_cube},
+    fit_function = fit_sequence_adc_calibration if coherent else fit_sequence_path_power_calibration
+    power_argument = (
+        {"po_adc": np.ones((1, 4, 2, 1), dtype=np.complex128)} if coherent
+        else {"po_path_power": np.ones((1, 4), dtype=float)}
+    )
+    gain, fit = fit_function(
+        rt_baseline={
+            "cube": rt_cube,
+            "reference_adc_power": {"single_human_only": rt_power[..., None]},
+        },
         po_times=np.array([[0.2, 1.2, 2.2, 3.2]], dtype=float),
-        po_path_power=np.ones((1, 4), dtype=float),
         config=config,
+        **power_argument,
     )
 
     assert np.isclose(gain, np.sqrt(2.5))
@@ -105,6 +114,9 @@ def test_rt_sequence_calibration_uses_retrace_chirps_and_last_retrace_alignment(
     assert fit["reference_chirps"] == 2
     assert fit["alignment"] == "last_retrace"
     assert fit["sample_mode"] == "retrace_chirps"
+    assert fit["reference_power_kind"] == (
+        "adc_rms_power" if coherent else "path_coefficient_power"
+    )
     assert fit["calibration_gain_strategy"] == "time_varying_last_retrace"
     gain_map = calibration_gain_array(fit, times.shape)
     np.testing.assert_allclose(gain_map, [[1.0, 1.0, 2.0, 2.0]])

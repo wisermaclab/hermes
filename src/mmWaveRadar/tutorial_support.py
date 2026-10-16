@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import xml.etree.ElementTree as ET
 
 import numpy as np
 
@@ -16,16 +17,15 @@ BEDROOM_SCENE_XML = """
         <string name="type" value="plasterboard"/>
         <float name="scattering_coefficient" value="0.2"/>
     </bsdf>
-    <bsdf type="itu-radio-material" id="mat-reflective-wall">
-        <string name="type" value="metal"/>
-        <float name="scattering_coefficient" value="0.2"/>
+    <bsdf type="itu-radio-material" id="mat-concrete">
+        <string name="type" value="concrete"/>
     </bsdf>
     <bsdf type="itu-radio-material" id="mat-wood"><string name="type" value="wood"/></bsdf>
     <bsdf type="itu-radio-material" id="mat-fabric"><string name="type" value="chipboard"/></bsdf>
 
     <shape type="cube" id="floor">
         <transform name="to_world"><scale x="2.95" y="4.35" z="0.04"/><translate x="2.5" y="0.75" z="-0.04"/></transform>
-        <ref name="bsdf" id="mat-wood"/>
+        <ref name="bsdf" id="mat-concrete"/>
     </shape>
     <shape type="cube" id="back_wall">
         <transform name="to_world"><scale x="0.05" y="4.35" z="1.5"/><translate x="5.45" y="0.75" z="1.5"/></transform>
@@ -37,7 +37,7 @@ BEDROOM_SCENE_XML = """
     </shape>
     <shape type="cube" id="right_wall">
         <transform name="to_world"><scale x="2.95" y="0.05" z="1.5"/><translate x="2.5" y="5.1" z="1.5"/></transform>
-        <ref name="bsdf" id="mat-reflective-wall"/>
+        <ref name="bsdf" id="mat-wall"/>
     </shape>
     <shape type="cube" id="bed">
         <transform name="to_world"><scale x="0.55" y="0.9" z="0.18"/><translate x="4.85" y="-2.65" z="0.28"/></transform>
@@ -55,15 +55,67 @@ BEDROOM_SCENE_XML = """
 """.strip()
 
 
-BEDROOM_SCENE_BOXES = (
-    {"id": "floor", "scale": (2.95, 4.35, 0.04), "translate": (2.5, 0.75, -0.04)},
-    {"id": "back_wall", "scale": (0.05, 4.35, 1.5), "translate": (5.45, 0.75, 1.5)},
-    {"id": "left_wall", "scale": (2.95, 0.05, 1.5), "translate": (2.5, -3.6, 1.5)},
-    {"id": "right_wall", "scale": (2.95, 0.05, 1.5), "translate": (2.5, 5.1, 1.5)},
-    {"id": "bed", "scale": (0.55, 0.9, 0.18), "translate": (4.85, -2.65, 0.28)},
-    {"id": "nightstand", "scale": (0.25, 0.25, 0.25), "translate": (4.95, -1.3, 0.25)},
-    {"id": "wardrobe", "scale": (0.35, 0.9, 1.0), "translate": (4.85, 3.8, 1.0)},
-)
+def _bedroom_scene_boxes_from_xml(scene_xml: str) -> tuple[dict, ...]:
+    """Extract the prepared-room preview data from its canonical XML."""
+
+    root = ET.fromstring(scene_xml)
+    material_types = {
+        material.attrib["id"]: material.find("./string[@name='type']").attrib[
+            "value"
+        ]
+        for material in root.findall("./bsdf")
+    }
+    boxes = []
+    for shape in root.findall("./shape[@type='cube']"):
+        transform = shape.find("./transform[@name='to_world']")
+        scale = transform.find("./scale") if transform is not None else None
+        translate = (
+            transform.find("./translate") if transform is not None else None
+        )
+        material = shape.find("./ref[@name='bsdf']")
+        if scale is None or translate is None or material is None:
+            raise ValueError(
+                f"bedroom cube {shape.attrib.get('id', '<unnamed>')} is incomplete"
+            )
+        material_id = material.attrib["id"]
+        material_type = material_types[material_id]
+        boxes.append(
+            {
+                "id": shape.attrib["id"],
+                "scale": tuple(float(scale.attrib[axis]) for axis in "xyz"),
+                "translate": tuple(
+                    float(translate.attrib[axis]) for axis in "xyz"
+                ),
+                "material_id": material_id,
+                "material": material_type,
+                "material_display": material_type.replace("_", " ").title(),
+            }
+        )
+    return tuple(boxes)
+
+
+BEDROOM_SCENE_BOXES = _bedroom_scene_boxes_from_xml(BEDROOM_SCENE_XML)
+
+
+def bedroom_scene_xml_for_boxes(room_boxes) -> str:
+    """Return the canonical bedroom XML with updated cube transforms."""
+
+    boxes_by_id = {str(box["id"]): box for box in room_boxes}
+    root = ET.fromstring(BEDROOM_SCENE_XML)
+    shapes = root.findall("./shape[@type='cube']")
+    shape_ids = {shape.attrib["id"] for shape in shapes}
+    if set(boxes_by_id) != shape_ids:
+        raise ValueError("room boxes must match the canonical bedroom objects")
+    for shape in shapes:
+        box = boxes_by_id[shape.attrib["id"]]
+        transform = shape.find("./transform[@name='to_world']")
+        scale = transform.find("./scale")
+        translate = transform.find("./translate")
+        for axis, value in zip("xyz", box["scale"]):
+            scale.attrib[axis] = f"{float(value):.9g}"
+        for axis, value in zip("xyz", box["translate"]):
+            translate.attrib[axis] = f"{float(value):.9g}"
+    return ET.tostring(root, encoding="unicode")
 
 
 def orientation_toward(target_point, radar_position):
@@ -752,6 +804,7 @@ __all__ = [
     "amass_marker_dict",
     "bedroom_scene_boxes",
     "bedroom_scene_xml",
+    "bedroom_scene_xml_for_boxes",
     "load_bedroom_scene",
     "make_expanding_chest_sequence",
     "make_expanding_cylinder_sequence",

@@ -459,6 +459,8 @@ def _radar(
     chirp_duration_s: float,
     chirp_repetition_time_s: float,
     sampling_frequency_hz: float,
+    adc_mode: str = "complex1x",
+    if_bandwidth_hz: float | None = None,
     num_adc_samples: int,
     num_chirps_per_frame: int,
     frame_period_s: float,
@@ -508,6 +510,8 @@ def _radar(
         chirp_duration=chirp_duration_s,
         chirp_repetition_time=chirp_repetition_time_s,
         sampling_frequency=sampling_frequency_hz,
+        adc_mode=adc_mode,
+        if_bandwidth_hz=if_bandwidth_hz,
         num_adc_samples=num_adc_samples,
         num_chirps_per_frame=num_chirps_per_frame,
         frame_period=frame_period_s,
@@ -570,9 +574,11 @@ def _po_cube(
     visibility_samples: int,
     integration_mode: str,
     quadrature_phase_span_scale_rad: float,
+    curvature_error_rad: float,
     quadrature_max_refinement_depth: int,
     quadrature_max_subfaces_per_parent: int,
     compute_backend: str,
+    diagnostics=None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     result = po_channel(
         vertices=vertices,
@@ -586,29 +592,38 @@ def _po_cube(
         visibility_fade_chirps=1,
         po_integration_mode=integration_mode,
         po_quadrature_phase_span_scale_rad=quadrature_phase_span_scale_rad,
+        po_curvature_error_rad=curvature_error_rad,
         po_quadrature_max_refinement_depth=quadrature_max_refinement_depth,
         po_quadrature_max_subfaces_per_parent=(
             quadrature_max_subfaces_per_parent
         ),
         compute_backend=compute_backend,
         compute_precision="float32",
+        receiver_fmcw=radar.fmcw,
+        max_frequency_offset_hz=(radar.fmcw.slope*(radar.fmcw.num_adc_samples-1)
+                                 /radar.fmcw.sampling_frequency),
     )
     azimuth_deg, elevation_deg = radar.local_azimuth_elevation(result.face_centroids)
     coefficients = np.asarray(result.coefficients, dtype=np.complex64)
-    coefficients *= radar.hardware.channel_gain(
+    hardware_gains = radar.hardware.channel_gain(
         azimuth_deg=azimuth_deg,
         elevation_deg=elevation_deg,
         frequency_hz=radar.fmcw.carrier_frequency,
     )
+    coefficients *= hardware_gains
+    delay_response = result.delay_response
+    if delay_response is not None:
+        delay_response = delay_response.with_channel_gains(
+            delay_response.channel_gains * hardware_gains)
     delays = np.asarray(result.delays_s, dtype=float)
-    valid = np.any(np.abs(coefficients) > 0.0, axis=0)
-    valid &= np.any(delays >= 0.0, axis=0) if delays.ndim == 2 else delays >= 0.0
     chirp_adc = synthesize_adc_from_paths(
-        coefficients[:, valid],
-        delays[:, valid] if delays.ndim == 2 else delays[valid],
+        coefficients,
+        delays,
         radar.fmcw,
         backend=compute_backend,
         precision="float32",
+        delay_response=delay_response,
+        diagnostics=diagnostics,
     )
     adc = np.repeat(
         chirp_adc[None, None, :, :],
@@ -664,6 +679,8 @@ def run_static_target_experiment(
     chirp_duration_s: float = 58e-6,
     chirp_repetition_time_s: float = 65e-6,
     sampling_frequency_hz: float = 4.5e6,
+    adc_mode: str = "complex1x",
+    if_bandwidth_hz: float | None = None,
     num_adc_samples: int = 225,
     num_chirps_per_frame: int | None = None,
     frame_period_s: float = 50e-3,
@@ -677,6 +694,7 @@ def run_static_target_experiment(
     cosine_3db_beamwidth_deg: float = 60.0,
     po_integration_mode: str = "parent_face_quadrature",
     po_quadrature_phase_span_scale_rad: float = 1.0,
+    po_curvature_error_rad: float = 0.005,
     po_quadrature_max_refinement_depth: int = 2,
     po_quadrature_max_subfaces_per_parent: int = 16,
     rt_samples_per_source: int = 100_000,
@@ -703,11 +721,12 @@ def run_static_target_experiment(
     if po_integration_mode not in (
         "face_centroid",
         "parent_face_quadrature",
+        "parent_face_adaptive_analytic",
         "parent_face_far_field_analytic",
     ):
         raise ValueError(
             "po_integration_mode must be 'face_centroid', "
-            "'parent_face_quadrature', or 'parent_face_far_field_analytic'"
+            "'parent_face_quadrature', 'parent_face_adaptive_analytic', or 'parent_face_far_field_analytic'"
         )
     po_phase_span = float(po_quadrature_phase_span_scale_rad)
     if not np.isfinite(po_phase_span) or po_phase_span <= 0.0:
@@ -715,6 +734,9 @@ def run_static_target_experiment(
             "po_quadrature_phase_span_scale_rad must be finite and positive"
         )
     po_refinement_depth = int(po_quadrature_max_refinement_depth)
+    curvature_error = float(po_curvature_error_rad)
+    if not np.isfinite(curvature_error) or curvature_error <= 0.:
+        raise ValueError("po_curvature_error_rad must be finite and positive")
     if (
         po_refinement_depth != po_quadrature_max_refinement_depth
         or po_refinement_depth < 0
@@ -860,6 +882,8 @@ def run_static_target_experiment(
         chirp_duration_s=chirp_duration_s,
         chirp_repetition_time_s=chirp_repetition_time_s,
         sampling_frequency_hz=sampling_frequency_hz,
+        adc_mode=adc_mode,
+        if_bandwidth_hz=if_bandwidth_hz,
         num_adc_samples=num_adc_samples,
         num_chirps_per_frame=num_chirps,
         frame_period_s=frame_period_s,
@@ -881,6 +905,7 @@ def run_static_target_experiment(
 
     check_cancelled()
     po_started = time.perf_counter()
+    po_filter_diagnostics = {}
     po_adc, face_power, face_visibility = _po_cube(
         vertices,
         faces,
@@ -889,9 +914,11 @@ def run_static_target_experiment(
         visibility_samples=visibility_samples,
         integration_mode=po_integration_mode,
         quadrature_phase_span_scale_rad=po_phase_span,
+        curvature_error_rad=curvature_error,
         quadrature_max_refinement_depth=po_refinement_depth,
         quadrature_max_subfaces_per_parent=po_subface_cap,
         compute_backend=compute_backend,
+        diagnostics=po_filter_diagnostics,
     )
     po_runtime = time.perf_counter() - po_started
     check_cancelled()
@@ -947,6 +974,9 @@ def run_static_target_experiment(
                 "chirp_repetition_time_s": float(
                     radar.fmcw.chirp_repetition_time
                 ),
+                "adc_mode": radar.fmcw.adc_mode,
+                "if_bandwidth_hz": radar.fmcw.if_bandwidth_hz,
+                "effective_if_cutoff_hz": radar.fmcw.effective_if_cutoff_hz,
                 "sampling_frequency_hz": float(
                     radar.fmcw.sampling_frequency
                 ),
@@ -975,6 +1005,7 @@ def run_static_target_experiment(
                 "rt_max_paths_per_source": rt_path_cap,
                 "po_visibility_samples_per_face": visibility_samples,
                 "po_integration_mode": po_integration_mode,
+                "po_curvature_error_rad": curvature_error,
                 "po_quadrature_phase_span_scale_rad": po_phase_span,
                 "po_quadrature_max_refinement_depth": po_refinement_depth,
                 "po_quadrature_max_subfaces_per_parent": po_subface_cap,
@@ -1004,6 +1035,9 @@ def run_static_target_experiment(
             "chirp_repetition_time_s": float(
                 radar.fmcw.chirp_repetition_time
             ),
+            "adc_mode": radar.fmcw.adc_mode,
+            "if_bandwidth_hz": radar.fmcw.if_bandwidth_hz,
+            "effective_if_cutoff_hz": radar.fmcw.effective_if_cutoff_hz,
             "sampling_frequency_hz": float(radar.fmcw.sampling_frequency),
             "num_adc_samples": int(radar.fmcw.num_adc_samples),
             "num_chirps_per_frame": int(radar.fmcw.num_chirps_per_frame),
@@ -1011,6 +1045,9 @@ def run_static_target_experiment(
             "num_tx": int(radar.fmcw.num_tx),
             "tdm_enabled": bool(radar.fmcw.tdm_enabled),
         },
+    }
+    sensor_parameters["adc_if_filter"] = {
+        "po": po_filter_diagnostics, "rt": rt_cube.metadata.adc_if_filter,
     }
     path_counts = np.asarray(rt_cube.metadata.path_counts)
     rt_face_hit_counts = np.asarray(
@@ -1104,6 +1141,8 @@ def run_static_target_diagnostics(
         chirp_duration_s=float(fmcw["chirp_duration_s"]),
         chirp_repetition_time_s=float(fmcw["chirp_repetition_time_s"]),
         sampling_frequency_hz=float(fmcw["sampling_frequency_hz"]),
+        adc_mode=fmcw.get("adc_mode", "complex1x"),
+        if_bandwidth_hz=fmcw.get("if_bandwidth_hz"),
         num_adc_samples=int(fmcw["num_adc_samples"]),
         num_chirps_per_frame=int(fmcw["num_chirps_per_frame"]),
         frame_period_s=float(fmcw["frame_period_s"]),

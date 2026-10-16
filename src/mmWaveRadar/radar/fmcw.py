@@ -10,6 +10,7 @@ import math
 import operator
 
 import numpy as np
+from .adc import adc_mode, if_cutoff_hz
 
 
 def _finite_float(name: str, value: object, *, allow_negative: bool) -> float:
@@ -60,6 +61,9 @@ class FMCWConfig:
     :param num_tx: Number of transmitters enabled by the chirp schedule
     :param tdm_enabled: Whether transmitters occupy consecutive physical chirp
         slots. When false, all transmitters are sampled simultaneously.
+    :param adc_mode: ``complex1x`` (default), ``complex2x``, or ``real``.
+    :param if_bandwidth_hz: Optional analog IF cap. The effective cutoff is
+        the smaller of this cap and 0.9 fs (1x) / 0.45 fs (2x/real).
     """
 
     carrier_frequency: float
@@ -72,8 +76,11 @@ class FMCWConfig:
     frame_period: float
     num_tx: int = 1
     tdm_enabled: bool = False
+    adc_mode: str = "complex1x"
+    if_bandwidth_hz: float | None = None
 
     def __post_init__(self):
+        adc_mode(self)
         float_fields = {
             "carrier_frequency": _finite_float(
                 "carrier_frequency",
@@ -123,6 +130,14 @@ class FMCWConfig:
         for fields in (float_fields, integer_fields):
             for name, value in fields.items():
                 object.__setattr__(self, name, value)
+        if self.if_bandwidth_hz is not None:
+            object.__setattr__(self, "if_bandwidth_hz", _finite_float(
+                "if_bandwidth_hz", self.if_bandwidth_hz, allow_negative=False))
+
+    @property
+    def effective_if_cutoff_hz(self) -> float:
+        """Effective ideal receiver cutoff after sampling-mode/HW limits."""
+        return if_cutoff_hz(self)
 
     @property
     def wavelength(self) -> float:

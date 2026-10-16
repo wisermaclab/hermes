@@ -32,6 +32,8 @@ class StaticPathBank:
     path_interactions: np.ndarray | None = None
     path_objects: np.ndarray | None = None
     path_primitives: np.ndarray | None = None
+    # CIR coefficients before hardware pattern, scalar gain, and phase signs.
+    propagation_coefficients: np.ndarray | None = None
 
 
 @dataclass(frozen=True)
@@ -68,11 +70,13 @@ def extract_static_path_bank(
         virtual_channel_tx_indices=radar.hardware.virtual_tx_indices(),
         virtual_channel_rx_indices=radar.hardware.virtual_rx_indices(),
     )
+    propagation_coefficients = coefficients
     coefficients = apply_path_hardware_gain(
         radar.hardware,
         coefficients,
         paths=paths,
         frequency_hz=radar.fmcw.carrier_frequency,
+        radar_orientation=radar.orientation,
     )
     num_paths = int(delays_s.size)
     tx_center = np.mean(radar.world_tx_positions(), axis=0)
@@ -115,6 +119,7 @@ def extract_static_path_bank(
         path_interactions=interactions,
         path_objects=objects,
         path_primitives=primitives,
+        propagation_coefficients=propagation_coefficients,
     )
 
 

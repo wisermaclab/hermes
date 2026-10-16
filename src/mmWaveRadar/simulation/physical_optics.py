@@ -16,6 +16,7 @@ from scipy.constants import c, epsilon_0, pi
 
 from ..radar.hardware import resolve_virtual_channel_pairs
 from ..targets.mesh import ensure_outward_face_winding
+from .po_wideband import PODelayResponse
 
 
 VisibilityMode = Literal["fractional_shadow_fade", "none"]
@@ -25,8 +26,21 @@ ComputePrecision = Literal["float64", "float32"]
 POIntegrationMode = Literal[
     "face_centroid",
     "parent_face_quadrature",
+    "parent_face_adaptive_analytic",
     "parent_face_far_field_analytic",
 ]
+PolarizationCallback = Callable[[np.ndarray], tuple[np.ndarray, np.ndarray]]
+
+
+def default_phase_span_scale_rad(po_integration_mode: str) -> float:
+    """Returns the subdivision phase span suited to one PO integration mode.
+
+    Midpoint quadrature samples the propagation phase once per subface, so a
+    subface must stay well below a pi span. The analytic modes integrate the
+    linear phase exactly; their span only bounds amplitude variation.
+    """
+
+    return 1.0 if po_integration_mode == "parent_face_quadrature" else 6.0
 
 
 PHASE_SPAN_SAMPLE_BARYCENTRICS = np.asarray(
@@ -87,6 +101,7 @@ class POChannelResult:
     visibility_state: FaceVisibilityState
     far_field_max_edge_m: float | None = None
     far_field_nearest_distance_m: float | None = None
+    delay_response: PODelayResponse | None = None
 
 
 def complex_relative_permittivity(
@@ -257,6 +272,54 @@ def parent_face_quadrature_geometry(
     integration without changing the visibility mesh topology.
     """
 
+    triangles, parent_indices = _adaptive_parent_triangles(
+        vertices, faces, selected_parent_indices, tx_positions, rx_positions,
+        frequency_hz, phase_span_scale_rad,
+        max_refinement_depth=max_refinement_depth,
+        max_subfaces_per_parent=max_subfaces_per_parent,
+        progress_callback=progress_callback,
+    )
+    centroids, normals, areas = _triangle_geometry_from_triangles(triangles)
+    return centroids, normals, areas, parent_indices
+
+
+def parent_face_adaptive_analytic_geometry(
+    vertices: np.ndarray,
+    faces: np.ndarray,
+    selected_parent_indices: np.ndarray,
+    tx_positions: np.ndarray,
+    rx_positions: np.ndarray,
+    frequency_hz: float,
+    phase_span_scale_rad: float = 6.0,
+    *,
+    curvature_error_rad: float = 0.005,
+    max_refinement_depth: int = 16,
+    max_subfaces_per_parent: int = 0,
+    progress_callback: Callable[[dict], None] | None = None,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Refine by phase span OR edge-midpoint curvature, retaining parent ids.
+
+    Each leaf is evaluated with the exact triangle integral of its locally
+    linear propagation phase. Curvature uses k_c/3 times the largest midpoint
+    path-length interpolation error over all edges and Tx/Rx combinations.
+    """
+    triangles, parent_indices = _adaptive_parent_triangles(
+        vertices, faces, selected_parent_indices, tx_positions, rx_positions,
+        frequency_hz, phase_span_scale_rad, curvature_error_rad=curvature_error_rad,
+        max_refinement_depth=max_refinement_depth,
+        max_subfaces_per_parent=max_subfaces_per_parent,
+        progress_callback=progress_callback,
+    )
+    centroids, normals, areas = _triangle_geometry_from_triangles(triangles)
+    return centroids, normals, areas, parent_indices, triangles
+
+
+def _adaptive_parent_triangles(
+    vertices, faces, selected_parent_indices, tx_positions, rx_positions,
+    frequency_hz, phase_span_scale_rad, *, curvature_error_rad=None,
+    max_refinement_depth=16, max_subfaces_per_parent=0, progress_callback=None,
+):
+    """Common four-child refinement; only the analytic mode tests curvature."""
     vertices = np.asarray(vertices, dtype=np.float64)
     faces = np.asarray(faces, dtype=np.uint32)
     selected_parent_indices = np.asarray(
@@ -264,14 +327,13 @@ def parent_face_quadrature_geometry(
         dtype=np.int64,
     ).reshape(-1)
     if selected_parent_indices.size == 0:
-        return (
-            np.zeros((0, 3), dtype=np.float64),
-            np.zeros((0, 3), dtype=np.float64),
-            np.zeros((0,), dtype=np.float64),
-            selected_parent_indices.copy(),
-        )
-    if phase_span_scale_rad <= 0.0:
-        raise ValueError("phase_span_scale_rad must be positive")
+        return np.zeros((0, 3, 3), dtype=np.float64), selected_parent_indices.copy()
+    if not np.isfinite(phase_span_scale_rad) or phase_span_scale_rad <= 0.0:
+        raise ValueError("phase_span_scale_rad must be finite and positive")
+    if curvature_error_rad is not None and (
+        not np.isfinite(curvature_error_rad) or curvature_error_rad <= 0.0
+    ):
+        raise ValueError("curvature_error_rad must be finite and positive")
     if max_refinement_depth < 0:
         raise ValueError("max_refinement_depth must be non-negative")
     if max_subfaces_per_parent < 0:
@@ -285,21 +347,27 @@ def parent_face_quadrature_geometry(
     num_faces = int(faces.shape[0])
     max_depth = int(max_refinement_depth)
     max_per_parent = int(max_subfaces_per_parent)
+    stage_prefix = "quadrature" if curvature_error_rad is None else "adaptive_analytic"
     if progress_callback is not None:
         progress_callback({
-            "stage": "quadrature_geometry_start",
+            "stage": f"{stage_prefix}_geometry_start",
             "parent_faces_processed": 0,
             "parent_faces_total": int(selected_parent_indices.size),
             "subfaces_total": int(triangles.shape[0]),
         })
+    def split_tests(current):
+        span_function = (_triangle_phase_span_rad if curvature_error_rad is None
+                         else _triangle_linear_phase_span_rad)
+        span = span_function(current, tx_positions, rx_positions, frequency_hz)
+        split = span > float(phase_span_scale_rad)
+        curvature = None
+        if curvature_error_rad is not None:
+            curvature = _triangle_phase_curvature_rad(current, tx_positions, rx_positions, frequency_hz)
+            split |= curvature > float(curvature_error_rad)
+        return split, span, curvature
+
     for depth in range(max_depth):
-        phase_span = _triangle_phase_span_rad(
-            triangles,
-            tx_positions,
-            rx_positions,
-            frequency_hz,
-        )
-        split_mask = phase_span > float(phase_span_scale_rad)
+        split_mask, _, _ = split_tests(triangles)
         if max_per_parent > 0 and np.any(split_mask):
             current_counts = np.bincount(parent_indices, minlength=num_faces)
             split_counts = np.bincount(
@@ -311,7 +379,7 @@ def parent_face_quadrature_geometry(
         split_count = int(np.count_nonzero(split_mask))
         if progress_callback is not None:
             progress_callback({
-                "stage": "quadrature_geometry_refinement",
+                "stage": f"{stage_prefix}_geometry_refinement",
                 "refinement_depth": int(depth),
                 "parent_faces_processed": int(
                     selected_parent_indices.size
@@ -341,7 +409,7 @@ def parent_face_quadrature_geometry(
         )
         if progress_callback is not None:
             progress_callback({
-                "stage": "quadrature_geometry_split",
+                "stage": f"{stage_prefix}_geometry_split",
                 "refinement_depth": int(depth + 1),
                 "parent_faces_processed": int(
                     selected_parent_indices.size
@@ -353,14 +421,23 @@ def parent_face_quadrature_geometry(
             })
 
     if progress_callback is not None:
+        diagnostics = {}
+        if curvature_error_rad is not None:
+            unresolved, span, curvature = split_tests(triangles)
+            diagnostics = {
+                "unresolved_subfaces": int(np.count_nonzero(unresolved)),
+                "unresolved_parent_faces": int(np.unique(parent_indices[unresolved]).size),
+                "max_phase_span_rad": float(np.max(span, initial=0.)),
+                "max_curvature_error_rad": float(np.max(curvature, initial=0.)),
+            }
         progress_callback({
-            "stage": "quadrature_geometry_done",
+            "stage": f"{stage_prefix}_geometry_done",
             "parent_faces_processed": int(selected_parent_indices.size),
             "parent_faces_total": int(selected_parent_indices.size),
             "subfaces_total": int(triangles.shape[0]),
+            **diagnostics,
         })
-    centroids, normals, areas = _triangle_geometry_from_triangles(triangles)
-    return centroids, normals, areas, parent_indices
+    return triangles, parent_indices
 
 
 def parent_face_far_field_analytic_geometry(
@@ -756,6 +833,47 @@ def _triangle_phase_span_rad(
     return (2.0 * pi * float(frequency_hz) / c) * max_delta_m
 
 
+def _triangle_phase_curvature_rad(triangles, tx_positions, rx_positions, frequency_hz):
+    """Return k_c/3 max_pq,edge |L(mid) - (L(v_i)+L(v_j))/2|.
+
+    Distance is convex along each edge, so both leg errors have the same sign.
+    The exact maximum over Tx/Rx pairs is therefore the sum of the separate
+    endpoint maxima for each edge; no pairwise PO integrations are involved.
+    """
+    triangles = np.asarray(triangles, dtype=np.float64).reshape(-1, 3, 3)
+    midpoints = .5 * (triangles + triangles[:, [1, 2, 0]])
+    max_error = np.zeros((2, len(triangles), 3), dtype=np.float64)
+    for leg, endpoints in enumerate((tx_positions, rx_positions)):
+        for endpoint in np.asarray(endpoints, dtype=np.float64).reshape(-1, 3):
+            distances = np.linalg.norm(triangles - endpoint, axis=-1)
+            error = .5 * (distances + distances[:, [1, 2, 0]]) - np.linalg.norm(midpoints - endpoint, axis=-1)
+            np.maximum(max_error[leg], error, out=max_error[leg])
+    return (2. * pi * float(frequency_hz) / (3. * c)) * np.max(max_error.sum(axis=0), axis=1)
+
+
+def _triangle_linear_phase_span_rad(triangles, tx_positions, rx_positions, frequency_hz):
+    """Worst Tx/Rx span of the centroid-linearized phase over the vertices.
+
+    A linear function's span on a triangle is its largest absolute edge
+    increment. Endpoint projection extrema give the exact maximum over all
+    Tx/Rx combinations without constructing a pair-by-face tensor.
+    """
+    triangles = np.asarray(triangles, dtype=np.float64).reshape(-1, 3, 3)
+    centers = triangles.mean(axis=1)
+    edges = triangles[:, [1, 2, 0]] - triangles
+    minima = np.full((2, len(triangles), 3), np.inf)
+    maxima = np.full_like(minima, -np.inf)
+    for leg, endpoints in enumerate((tx_positions, rx_positions)):
+        for endpoint in np.asarray(endpoints, dtype=np.float64).reshape(-1, 3):
+            vectors = endpoint - centers
+            directions = vectors / np.maximum(np.linalg.norm(vectors, axis=1)[:, None], 1e-18)
+            projections = np.einsum("ned,nd->ne", edges, directions)
+            np.minimum(minima[leg], projections, out=minima[leg])
+            np.maximum(maxima[leg], projections, out=maxima[leg])
+    span = np.max(np.maximum(maxima.sum(axis=0), -minima.sum(axis=0)), axis=1)
+    return (2. * pi * float(frequency_hz) / c) * span
+
+
 def _phase_center_delays_for_centroids(
     centroids: np.ndarray,
     tx_position: np.ndarray,
@@ -791,6 +909,10 @@ def _aggregate_parent_face_quadrature_contributions(
     precision: ComputePrecision,
     chunk_size: int = PARENT_QUADRATURE_CONTRIBUTION_CHUNK_SIZE,
     progress_callback: Callable[[dict], None] | None = None,
+    polarization_axis: np.ndarray | None = None,
+    polarization_callback: PolarizationCallback | None = None,
+    delay_response: PODelayResponse | None = None,
+    delay_path_indices: np.ndarray | None = None,
 ) -> np.ndarray:
     """Sums temporary quadrature subface PO terms onto parent face ids.
 
@@ -824,6 +946,10 @@ def _aggregate_parent_face_quadrature_contributions(
 
     effective_weights = np.asarray(effective_weights, dtype=float_dtype).reshape(-1)
     max_chunk = max(1, int(chunk_size))
+    if delay_response is not None:
+        max_chunk = min(max_chunk, 32768)
+    response_indices = (np.arange(selected_parent_indices.size) if delay_path_indices is None
+                        else np.asarray(delay_path_indices))
     chunk_total = int((path_face_indices.size + max_chunk - 1) // max_chunk)
     if progress_callback is not None:
         parent_subface_totals = np.bincount(
@@ -857,7 +983,15 @@ def _aggregate_parent_face_quadrature_contributions(
             weights=effective_weights[chunk_parent_indices],
             backend=backend,
             precision=precision,
+            polarization_axis=polarization_axis,
+            polarization_callback=polarization_callback,
         )
+        if delay_response is not None:
+            points = integration_centroids[start:stop]
+            sample_delays = (np.linalg.norm(points - tx_phase_center, axis=1)
+                             + np.linalg.norm(points - rx_phase_center, axis=1)) / c
+            delay_response.accumulate(chunk_contrib, sample_delays,
+                                      response_indices[chunk_parent_positions])
         np.add.at(contributions, chunk_parent_positions, chunk_contrib)
         if progress_callback is not None:
             parent_subfaces_done += np.bincount(
@@ -980,6 +1114,10 @@ def _aggregate_parent_face_far_field_analytic_contributions(
     precision: ComputePrecision,
     chunk_size: int = PARENT_QUADRATURE_CONTRIBUTION_CHUNK_SIZE,
     progress_callback: Callable[[dict], None] | None = None,
+    polarization_axis: np.ndarray | None = None,
+    polarization_callback: PolarizationCallback | None = None,
+    delay_response: PODelayResponse | None = None,
+    delay_path_indices: np.ndarray | None = None,
 ) -> np.ndarray:
     """Sums analytic linear-phase subface PO terms onto parent face ids."""
 
@@ -1007,6 +1145,10 @@ def _aggregate_parent_face_far_field_analytic_contributions(
 
     effective_weights = np.asarray(effective_weights, dtype=float_dtype).reshape(-1)
     max_chunk = max(1, int(chunk_size))
+    if delay_response is not None:
+        max_chunk = min(max_chunk, 32768)
+    response_indices = (np.arange(selected_parent_indices.size) if delay_path_indices is None
+                        else np.asarray(delay_path_indices))
     chunk_total = int((path_face_indices.size + max_chunk - 1) // max_chunk)
     if progress_callback is not None:
         parent_subface_totals = np.bincount(
@@ -1025,7 +1167,6 @@ def _aggregate_parent_face_far_field_analytic_contributions(
         })
     wavelength_m = c / float(frequency_hz)
     k0 = 2.0 * pi / wavelength_m
-    phase_sign = -1.0 if _use_torch_backend(backend, precision) else 1.0
     tx_phase_center = np.asarray(tx_phase_center, dtype=np.float64).reshape(3)
     rx_phase_center = np.asarray(rx_phase_center, dtype=np.float64).reshape(3)
     for start in range(0, path_face_indices.size, max_chunk):
@@ -1047,6 +1188,8 @@ def _aggregate_parent_face_far_field_analytic_contributions(
             weights=effective_weights[chunk_parent_indices],
             backend=backend,
             precision=precision,
+            polarization_axis=polarization_axis,
+            polarization_callback=polarization_callback,
         )
         tx_vec = tx_phase_center[None, :] - chunk_centroids
         rx_vec = rx_phase_center[None, :] - chunk_centroids
@@ -1054,7 +1197,9 @@ def _aggregate_parent_face_far_field_analytic_contributions(
         rx_dist = np.linalg.norm(rx_vec, axis=1)
         tx_hat = tx_vec / np.maximum(tx_dist[:, None], 1e-18)
         rx_hat = rx_vec / np.maximum(rx_dist[:, None], 1e-18)
-        q_vectors = phase_sign * k0 * (tx_hat + rx_hat)[None, :, :]
+        # The integral evaluates exp(-j q·delta), while the local path length
+        # is L(delta) = L(0) - (tx_hat + rx_hat)·delta.
+        q_vectors = -k0 * (tx_hat + rx_hat)[None, :, :]
         integrals = _triangle_linear_phase_integrals(
             integration_triangles[start:stop],
             chunk_centroids,
@@ -1066,6 +1211,22 @@ def _aggregate_parent_face_far_field_analytic_contributions(
             out=np.zeros_like(integrals),
             where=chunk_areas > 0.0,
         ).astype(complex_dtype)
+        if delay_response is not None:
+            def phase_integral(offset_hz):
+                q = -(k0 + 2.*pi*offset_hz/c) * (tx_hat + rx_hat)[None]
+                integral = _triangle_linear_phase_integrals(
+                    integration_triangles[start:stop], chunk_centroids, q,
+                ).ravel()
+                return np.divide(integral, chunk_areas,
+                                 out=np.zeros_like(integral), where=chunk_areas > 0.)
+            delay_response.accumulate(
+                chunk_contrib, (tx_dist + rx_dist) / c,
+                response_indices[chunk_parent_positions], phase_integral=phase_integral,
+                vertex_delay_offsets_s=-np.einsum(
+                    "nvi,ni->nv", integration_triangles[start:stop] - chunk_centroids[:, None],
+                    tx_hat + rx_hat) / c,
+                carrier_frequency_hz=frequency_hz,
+            )
         chunk_contrib = chunk_contrib.astype(complex_dtype, copy=False) * area_ratio
         np.add.at(contributions, chunk_parent_positions, chunk_contrib)
         if progress_callback is not None:
@@ -1123,6 +1284,39 @@ def vector_facet_channel(
         contributions) > 0.0))
 
 
+def _reciprocal_facet_kernel(tx_hat, rx_hat, normals, tx_pol, rx_pol,
+                             material, frequency_hz, preferred_axis):
+    """Reciprocal tangent-plane scattering dyadic projected onto antenna fields.
+
+    Symmetrize the local dielectric PO dyadic with its reciprocal transpose,
+    before integration. This preserves the monostatic and specular limits.
+    Receive fields use a Hermitian projection, hence conjugate both fields
+    when exchanging the source and receiver in the reciprocal term.
+    """
+    eta0 = 1. / (c * epsilon_0)
+    result = np.zeros(tx_hat.shape[0], dtype=np.complex128)
+    for source, observer, incident, receive in (
+        (tx_hat, rx_hat, tx_pol, rx_pol),
+        (rx_hat, tx_hat, rx_pol.conjugate(), tx_pol.conjugate()),
+    ):
+        cosine = np.einsum("ij,ij->i", normals, source)
+        r_te, r_tm = fresnel_coefficients(cosine, material, frequency_hz)
+        attenuation = coherent_surface_attenuation(cosine, material, frequency_hz)
+        k_inc = -source
+        k_ref = k_inc - 2. * np.einsum("ij,ij->i", k_inc, normals)[:, None] * normals
+        te, tm_inc = _local_incidence_bases(k_inc, normals, preferred_axis)
+        tm_ref = _normalize_rows(np.cross(te, k_ref), fallback=tm_inc)
+        e_ref = attenuation[:, None] * (
+            (r_te * np.einsum("ij,ij->i", incident, te))[:, None] * te
+            + (r_tm * np.einsum("ij,ij->i", incident, tm_inc))[:, None] * tm_ref
+        )
+        j = np.cross(normals, np.cross(k_ref, e_ref) / eta0)
+        m = -np.cross(normals, e_ref)
+        radiation = eta0 * np.cross(observer, np.cross(observer, j)) + np.cross(observer, m)
+        result += .5 * (cosine > 0.) * np.einsum("ij,ij->i", receive.conjugate(), radiation)
+    return result
+
+
 def vector_facet_face_contributions(
     face_indices: np.ndarray,
     centroids: np.ndarray,
@@ -1136,8 +1330,16 @@ def vector_facet_face_contributions(
     weights: np.ndarray | None = None,
     backend: ComputeBackend = "numpy",
     precision: ComputePrecision = "float64",
+    polarization_axis: np.ndarray | None = None,
+    polarization_callback: PolarizationCallback | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Returns per-face PO contributions and delays for one Tx/Rx pair."""
+    """Return facet fields projected onto the Tx/Rx polarization responses.
+
+    The optional callback receives selected integration points and returns
+    complex incident and receive polarization vectors there. Their magnitudes
+    carry reflection loss and must not be normalized. The receive projection
+    uses the Hermitian inner product, as for ordinary antenna polarizations.
+    """
 
     float_dtype, complex_dtype = _numpy_dtypes_for_precision(precision)
     face_indices = np.asarray(face_indices, dtype=np.int64).reshape(-1)
@@ -1146,6 +1348,14 @@ def vector_facet_face_contributions(
             np.zeros((0,), dtype=complex_dtype),
             np.zeros((0,), dtype=float_dtype),
         )
+    polarizations = None
+    if polarization_callback is not None:
+        vectors = polarization_callback(np.asarray(centroids)[face_indices])
+        polarizations = tuple(np.asarray(p, dtype=complex_dtype) for p in vectors)
+        if len(polarizations) != 2 or any(
+            p.shape != (face_indices.size, 3) for p in polarizations
+        ):
+            raise ValueError("polarization callback must return two [selected faces, 3] arrays")
     if _use_torch_backend(backend, precision):
         return _torch_vector_facet_face_contributions(
             face_indices=face_indices,
@@ -1158,12 +1368,16 @@ def vector_facet_face_contributions(
             material=material,
             weights=weights,
             precision=precision,
+            polarization_axis=polarization_axis,
+            polarizations=polarizations,
         )
 
     wavelength_m = c / frequency_hz
     k0 = 2.0 * pi / wavelength_m
-    eta0 = 1.0 / (c * epsilon_0)
-    preferred_axis = np.array([0.0, 0.0, 1.0], dtype=float_dtype)
+    preferred_axis = np.asarray(
+        [0., 0., 1.] if polarization_axis is None else polarization_axis,
+        dtype=float_dtype,
+    )
 
     c_sel = np.asarray(centroids, dtype=float_dtype)[face_indices]
     n_sel = np.asarray(normals, dtype=float_dtype)[face_indices]
@@ -1185,11 +1399,11 @@ def vector_facet_face_contributions(
     contributions = np.zeros(face_indices.shape, dtype=complex_dtype)
 
     cos_inc = np.einsum("ij,ij->i", n_sel, tx_hat)
-    illum_mask = (weights > 0.0) & (cos_inc > 0.0)
+    illum_mask = ((weights > 0.0) & ((cos_inc > 0.0)
+                  | (np.einsum("ij,ij->i", n_sel, rx_hat) > 0.0)))
     if not np.any(illum_mask):
         return contributions, delays_s.astype(float_dtype)
 
-    c_vis = c_sel[illum_mask]
     n_vis = n_sel[illum_mask]
     a_vis = a_sel[illum_mask]
     w_vis = weights[illum_mask]
@@ -1197,75 +1411,23 @@ def vector_facet_face_contributions(
     rx_hat_vis = rx_hat[illum_mask]
     tx_dist_vis = tx_dist[illum_mask]
     rx_dist_vis = rx_dist[illum_mask]
-    cos_inc_vis = cos_inc[illum_mask]
 
-    r_te, r_tm = fresnel_coefficients(
-        cos_theta=cos_inc_vis,
-        material=material,
-        frequency_hz=frequency_hz,
+    if polarizations is None:
+        tx_pol = _transverse_polarizations(-tx_hat_vis, preferred_axis)
+        rx_pol = _transverse_polarizations(rx_hat_vis, preferred_axis)
+    else:
+        tx_pol, rx_pol = (p[illum_mask] for p in polarizations)
+    kernel = _reciprocal_facet_kernel(
+        tx_hat_vis, rx_hat_vis, n_vis, tx_pol, rx_pol,
+        material, frequency_hz, preferred_axis,
     )
-    attenuation = coherent_surface_attenuation(
-        cos_theta=cos_inc_vis,
-        material=material,
-        frequency_hz=frequency_hz,
-    )
-    r_te = r_te * attenuation
-    r_tm = r_tm * attenuation
-
-    k_hat_inc = -tx_hat_vis
-    k_hat_refl = k_hat_inc - 2.0 * np.einsum(
-        "ij,ij->i", k_hat_inc, n_vis
-    )[:, None] * n_vis
-    te_hat, tm_inc_hat = _local_incidence_bases(
-        k_hat_inc=k_hat_inc,
-        normals=n_vis,
-        preferred_axis=preferred_axis,
-    )
-    tm_ref_hat = _normalize_rows(
-        np.cross(te_hat, k_hat_refl),
-        fallback=tm_inc_hat,
-    )
-
-    tx_pol = _transverse_polarizations(k_hat_inc, preferred_axis=preferred_axis)
-    rx_pol = _transverse_polarizations(rx_hat_vis,
-                                       preferred_axis=preferred_axis)
-
-    e_te = np.einsum("ij,ij->i", tx_pol, te_hat)
-    e_tm = np.einsum("ij,ij->i", tx_pol, tm_inc_hat)
-    e_ref = (
-        (r_te * e_te)[:, None] * te_hat
-        + (r_tm * e_tm)[:, None] * tm_ref_hat
-    )
-    h_ref = np.cross(k_hat_refl, e_ref) / eta0
-
-    electric_current = np.cross(n_vis, h_ref)
-    magnetic_current = -np.cross(n_vis, e_ref)
-    radiation_kernel = (
-        eta0 * np.cross(rx_hat_vis, np.cross(rx_hat_vis, electric_current))
-        + np.cross(rx_hat_vis, magnetic_current)
-    )
-
-    # Path coefficients use the dechirped tx(t)*conj(rx(t)) ADC convention:
-    # increasing path length must produce a positive slow-time phase slope.
-    phase = np.exp(1j * k0 * (tx_dist_vis + rx_dist_vis))
-    scattering_amplitude = (
-        (-1j * k0)
-        * a_vis[:, None]
-        * w_vis[:, None]
-        * radiation_kernel
-        / (4.0 * pi)
-    )
-    channel_faces = (
-        wavelength_m
-        * phase[:, None]
-        * scattering_amplitude
-        / ((4.0 * pi) * np.maximum(tx_dist_vis * rx_dist_vis, 1e-18))[:, None]
-    )
-    contributions[illum_mask] = np.einsum(
-        "ij,ij->i",
-        rx_pol.conjugate(),
-        channel_faces,
+    # e^(j omega t): the outgoing Green function gives +jk times this kernel.
+    phase = np.exp(-1j * k0 * (tx_dist_vis + rx_dist_vis))
+    contributions[illum_mask] = (
+        wavelength_m * phase * (1j * k0) * a_vis * w_vis * kernel
+        / (16. * pi**2 * np.maximum(tx_dist_vis * rx_dist_vis, 1e-18))
     ).astype(complex_dtype)
+
     return contributions, delays_s.astype(float_dtype)
 
 
@@ -1303,7 +1465,6 @@ def vector_facet_face_contributions_for_pairs(
 
     wavelength_m = c / frequency_hz
     k0 = 2.0 * pi / wavelength_m
-    eta0 = 1.0 / (c * epsilon_0)
     preferred_axis = np.array([0.0, 0.0, 1.0], dtype=float_dtype)
 
     c_sel = np.asarray(centroids, dtype=float_dtype)[face_indices]
@@ -1326,7 +1487,8 @@ def vector_facet_face_contributions_for_pairs(
     contributions = np.zeros((num_pairs, face_indices.size), dtype=complex_dtype)
 
     cos_inc = np.einsum("fn,pfn->pf", n_sel, tx_hat)
-    illum_mask = (weights[None, :] > 0.0) & (cos_inc > 0.0)
+    illum_mask = ((weights[None, :] > 0.0) & ((cos_inc > 0.0)
+                  | (np.einsum("fn,pfn->pf", n_sel, rx_hat) > 0.0)))
     if not np.any(illum_mask):
         return contributions, delays_s.astype(float_dtype)
 
@@ -1338,74 +1500,19 @@ def vector_facet_face_contributions_for_pairs(
     rx_hat_vis = rx_hat[pair_indices, local_face_indices]
     tx_dist_vis = tx_dist[pair_indices, local_face_indices]
     rx_dist_vis = rx_dist[pair_indices, local_face_indices]
-    cos_inc_vis = cos_inc[pair_indices, local_face_indices]
 
-    r_te, r_tm = fresnel_coefficients(
-        cos_theta=cos_inc_vis,
-        material=material,
-        frequency_hz=frequency_hz,
+    tx_pol = _transverse_polarizations(-tx_hat_vis, preferred_axis)
+    rx_pol = _transverse_polarizations(rx_hat_vis, preferred_axis)
+    kernel = _reciprocal_facet_kernel(
+        tx_hat_vis, rx_hat_vis, n_vis, tx_pol, rx_pol,
+        material, frequency_hz, preferred_axis,
     )
-    attenuation = coherent_surface_attenuation(
-        cos_theta=cos_inc_vis,
-        material=material,
-        frequency_hz=frequency_hz,
-    )
-    r_te = r_te * attenuation
-    r_tm = r_tm * attenuation
-
-    k_hat_inc = -tx_hat_vis
-    k_hat_refl = k_hat_inc - 2.0 * np.einsum(
-        "ij,ij->i", k_hat_inc, n_vis
-    )[:, None] * n_vis
-    te_hat, tm_inc_hat = _local_incidence_bases(
-        k_hat_inc=k_hat_inc,
-        normals=n_vis,
-        preferred_axis=preferred_axis,
-    )
-    tm_ref_hat = _normalize_rows(
-        np.cross(te_hat, k_hat_refl),
-        fallback=tm_inc_hat,
-    )
-
-    tx_pol = _transverse_polarizations(k_hat_inc, preferred_axis=preferred_axis)
-    rx_pol = _transverse_polarizations(rx_hat_vis, preferred_axis=preferred_axis)
-
-    e_te = np.einsum("ij,ij->i", tx_pol, te_hat)
-    e_tm = np.einsum("ij,ij->i", tx_pol, tm_inc_hat)
-    e_ref = (
-        (r_te * e_te)[:, None] * te_hat
-        + (r_tm * e_tm)[:, None] * tm_ref_hat
-    )
-    h_ref = np.cross(k_hat_refl, e_ref) / eta0
-
-    electric_current = np.cross(n_vis, h_ref)
-    magnetic_current = -np.cross(n_vis, e_ref)
-    radiation_kernel = (
-        eta0 * np.cross(rx_hat_vis, np.cross(rx_hat_vis, electric_current))
-        + np.cross(rx_hat_vis, magnetic_current)
-    )
-
-    # Path coefficients use the dechirped tx(t)*conj(rx(t)) ADC convention:
-    # increasing path length must produce a positive slow-time phase slope.
-    phase = np.exp(1j * k0 * (tx_dist_vis + rx_dist_vis))
-    scattering_amplitude = (
-        (-1j * k0)
-        * a_vis[:, None]
-        * w_vis[:, None]
-        * radiation_kernel
-        / (4.0 * pi)
-    )
-    channel_faces = (
-        wavelength_m
-        * phase[:, None]
-        * scattering_amplitude
-        / ((4.0 * pi) * np.maximum(tx_dist_vis * rx_dist_vis, 1e-18))[:, None]
-    )
-    contributions[pair_indices, local_face_indices] = np.einsum(
-        "ij,ij->i",
-        rx_pol.conjugate(),
-        channel_faces,
+    phase = np.exp(-1j * k0 * (tx_dist_vis + rx_dist_vis))
+    contributions[pair_indices, local_face_indices] = (
+        wavelength_m * phase * (1j * k0) * a_vis * w_vis * kernel
+        / (16. * pi**2 * np.maximum(tx_dist_vis * rx_dist_vis, 1e-18))
     ).astype(complex_dtype)
+
     return contributions, delays_s.astype(float_dtype)
 
 
@@ -1487,9 +1594,8 @@ def project_phase_center_contributions_to_virtual_channels(
     # This is a virtual-array approximation: do not recompute PO currents for
     # each Tx/Rx pair, but keep per-VC carrier phase, spreading, and tau_vc.
     k0 = 2.0 * pi * frequency_hz / c
-    # Match the dechirped ADC convention used by synthesize_adc_from_paths:
-    # positive phase slope maps to positive range rate in Doppler processing.
-    phase = np.exp(1j * k0 * (path_lengths - center_lengths[None, :]))
+    # Retain the physical channel's negative phase when changing path length.
+    phase = np.exp(-1j * k0 * (path_lengths - center_lengths[None, :]))
     spreading = center_spreads[None, :] / np.maximum(spreads, 1e-18)
     coefficients = (
         phase_center_contributions[None, :] * phase * spreading
@@ -1592,6 +1698,8 @@ def _torch_vector_facet_face_contributions(
     *,
     weights: np.ndarray | None = None,
     precision: ComputePrecision = "float64",
+    polarization_axis: np.ndarray | None = None,
+    polarizations: tuple[np.ndarray, np.ndarray] | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Torch implementation of per-face PO contributions.
 
@@ -1650,7 +1758,8 @@ def _torch_vector_facet_face_contributions(
     contributions = torch.zeros((face_indices.size,), dtype=cdtype, device=device)
 
     cos_inc = torch.sum(n_sel * tx_hat, dim=1)
-    illum_mask = (w_sel > 0.0) & (cos_inc > 0.0)
+    illum_mask = ((w_sel > 0.0) & ((cos_inc > 0.0)
+                  | (torch.sum(n_sel * rx_hat, dim=1) > 0.0)))
     if not bool(torch.any(illum_mask).item()):
         return (
             contributions.cpu().numpy().astype(complex_dtype),
@@ -1664,95 +1773,56 @@ def _torch_vector_facet_face_contributions(
     rx_hat_vis = rx_hat[illum_mask]
     tx_dist_vis = tx_dist[illum_mask]
     rx_dist_vis = rx_dist[illum_mask]
-    cos_inc_vis = cos_inc[illum_mask]
 
     wavelength_m = c / frequency_hz
     k0 = 2.0 * pi / wavelength_m
     eta0 = 1.0 / (c * epsilon_0)
-    preferred_axis = torch.tensor([0.0, 0.0, 1.0], dtype=dtype, device=device)
-
-    r_te, r_tm = _torch_fresnel_coefficients(
-        cos_theta=cos_inc_vis,
-        material=material,
-        frequency_hz=frequency_hz,
-        wavelength_m=wavelength_m,
-        cdtype=cdtype,
-    )
-    attenuation = _torch_coherent_surface_attenuation(
-        cos_theta=cos_inc_vis,
-        material=material,
-        frequency_hz=frequency_hz,
-        dtype=dtype,
-        cdtype=cdtype,
-    )
-    r_te = r_te * attenuation.to(cdtype)
-    r_tm = r_tm * attenuation.to(cdtype)
-
-    k_hat_inc = -tx_hat_vis
-    k_hat_refl = k_hat_inc - 2.0 * torch.sum(
-        k_hat_inc * n_vis, dim=1
-    )[:, None] * n_vis
-    te_hat, tm_inc_hat = _torch_local_incidence_bases(
-        k_hat_inc=k_hat_inc,
-        normals=n_vis,
-        preferred_axis=preferred_axis,
-    )
-    tm_ref_hat = _torch_normalize_rows(
-        torch.linalg.cross(te_hat, k_hat_refl, dim=1),
-        fallback=tm_inc_hat,
+    preferred_axis = torch.as_tensor(
+        [0., 0., 1.] if polarization_axis is None else polarization_axis,
+        dtype=dtype, device=device,
     )
 
-    tx_pol = _torch_transverse_polarizations(
-        k_hat_inc,
-        preferred_axis=preferred_axis,
-    )
-    rx_pol = _torch_transverse_polarizations(
-        rx_hat_vis,
-        preferred_axis=preferred_axis,
-    )
-
-    e_te = torch.sum(tx_pol * te_hat, dim=1).to(cdtype)
-    e_tm = torch.sum(tx_pol * tm_inc_hat, dim=1).to(cdtype)
-    e_ref = (
-        (r_te * e_te)[:, None] * te_hat.to(cdtype)
-        + (r_tm * e_tm)[:, None] * tm_ref_hat.to(cdtype)
-    )
-    h_ref = torch.linalg.cross(k_hat_refl.to(cdtype), e_ref, dim=1) / eta0
-
-    electric_current = torch.linalg.cross(n_vis.to(cdtype), h_ref, dim=1)
-    magnetic_current = -torch.linalg.cross(n_vis.to(cdtype), e_ref, dim=1)
-    rx_hat_c = rx_hat_vis.to(cdtype)
-    radiation_kernel = (
-        eta0
-        * torch.linalg.cross(
-            rx_hat_c,
-            torch.linalg.cross(rx_hat_c, electric_current, dim=1),
-            dim=1,
+    if polarizations is None:
+        tx_pol = _torch_transverse_polarizations(-tx_hat_vis, preferred_axis).to(cdtype)
+        rx_pol = _torch_transverse_polarizations(rx_hat_vis, preferred_axis).to(cdtype)
+    else:
+        tx_pol, rx_pol = (
+            torch.as_tensor(p, dtype=cdtype, device=device)[illum_mask]
+            for p in polarizations
         )
-        + torch.linalg.cross(rx_hat_c, magnetic_current, dim=1)
+    kernel = torch.zeros_like(tx_dist_vis, dtype=cdtype)
+    for source, observer, incident, receive in (
+        (tx_hat_vis, rx_hat_vis, tx_pol, rx_pol),
+        (rx_hat_vis, tx_hat_vis, rx_pol.conj(), tx_pol.conj()),
+    ):
+        cosine = torch.sum(n_vis * source, dim=1)
+        r_te, r_tm = _torch_fresnel_coefficients(
+            cosine, material, frequency_hz, wavelength_m, cdtype,
+        )
+        attenuation = _torch_coherent_surface_attenuation(
+            cosine, material, frequency_hz, dtype, cdtype,
+        )
+        k_inc = -source
+        k_ref = k_inc - 2. * torch.sum(k_inc * n_vis, dim=1)[:, None] * n_vis
+        te, tm_inc = _torch_local_incidence_bases(k_inc, n_vis, preferred_axis)
+        tm_ref = _torch_normalize_rows(torch.linalg.cross(te, k_ref, dim=1), fallback=tm_inc)
+        e_ref = attenuation[:, None] * (
+            (r_te * torch.sum(incident * te, dim=1))[:, None] * te
+            + (r_tm * torch.sum(incident * tm_inc, dim=1))[:, None] * tm_ref
+        )
+        n_c, k_c, o_c = n_vis.to(cdtype), k_ref.to(cdtype), observer.to(cdtype)
+        j = torch.linalg.cross(n_c, torch.linalg.cross(k_c, e_ref, dim=1) / eta0, dim=1)
+        m = -torch.linalg.cross(n_c, e_ref, dim=1)
+        radiation = (eta0 * torch.linalg.cross(o_c, torch.linalg.cross(o_c, j, dim=1), dim=1)
+                     + torch.linalg.cross(o_c, m, dim=1))
+        kernel += .5 * (cosine > 0.) * torch.sum(receive.conj() * radiation, dim=1)
+    phase = torch.exp(-1j * torch.as_tensor(k0, dtype=dtype, device=device)
+                      * (tx_dist_vis + rx_dist_vis)).to(cdtype)
+    contributions[illum_mask] = (
+        wavelength_m * phase * (1j * k0) * a_vis * w_vis * kernel
+        / (16. * pi**2 * torch.clamp(tx_dist_vis * rx_dist_vis, min=1e-18))
     )
 
-    path_length = tx_dist_vis + rx_dist_vis
-    phase_arg = torch.as_tensor(-k0, dtype=dtype, device=device) * path_length
-    phase = torch.exp(1j * phase_arg).to(cdtype)
-    scattering_amplitude = (
-        torch.as_tensor(-1j * k0, dtype=cdtype, device=device)
-        * a_vis[:, None].to(cdtype)
-        * w_vis[:, None].to(cdtype)
-        * radiation_kernel
-        / (4.0 * pi)
-    )
-    spreading = torch.clamp(tx_dist_vis * rx_dist_vis, min=1e-18)
-    channel_faces = (
-        wavelength_m
-        * phase[:, None]
-        * scattering_amplitude
-        / ((4.0 * pi) * spreading)[:, None].to(cdtype)
-    )
-    contributions[illum_mask] = torch.sum(
-        torch.conj(rx_pol.to(cdtype)) * channel_faces,
-        dim=1,
-    )
     return (
         contributions.cpu().numpy().astype(complex_dtype),
         delays_s.cpu().numpy().astype(float_dtype),
@@ -1894,7 +1964,9 @@ def _torch_local_incidence_bases(k_hat_inc, normals, preferred_axis):
 
     te_hat = torch.linalg.cross(k_hat_inc, normals, dim=1)
     te_norms = torch.linalg.norm(te_hat, dim=1)
-    singular = te_norms <= 1e-18
+    # TE/TM are degenerate at normal incidence. Avoid amplifying roundoff in
+    # the almost-zero cross product when the entire scene is rotated.
+    singular = te_norms <= math.sqrt(torch.finfo(k_hat_inc.dtype).eps)
     if bool(torch.any(singular).item()):
         fallback_te = _torch_transverse_polarizations(
             k_hat_inc,
@@ -1979,12 +2051,16 @@ def po_channel(
     precomputed_raw_fractional_visibility: np.ndarray | None = None,
     precomputed_visible_sample_counts: np.ndarray | None = None,
     po_integration_mode: POIntegrationMode = "face_centroid",
-    po_quadrature_phase_span_scale_rad: float = 1.0,
+    po_quadrature_phase_span_scale_rad: float | None = None,
+    po_curvature_error_rad: float = 0.005,
     po_quadrature_max_refinement_depth: int = 16,
     po_quadrature_max_subfaces_per_parent: int = 0,
     progress_callback: Callable[[dict], None] | None = None,
     compute_backend: ComputeBackend = "numpy",
     compute_precision: ComputePrecision = "float64",
+    polarization_axis: np.ndarray | None = None,
+    max_frequency_offset_hz: float | None = None,
+    receiver_fmcw=None,
 ) -> POChannelResult:
     """Evaluates a human-only PO virtual channel over one chirp."""
 
@@ -2012,15 +2088,22 @@ def po_channel(
     if po_integration_mode not in (
         "face_centroid",
         "parent_face_quadrature",
+        "parent_face_adaptive_analytic",
         "parent_face_far_field_analytic",
     ):
         raise ValueError(
             "po_integration_mode must be 'face_centroid', "
-            "'parent_face_quadrature', or "
+            "'parent_face_quadrature', 'parent_face_adaptive_analytic', or "
             "'parent_face_far_field_analytic'"
+        )
+    if po_quadrature_phase_span_scale_rad is None:
+        po_quadrature_phase_span_scale_rad = default_phase_span_scale_rad(
+            po_integration_mode
         )
     if po_quadrature_phase_span_scale_rad <= 0.0:
         raise ValueError("po_quadrature_phase_span_scale_rad must be positive")
+    if not np.isfinite(po_curvature_error_rad) or po_curvature_error_rad <= 0.0:
+        raise ValueError("po_curvature_error_rad must be finite and positive")
     if po_quadrature_max_refinement_depth < 0:
         raise ValueError("po_quadrature_max_refinement_depth must be non-negative")
     if po_quadrature_max_subfaces_per_parent < 0:
@@ -2101,6 +2184,16 @@ def po_channel(
     selected_face_indices = np.flatnonzero(effective_weights > 0.0)
     tx_phase_center = np.mean(tx_positions, axis=0)
     rx_phase_center = np.mean(rx_positions, axis=0)
+    delay_response = None
+    if max_frequency_offset_hz is not None and po_integration_mode != "face_centroid":
+        delay_response = PODelayResponse.for_mesh(
+            vertices, faces, selected_face_indices.size, max_frequency_offset_hz,
+            receiver_fmcw=receiver_fmcw,
+            channel_delay_margin_s=(np.max(np.linalg.norm(tx_positions-tx_phase_center, axis=1))
+                                    + np.max(np.linalg.norm(rx_positions-rx_phase_center, axis=1))) / c,
+        )
+        delay_response.set_reference(np.arange(selected_face_indices.size),
+                                     centroids[selected_face_indices], tx_phase_center, rx_phase_center)
     far_field_max_edge_m = None
     far_field_nearest_distance_m = None
     if po_integration_mode == "parent_face_quadrature":
@@ -2139,6 +2232,8 @@ def po_channel(
             backend=compute_backend,
             precision=compute_precision,
             progress_callback=progress_callback,
+            polarization_axis=polarization_axis,
+            delay_response=delay_response,
         )
         phase_center_delays_s = _phase_center_delays_for_centroids(
             integration_centroids,
@@ -2146,26 +2241,32 @@ def po_channel(
             rx_phase_center,
             compute_precision,
         )
-    elif po_integration_mode == "parent_face_far_field_analytic":
-        (
-            far_field_centroids,
-            far_field_normals,
-            far_field_areas,
-            far_field_parent_indices,
-            far_field_triangles,
-            far_field_max_edge_m,
-            far_field_nearest_distance_m,
-        ) = parent_face_far_field_analytic_geometry(
-            vertices=vertices,
-            faces=faces,
-            selected_parent_indices=selected_face_indices,
-            tx_positions=tx_positions,
-            rx_positions=rx_positions,
-            frequency_hz=frequency_hz,
+    elif po_integration_mode in ("parent_face_adaptive_analytic", "parent_face_far_field_analytic"):
+        geometry_kwargs = dict(
+            vertices=vertices, faces=faces, selected_parent_indices=selected_face_indices,
+            tx_positions=tx_positions, rx_positions=rx_positions, frequency_hz=frequency_hz,
             max_refinement_depth=po_quadrature_max_refinement_depth,
             max_subfaces_per_parent=po_quadrature_max_subfaces_per_parent,
             progress_callback=progress_callback,
         )
+        if po_integration_mode == "parent_face_adaptive_analytic":
+            (
+                far_field_centroids, far_field_normals, far_field_areas,
+                far_field_parent_indices, far_field_triangles,
+            ) = parent_face_adaptive_analytic_geometry(
+                **geometry_kwargs, phase_span_scale_rad=po_quadrature_phase_span_scale_rad,
+                curvature_error_rad=po_curvature_error_rad,
+            )
+        else:
+            (
+                far_field_centroids,
+                far_field_normals,
+                far_field_areas,
+                far_field_parent_indices,
+                far_field_triangles,
+                far_field_max_edge_m,
+                far_field_nearest_distance_m,
+            ) = parent_face_far_field_analytic_geometry(**geometry_kwargs)
         path_face_indices = selected_face_indices
         integration_centroids = centroids[selected_face_indices]
         integration_normals = normals[selected_face_indices]
@@ -2186,6 +2287,8 @@ def po_channel(
                 backend=compute_backend,
                 precision=compute_precision,
                 progress_callback=progress_callback,
+                polarization_axis=polarization_axis,
+                delay_response=delay_response,
             )
         )
         phase_center_delays_s = _phase_center_delays_for_centroids(
@@ -2214,6 +2317,7 @@ def po_channel(
                 weights=effective_weights[path_face_indices],
                 backend=compute_backend,
                 precision=compute_precision,
+                polarization_axis=polarization_axis,
             )
         )
     # Approximation: full PO is evaluated at the Tx/Rx phase center only.
@@ -2235,6 +2339,15 @@ def po_channel(
     if coefficients.shape[0] == 1:
         delays_s = np.asarray(phase_center_delays_s, dtype=float_dtype).reshape(-1)
 
+    if delay_response is not None:
+        gains, _, _, _ = project_phase_center_contributions_to_virtual_channels(
+            np.ones(path_face_indices.size, complex), integration_centroids,
+            tx_positions, rx_positions, frequency_hz,
+            virtual_channel_tx_indices=virtual_channel_tx_indices,
+            virtual_channel_rx_indices=virtual_channel_rx_indices,
+            virtual_channel_order=virtual_channel_order, precision=compute_precision,
+        )
+        delay_response = delay_response.with_channel_gains(gains)
     state_out = FaceVisibilityState(
         was_visible=raw_visibility > 0.0,
         fade_weights=fade_weights.copy(),
@@ -2267,6 +2380,7 @@ def po_channel(
         visibility_state=state_out,
         far_field_max_edge_m=far_field_max_edge_m,
         far_field_nearest_distance_m=far_field_nearest_distance_m,
+        delay_response=delay_response,
     )
 
 
@@ -2361,7 +2475,9 @@ def _local_incidence_bases(
 
     te_hat = np.cross(k_hat_inc, normals)
     te_norms = np.linalg.norm(te_hat, axis=1)
-    singular = te_norms <= 1e-18
+    # Near normal incidence both polarizations have the same physical action;
+    # use a stable transverse basis instead of normalizing cancellation noise.
+    singular = te_norms <= np.sqrt(np.finfo(np.asarray(k_hat_inc).dtype).eps)
     if np.any(singular):
         te_hat[singular] = _transverse_polarizations(
             k_hat_inc[singular],

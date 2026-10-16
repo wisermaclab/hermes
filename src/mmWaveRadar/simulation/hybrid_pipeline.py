@@ -5,26 +5,31 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+from contextlib import ExitStack
+from dataclasses import dataclass, field, replace
+import functools
 from pathlib import Path
 import time
 from typing import Callable
 
+from ..radar.adc import merge_if_filter_diagnostics
 import numpy as np
-from scipy.constants import c
 
 from .calibration import (
     POCalibrationConfig,
+    POCalibrationReference,
     calibration_gain_array,
     fit_first_pose_adc_calibration,
-    fit_sequence_path_power_calibration,
+    fit_sequence_adc_calibration,
 )
 from .channel_gain import apply_path_hardware_gain
-from .env_human_coupling import (
-    compute_env_human_coupling_channels,
-    extract_rt_reflector_bank,
+from .env_human_coupling import _reflector_support
+from .hybrid_passes import (
+    _run_coupling_pass,
+    _run_static_environment_pass,
+    _select_reflectors,
+    _zeroed_metadata_arrays,
 )
-from .physical_optics import HumanVisibilityScene
 from ..radar import RadarSensor
 from .types import (
     HybridStaticEnvPOConfig,
@@ -41,11 +46,6 @@ from .tdm import (
     tdm_expansion_required,
 )
 from .simulator import MmWaveRadarSimulator
-from .static_blocking import (
-    PathVisibilityState,
-    blocked_path_visibility,
-    extract_static_path_bank,
-)
 from .rt_coherence import (
     extract_coherent_rt_path_bank,
     match_coherent_rt_path_banks,
@@ -131,6 +131,7 @@ class FullRTMobilityBaselineResult:
     human_env_coupled_path_power: np.ndarray
     human_multi_touch_path_power: np.ndarray
     retrace_count: int
+    reference_adc_power: dict[str, np.ndarray] = field(default_factory=dict)
 
 
 RTMobilityBaselineResult = FullRTMobilityBaselineResult
@@ -163,6 +164,13 @@ def _collapse_tdm_full_rt_result(
             result.human_reference_path_counts,
             "human_reference_path_counts",
         ),
+        reference_adc_power={
+            component: np.stack([
+                collapse_tdm_first_frame_adc(frame[:, None, :], radar)[:, 0, :]
+                for frame in power
+            ])
+            for component, power in result.reference_adc_power.items()
+        },
         human_touch_path_counts=metadata.human_touch_path_counts,
         one_human_touch_path_counts=metadata.one_human_touch_path_counts,
         single_human_only_path_counts=metadata.single_human_only_path_counts,
@@ -244,75 +252,12 @@ class _FrameRangeMeshSequence:
         return float(np.max(np.linalg.norm(vertices - ref, axis=1)))
 
 
-@dataclass(frozen=True)
-class _StaticEnvironmentPass:
-    """Static RT, dynamic blocking, and RT-derived reflector candidates."""
-
-    static_unblocked_adc: np.ndarray
-    static_blocked_adc: np.ndarray
-    visibility_weights: np.ndarray
-    static_path_counts: np.ndarray
-    blocked_counts: np.ndarray
-    mean_visibility: np.ndarray
-    static_bank: object
-    reflector_bank: object
-    runtime_profile_s: dict[str, float]
-    runtime_profile_counts: dict[str, int]
-    wall_time_s: float
-
-
-@dataclass(frozen=True)
-class _CouplingPass:
-    """Human/environment coupling terms and diagnostics."""
-
-    human_env_adc: np.ndarray
-    env_human_adc: np.ndarray
-    human_env_counts: np.ndarray
-    env_human_counts: np.ndarray
-    human_env_min_lengths: np.ndarray
-    human_env_mean_lengths: np.ndarray
-    human_env_max_lengths: np.ndarray
-    env_human_min_lengths: np.ndarray
-    env_human_mean_lengths: np.ndarray
-    env_human_max_lengths: np.ndarray
-    runtime_profile_s: dict[str, float]
-    runtime_profile_counts: dict[str, int]
-    wall_time_s: float
-
-
 def _runtime_alias_key(key: str) -> str | None:
     """Maps legacy ``full_rt_*`` profile keys to shorter ``rt_*`` aliases."""
 
     if not key.startswith("full_rt_"):
         return None
     return "rt_" + key[len("full_rt_"):]
-
-
-def _path_length_stats(valid: np.ndarray, delays_s: np.ndarray):
-    """Returns min/mean/max valid path lengths in meters."""
-
-    delays = np.asarray(delays_s)
-    if delays.ndim == 2:
-        delays = np.mean(delays, axis=0)
-    lengths = c * delays[np.asarray(valid, dtype=bool)]
-    if lengths.size == 0:
-        return np.nan, np.nan, np.nan
-    return float(np.min(lengths)), float(np.mean(lengths)), float(np.max(lengths))
-
-
-def _zeroed_metadata_arrays(times_shape):
-    """Allocates zero/NaN metadata arrays matching a frame/chirp time shape."""
-
-    return (
-        np.zeros(times_shape, dtype=np.int64),
-        np.zeros(times_shape, dtype=np.int64),
-        np.full(times_shape, np.nan, dtype=np.float64),
-        np.full(times_shape, np.nan, dtype=np.float64),
-        np.full(times_shape, np.nan, dtype=np.float64),
-        np.full(times_shape, np.nan, dtype=np.float64),
-        np.full(times_shape, np.nan, dtype=np.float64),
-        np.full(times_shape, np.nan, dtype=np.float64),
-    )
 
 
 def _reset_runtime_keys(profile_s: dict[str, float], profile_counts: dict[str, int]):
@@ -344,26 +289,64 @@ def _require_components(base_cube: RadarCube, keys: set[str]):
         raise RuntimeError(f"base cube is missing components: {sorted(missing)}")
 
 
+def _with_target_detached(*scene_arguments: str):
+    """Runs a hybrid entry point with its mesh target out of the named scenes.
+
+    An earlier RT run can leave the moving mesh in a scene. The static trace,
+    reflector discovery, and static occlusion must not see that frozen copy.
+    """
+
+    def decorate(function):
+        @functools.wraps(function)
+        def wrapper(*args, **kwargs):
+            with ExitStack() as stack:
+                detached = set()
+                for name in scene_arguments:
+                    scene = kwargs.get(name)
+                    if scene is not None and id(scene) not in detached:
+                        detached.add(id(scene))
+                        stack.enter_context(
+                            kwargs["target"].detached_from_scene(scene)
+                        )
+                return function(*args, **kwargs)
+
+        return wrapper
+
+    return decorate
+
+
 def _print_reflector_summary(reflector_bank, *, max_rows: int = 8):
-    """Prints a compact summary of RT-derived environment reflectors."""
+    """Prints selected image planes and the relative-power selection summary."""
 
     reflector_count = int(reflector_bank.vertices.shape[0])
-    print(f"RT-derived coupling candidates: {reflector_count}", flush=True)
+    selection = getattr(reflector_bank, "selection_metadata", None)
+    if selection is not None:
+        print("Image-source reflector selection [candidates, retained, cutoff_dB]:",
+              (selection["candidate_count"], reflector_count, selection["power_threshold_db"]), flush=True)
+        print("Image-source estimated relative powers [name, dB]:", [
+            (entry["object"], entry["relative_power_db"])
+            for entry in selection["candidates"] if entry["retained"]][:max_rows], flush=True)
+    else:
+        print(f"Image-source reflectors: {reflector_count}", flush=True)
     if reflector_count <= 0:
         return
+    support_vertices = [
+        _reflector_support(reflector_bank, idx).reshape(-1, 3)
+        for idx in range(min(reflector_count, max_rows))
+    ]
     reflector_bounds = [
         (
             reflector_bank.object_names[idx],
-            np.array2string(reflector_bank.vertices[idx].min(axis=0), precision=3),
-            np.array2string(reflector_bank.vertices[idx].max(axis=0), precision=3),
+            np.array2string(support_vertices[idx].min(axis=0), precision=3),
+            np.array2string(support_vertices[idx].max(axis=0), precision=3),
         )
         for idx in range(min(reflector_count, max_rows))
     ]
-    print("RT reflector world bounds [name, min_xyz, max_xyz]:", reflector_bounds, flush=True)
+    print("Reflector world bounds [name, min_xyz, max_xyz]:", reflector_bounds, flush=True)
     if reflector_bank.reflection_gains is not None:
         gains = np.asarray(reflector_bank.reflection_gains)[:min(reflector_count, max_rows)]
         print(
-            "RT-calibrated reflector gains [name, |gain|, phase_deg]:",
+            "Static RT reference gains (diagnostic only) [name, |gain|, phase_deg]:",
             [
                 (
                     reflector_bank.object_names[idx],
@@ -383,6 +366,7 @@ def _run_full_rt_coherent_transition_baseline(
     targets: list[MeshTarget],
     simulator: MmWaveRadarSimulator,
     num_frames: int,
+    calibration_reference_component: POCalibrationReference | None = None,
 ) -> FullRTMobilityBaselineResult:
     """Runs full-scene RT while preserving coherent paths between retraces."""
 
@@ -429,6 +413,13 @@ def _run_full_rt_coherent_transition_baseline(
         dtype=adc_complex_dtype,
     )
     human_reference_path_counts = np.zeros(num_chirps, dtype=np.int64)
+    reference_adc_power = (
+        {} if calibration_reference_component is None else {
+            calibration_reference_component: np.zeros(
+                (num_frames, num_chirps, num_vc), dtype=np.float64,
+            )
+        }
+    )
     threshold = fmcw.wavelength * simulator.retrace_displacement_fraction
     transition_config = simulator.rt_coherent_transition_config
     transition_matching_enabled = bool(transition_config.enabled)
@@ -812,18 +803,35 @@ def _run_full_rt_coherent_transition_baseline(
                 "full_rt_adc_synthesis",
                 time.perf_counter() - adc_t0,
             )
+            reference_adc = None
+            if calibration_reference_component is not None:
+                reference_valid = {
+                    "single_human_only": single_human_only,
+                    "one_human_touch": one_human_touch,
+                    "human_touch": human_touch,
+                    "human_env_coupled": human_env_coupled,
+                    "human_multi_touch": human_multi_touch,
+                }[calibration_reference_component]
+                reference_adc = simulator.synthesize_adc(
+                    a, tau, reference_valid, fmcw,
+                    backend=simulator.adc_compute_backend,
+                    precision=simulator.adc_compute_precision,
+                )
+                reference_adc_power[calibration_reference_component][frame, chirp] = (
+                    np.mean(np.abs(reference_adc.astype(np.complex128)) ** 2, axis=0)
+                )
             if frame == 0:
                 human_valid = single_human_only
                 human_reference_path_counts[chirp] = int(
                     single_human_only_path_counts[frame, chirp]
                 )
-                human_reference_adc[chirp] = simulator.synthesize_adc(
-                    a,
-                    tau,
-                    human_valid,
-                    fmcw,
-                    backend=simulator.adc_compute_backend,
-                    precision=simulator.adc_compute_precision,
+                human_reference_adc[chirp] = (
+                    reference_adc if calibration_reference_component == "single_human_only"
+                    else simulator.synthesize_adc(
+                        a, tau, human_valid, fmcw,
+                        backend=simulator.adc_compute_backend,
+                        precision=simulator.adc_compute_precision,
+                    )
                 )
 
     simulator.log_frame_progress(
@@ -834,6 +842,7 @@ def _run_full_rt_coherent_transition_baseline(
         extra=f"retraces={int(frame_retrace_counts[num_frames - 1])}",
     )
     metadata = SensingMetadata(
+        adc_if_filter=dict(getattr(simulator, "adc_if_filter", {})),
         events=events,
         path_counts=path_counts,
         max_displacements=max_displacements,
@@ -878,6 +887,7 @@ def _run_full_rt_coherent_transition_baseline(
         human_env_coupled_path_power=human_env_coupled_path_power,
         human_multi_touch_path_power=human_multi_touch_path_power,
         retrace_count=int(len(event_banks)),
+        reference_adc_power=reference_adc_power,
     )
 
 
@@ -888,12 +898,14 @@ def run_full_rt_mobility_baseline(
     targets: list[MeshTarget],
     simulator: MmWaveRadarSimulator,
     num_frames: int,
+    calibration_reference_component: POCalibrationReference | None = None,
 ) -> FullRTMobilityBaselineResult:
     """Runs full-scene RT over the motion window and extracts first-frame human RT.
 
     This intentionally stays as a separate top-level helper from the hybrid
     pipeline so mobility-specific tracing/cache optimizations can evolve here
-    without entangling the PO/RT hybrid component assembly.
+    without entangling the PO/RT hybrid component assembly. When requested,
+    retain per-channel ADC powers for one calibration component at every chirp.
     """
 
     if scene is None:
@@ -903,6 +915,8 @@ def run_full_rt_mobility_baseline(
     num_frames = int(num_frames)
     if num_frames <= 0:
         raise ValueError("num_frames must be positive")
+    if calibration_reference_component is not None:
+        POCalibrationConfig(reference_component=calibration_reference_component)
     if tdm_expansion_required(radar):
         expanded_result = run_full_rt_mobility_baseline(
             scene=scene,
@@ -910,6 +924,7 @@ def run_full_rt_mobility_baseline(
             targets=targets,
             simulator=simulator,
             num_frames=num_frames,
+            calibration_reference_component=calibration_reference_component,
         )
         return _collapse_tdm_full_rt_result(expanded_result, radar)
 
@@ -935,6 +950,7 @@ def run_full_rt_mobility_baseline(
                 targets=targets,
                 simulator=simulator,
                 num_frames=num_frames,
+                calibration_reference_component=calibration_reference_component,
             )
 
         fmcw = radar.fmcw
@@ -974,6 +990,13 @@ def run_full_rt_mobility_baseline(
             dtype=adc_complex_dtype,
         )
         human_reference_path_counts = np.zeros(num_chirps, dtype=np.int64)
+        reference_adc_power = (
+            {} if calibration_reference_component is None else {
+                calibration_reference_component: np.zeros(
+                    (num_frames, num_chirps, num_vc), dtype=np.float64,
+                )
+            }
+        )
         reference_vertices = [None for _ in targets]
         current_target_vertices = [None for _ in targets]
         paths = None
@@ -1096,6 +1119,7 @@ def run_full_rt_mobility_baseline(
                                 cached_path_arrays[0],
                                 paths=paths,
                                 frequency_hz=fmcw.carrier_frequency,
+                                radar_orientation=radar.orientation,
                             ),
                             cached_path_arrays[1],
                             cached_path_arrays[2],
@@ -1221,18 +1245,35 @@ def run_full_rt_mobility_baseline(
                     "full_rt_adc_synthesis",
                     time.perf_counter() - adc_t0,
                 )
+                reference_adc = None
+                if calibration_reference_component is not None:
+                    reference_valid = {
+                        "single_human_only": single_human_only,
+                        "one_human_touch": one_human_touch,
+                        "human_touch": human_touch,
+                        "human_env_coupled": human_env_coupled,
+                        "human_multi_touch": human_multi_touch,
+                    }[calibration_reference_component]
+                    reference_adc = simulator.synthesize_adc(
+                        a, tau, reference_valid, fmcw,
+                        backend=simulator.adc_compute_backend,
+                        precision=simulator.adc_compute_precision,
+                    )
+                    reference_adc_power[calibration_reference_component][frame, chirp] = (
+                        np.mean(np.abs(reference_adc.astype(np.complex128)) ** 2, axis=0)
+                    )
                 if frame == 0:
                     human_valid = single_human_only
                     human_reference_path_counts[chirp] = int(
                         single_human_only_path_counts[frame, chirp]
                     )
-                    human_reference_adc[chirp] = simulator.synthesize_adc(
-                        a,
-                        tau,
-                        human_valid,
-                        fmcw,
-                        backend=simulator.adc_compute_backend,
-                        precision=simulator.adc_compute_precision,
+                    human_reference_adc[chirp] = (
+                        reference_adc if calibration_reference_component == "single_human_only"
+                        else simulator.synthesize_adc(
+                            a, tau, human_valid, fmcw,
+                            backend=simulator.adc_compute_backend,
+                            precision=simulator.adc_compute_precision,
+                        )
                     )
 
         simulator.log_frame_progress(
@@ -1243,6 +1284,7 @@ def run_full_rt_mobility_baseline(
             extra=f"retraces={total_retraces}",
         )
         metadata = SensingMetadata(
+            adc_if_filter=dict(getattr(simulator, "adc_if_filter", {})),
             events=events,
             path_counts=path_counts,
             max_displacements=max_displacements,
@@ -1281,6 +1323,7 @@ def run_full_rt_mobility_baseline(
             human_env_coupled_path_power=human_env_coupled_path_power,
             human_multi_touch_path_power=human_multi_touch_path_power,
             retrace_count=int(total_retraces),
+            reference_adc_power=reference_adc_power,
         )
     finally:
         if added_objects:
@@ -1300,6 +1343,7 @@ def run_rt_mobility_baseline(
     targets: list[MeshTarget],
     simulator: MmWaveRadarSimulator,
     num_frames: int,
+    calibration_reference_component: POCalibrationReference | None = None,
 ) -> RTMobilityBaselineResult:
     """Backward-compatible name for the full-scene RT mobility baseline."""
 
@@ -1309,6 +1353,7 @@ def run_rt_mobility_baseline(
         targets=targets,
         simulator=simulator,
         num_frames=num_frames,
+        calibration_reference_component=calibration_reference_component,
     )
 
 
@@ -1403,6 +1448,7 @@ def _rt_result_to_calibration_baseline(
     return {
         "cube": result.cube,
         "human_reference_adc": result.human_reference_adc,
+        "reference_adc_power": result.reference_adc_power,
         "human_reference_path_counts": result.human_reference_path_counts,
         "human_touch_path_counts": result.human_touch_path_counts,
         "one_human_touch_path_counts": result.one_human_touch_path_counts,
@@ -1504,13 +1550,10 @@ def _calibrate_human_po(
         po_calibration["reference_frame"] = int(frame_start)
         po_calibration["reference_chirps"] = int(human_cube.adc.shape[1])
     else:
-        po_path_power = human_cube.metadata.total_path_power
-        if po_path_power is None:
-            raise RuntimeError("human PO cube is missing total path power metadata")
-        gain, po_calibration = fit_sequence_path_power_calibration(
+        gain, po_calibration = fit_sequence_adc_calibration(
             rt_baseline=rt_baseline,
             po_times=human_cube.times[frame_start:frame_stop],
-            po_path_power=np.asarray(po_path_power)[frame_start:frame_stop],
+            po_adc=human_cube.adc[frame_start:frame_stop],
             config=calibration_config,
         )
         po_calibration = _expand_selected_gain_map(
@@ -1574,443 +1617,7 @@ def _calibrate_human_po(
     return gain, po_calibration
 
 
-def _run_static_environment_pass(
-    *,
-    scene,
-    radar: RadarSensor,
-    target: MeshTarget,
-    times: np.ndarray,
-    simulator: MmWaveRadarSimulator,
-    config: HybridStaticEnvPOConfig,
-) -> _StaticEnvironmentPass:
-    """Traces static paths and synthesizes blocked/unblocked environment ADC."""
-
-    runtime_profile_s = {
-        "hybrid_static_trace": 0.0,
-        "hybrid_segment_extraction": 0.0,
-        "hybrid_reflector_extraction": 0.0,
-        "hybrid_blocking_rays": 0.0,
-        "hybrid_static_adc_synthesis": 0.0,
-    }
-    runtime_profile_counts = dict.fromkeys(runtime_profile_s, 0)
-
-    total_t0 = time.perf_counter()
-    radar.configure_scene(scene)
-    trace_t0 = time.perf_counter()
-    paths = simulator.trace_scene(scene)
-    runtime_profile_s["hybrid_static_trace"] = time.perf_counter() - trace_t0
-    runtime_profile_counts["hybrid_static_trace"] = 1
-
-    extraction_t0 = time.perf_counter()
-    static_bank = extract_static_path_bank(
-        paths,
-        radar,
-        virtual_channel_order=radar.hardware.virtual_channel_order,
-    )
-    runtime_profile_s["hybrid_segment_extraction"] = (
-        time.perf_counter() - extraction_t0
-    )
-    runtime_profile_counts["hybrid_segment_extraction"] = 1
-
-    reflector_t0 = time.perf_counter()
-    reflector_bank = extract_rt_reflector_bank(
-        scene,
-        static_bank,
-        max_reflectors=(
-            config.coupling_max_reflectors if config.coupling_enabled else -1
-        ),
-        min_area_m2=config.coupling_min_reflector_area_m2,
-        frequency_hz=radar.fmcw.carrier_frequency,
-    )
-    runtime_profile_s["hybrid_reflector_extraction"] = (
-        time.perf_counter() - reflector_t0
-    )
-    runtime_profile_counts["hybrid_reflector_extraction"] = 1
-
-    _, adc_complex_dtype = simulator.numpy_dtypes_for_precision(
-        simulator.adc_compute_precision
-    )
-    static_unblocked_adc = np.zeros(
-        times.shape + (radar.fmcw.num_adc_samples,
-                       radar.hardware.num_virtual_channels),
-        dtype=adc_complex_dtype,
-    )
-    static_blocked_adc = np.zeros_like(static_unblocked_adc)
-    visibility_weights = np.zeros(
-        times.shape + np.asarray(static_bank.delays_s).shape,
-        dtype=np.float64,
-    )
-    static_path_count = int(np.count_nonzero(static_bank.valid))
-    static_path_counts = np.full(times.shape, static_path_count, dtype=np.int64)
-    blocked_counts = np.zeros(times.shape, dtype=np.int64)
-    mean_visibility = np.zeros(times.shape, dtype=np.float64)
-    unblocked_weights = static_bank.valid.astype(np.float64)
-    unblocked_adc = simulator.synthesize_adc(
-        static_bank.coefficients,
-        static_bank.delays_s,
-        static_bank.valid,
-        radar.fmcw,
-        backend=simulator.adc_compute_backend,
-        precision=simulator.adc_compute_precision,
-    )
-    static_unblocked_adc[:] = unblocked_adc[None, None, :, :]
-
-    visibility_scene = HumanVisibilityScene(
-        target.mesh_sequence.faces,
-        target.mesh_sequence.vertices_at(float(times.reshape(-1)[0])),
-        name="hybrid-static-blocking-human",
-    )
-    visibility_state: PathVisibilityState | None = None
-    frame_start_s = time.perf_counter()
-    for frame in range(times.shape[0]):
-        simulator.report_frame_progress(
-            mode="hybrid_static_environment",
-            frame=frame,
-            num_frames=times.shape[0],
-        )
-        if frame > 0:
-            simulator.log_frame_progress(
-                mode="hybrid_static_env",
-                frame=frame - 1,
-                num_frames=times.shape[0],
-                frame_start_s=frame_start_s,
-                extra=f"static_paths={static_path_count}",
-            )
-        for chirp in range(times.shape[1]):
-            simulator.check_cancelled()
-            chirp_time = float(times[frame, chirp])
-            vertices = target.mesh_sequence.vertices_at(chirp_time)
-            visibility_scene.update_vertices(vertices)
-            if config.blocking_enabled:
-                blocking_t0 = time.perf_counter()
-                visibility = blocked_path_visibility(
-                    static_bank,
-                    visibility_scene,
-                    blocker_vertices=vertices,
-                    aabb_culling=config.blocking_aabb_culling,
-                    aabb_margin_m=config.blocking_aabb_margin_m,
-                    state=visibility_state,
-                    fade_chirps=config.blocking_fade_chirps,
-                    ray_epsilon_m=config.blocking_ray_epsilon_m,
-                    ray_chunk_size=config.blocking_ray_chunk_size,
-                )
-                runtime_profile_s["hybrid_blocking_rays"] += (
-                    time.perf_counter() - blocking_t0
-                )
-                runtime_profile_counts["hybrid_blocking_rays"] += 1
-                visibility_state = visibility.state
-                weights = visibility.visibility_weights
-                blocked_counts[frame, chirp] = int(
-                    np.count_nonzero(visibility.blocked_paths & static_bank.valid)
-                )
-            else:
-                weights = unblocked_weights
-                blocked_counts[frame, chirp] = 0
-
-            visibility_weights[frame, chirp] = weights
-            mean_visibility[frame, chirp] = (
-                float(np.mean(weights[static_bank.valid]))
-                if static_path_count > 0 else 0.0
-            )
-            static_adc_t0 = time.perf_counter()
-            weighted_a = static_bank.coefficients * weights[None, :]
-            valid = static_bank.valid & (weights > 0.0)
-            static_blocked_adc[frame, chirp] = simulator.synthesize_adc(
-                weighted_a,
-                static_bank.delays_s,
-                valid,
-                radar.fmcw,
-                backend=simulator.adc_compute_backend,
-                precision=simulator.adc_compute_precision,
-            )
-            runtime_profile_s["hybrid_static_adc_synthesis"] += (
-                time.perf_counter() - static_adc_t0
-            )
-            runtime_profile_counts["hybrid_static_adc_synthesis"] += 1
-
-    simulator.log_frame_progress(
-        mode="hybrid_static_env",
-        frame=times.shape[0] - 1,
-        num_frames=times.shape[0],
-        frame_start_s=frame_start_s,
-        extra=f"static_paths={static_path_count}",
-    )
-    return _StaticEnvironmentPass(
-        static_unblocked_adc=static_unblocked_adc,
-        static_blocked_adc=static_blocked_adc,
-        visibility_weights=visibility_weights,
-        static_path_counts=static_path_counts,
-        blocked_counts=blocked_counts,
-        mean_visibility=mean_visibility,
-        static_bank=static_bank,
-        reflector_bank=reflector_bank,
-        runtime_profile_s=runtime_profile_s,
-        runtime_profile_counts=runtime_profile_counts,
-        wall_time_s=time.perf_counter() - total_t0,
-    )
-
-
-def _run_coupling_pass(
-    *,
-    scene,
-    radar: RadarSensor,
-    target: MeshTarget,
-    times: np.ndarray,
-    simulator: MmWaveRadarSimulator,
-    config: HybridStaticEnvPOConfig,
-    reflector_bank,
-    gain_map: np.ndarray,
-    progress: bool,
-    progress_every_frames: int,
-) -> _CouplingPass:
-    """Computes dynamic human-environment coupling ADC over the time grid."""
-
-    runtime_profile_s = {
-        "hybrid_coupling_channel": 0.0,
-        "hybrid_coupling_setup": 0.0,
-        "hybrid_human_env_channel": 0.0,
-        "hybrid_env_human_channel": 0.0,
-        "hybrid_coupling_adc_synthesis": 0.0,
-        "hybrid_human_env_adc_synthesis": 0.0,
-        "hybrid_env_human_adc_synthesis": 0.0,
-    }
-    runtime_profile_counts = dict.fromkeys(runtime_profile_s, 0)
-    _, adc_complex_dtype = simulator.numpy_dtypes_for_precision(
-        simulator.adc_compute_precision
-    )
-    adc_shape = times.shape + (
-        radar.fmcw.num_adc_samples,
-        radar.hardware.num_virtual_channels,
-    )
-    human_env_adc = np.zeros(adc_shape, dtype=adc_complex_dtype)
-    env_human_adc = np.zeros_like(human_env_adc)
-    (
-        human_env_counts,
-        env_human_counts,
-        human_env_min_lengths,
-        human_env_mean_lengths,
-        human_env_max_lengths,
-        env_human_min_lengths,
-        env_human_mean_lengths,
-        env_human_max_lengths,
-    ) = _zeroed_metadata_arrays(times.shape)
-
-    total_t0 = time.perf_counter()
-    reflector_count = int(reflector_bank.vertices.shape[0])
-    if not config.coupling_enabled or reflector_count <= 0:
-        return _CouplingPass(
-            human_env_adc=human_env_adc,
-            env_human_adc=env_human_adc,
-            human_env_counts=human_env_counts,
-            env_human_counts=env_human_counts,
-            human_env_min_lengths=human_env_min_lengths,
-            human_env_mean_lengths=human_env_mean_lengths,
-            human_env_max_lengths=human_env_max_lengths,
-            env_human_min_lengths=env_human_min_lengths,
-            env_human_mean_lengths=env_human_mean_lengths,
-            env_human_max_lengths=env_human_max_lengths,
-            runtime_profile_s=runtime_profile_s,
-            runtime_profile_counts=runtime_profile_counts,
-            wall_time_s=time.perf_counter() - total_t0,
-        )
-
-    coupling_po_config = config.human_po_config
-    coupling_compute_backend = (
-        simulator.compute_backend if coupling_po_config.compute_backend is None
-        else coupling_po_config.compute_backend
-    )
-    coupling_compute_precision = (
-        simulator.compute_precision if coupling_po_config.compute_precision is None
-        else coupling_po_config.compute_precision
-    )
-    coupling_incremental_update = (
-        bool(coupling_po_config.incremental_update)
-        if config.coupling_incremental_update is None
-        else bool(config.coupling_incremental_update)
-    )
-    coupling_visibility_refresh_chirps = (
-        int(coupling_po_config.incremental_visibility_refresh_chirps)
-        if config.coupling_visibility_refresh_chirps is None
-        else int(config.coupling_visibility_refresh_chirps)
-    )
-    visibility_scene = HumanVisibilityScene(
-        target.mesh_sequence.faces,
-        target.mesh_sequence.vertices_at(float(times.reshape(-1)[0])),
-        name="hybrid-coupling-human",
-    )
-
-    frame_start_s = time.perf_counter()
-    progress_every_frames = max(1, int(progress_every_frames))
-    cached_human_env_active_sets = None
-    cached_env_human_active_sets = None
-    for frame in range(times.shape[0]):
-        simulator.report_frame_progress(
-            mode="hybrid_coupling",
-            frame=frame,
-            num_frames=times.shape[0],
-        )
-        for chirp in range(times.shape[1]):
-            simulator.check_cancelled()
-            chirp_index = frame * times.shape[1] + chirp
-            chirp_time = float(times[frame, chirp])
-            vertices = target.mesh_sequence.vertices_at(chirp_time)
-            visibility_scene.update_vertices(vertices)
-            refresh_coupling_visibility = (
-                not coupling_incremental_update
-                or cached_human_env_active_sets is None
-                or cached_env_human_active_sets is None
-                or chirp_index % coupling_visibility_refresh_chirps == 0
-            )
-
-            coupling_t0 = time.perf_counter()
-            coupling = compute_env_human_coupling_channels(
-                vertices=vertices,
-                faces=target.mesh_sequence.faces,
-                tx_positions=radar.world_tx_positions(),
-                rx_positions=radar.world_rx_positions(),
-                virtual_channel_tx_indices=(
-                    radar.hardware.virtual_tx_indices()
-                ),
-                virtual_channel_rx_indices=(
-                    radar.hardware.virtual_rx_indices()
-                ),
-                virtual_channel_order=radar.hardware.virtual_channel_order,
-                frequency_hz=radar.fmcw.carrier_frequency,
-                human_material=target.material,
-                reflectors=reflector_bank,
-                human_visibility_scene=visibility_scene,
-                static_visibility_scene=scene.mi_scene,
-                reflection_scale=config.coupling_reflection_scale,
-                backend=coupling_compute_backend,
-                precision=coupling_compute_precision,
-                human_env_active_sets=(
-                    None if refresh_coupling_visibility
-                    else cached_human_env_active_sets
-                ),
-                env_human_active_sets=(
-                    None if refresh_coupling_visibility
-                    else cached_env_human_active_sets
-                ),
-            )
-            cached_human_env_active_sets = coupling.human_env_active_sets
-            cached_env_human_active_sets = coupling.env_human_active_sets
-            coupling_elapsed_s = time.perf_counter() - coupling_t0
-            runtime_profile_s["hybrid_coupling_channel"] += coupling_elapsed_s
-            runtime_profile_counts["hybrid_coupling_channel"] += 1
-            coupling_profile_s = coupling.runtime_profile_s or {}
-            coupling_profile_counts = coupling.runtime_profile_counts or {}
-            runtime_profile_s["hybrid_coupling_setup"] += (
-                coupling_profile_s.get("coupling_setup", 0.0)
-                + coupling_profile_s.get("coupling_assembly", 0.0)
-            )
-            runtime_profile_counts["hybrid_coupling_setup"] += (
-                coupling_profile_counts.get("coupling_setup", 0)
-                + coupling_profile_counts.get("coupling_assembly", 0)
-            )
-            runtime_profile_s["hybrid_human_env_channel"] += (
-                coupling_profile_s.get("human_env_channel", 0.0)
-            )
-            runtime_profile_counts["hybrid_human_env_channel"] += (
-                coupling_profile_counts.get("human_env_channel", 0)
-            )
-            runtime_profile_s["hybrid_env_human_channel"] += (
-                coupling_profile_s.get("env_human_channel", 0.0)
-            )
-            runtime_profile_counts["hybrid_env_human_channel"] += (
-                coupling_profile_counts.get("env_human_channel", 0)
-            )
-
-            human_env_counts[frame, chirp] = int(
-                np.count_nonzero(coupling.human_env_valid)
-            )
-            env_human_counts[frame, chirp] = int(
-                np.count_nonzero(coupling.env_human_valid)
-            )
-            (
-                human_env_min_lengths[frame, chirp],
-                human_env_mean_lengths[frame, chirp],
-                human_env_max_lengths[frame, chirp],
-            ) = _path_length_stats(
-                coupling.human_env_valid,
-                coupling.human_env_delays_s,
-            )
-            (
-                env_human_min_lengths[frame, chirp],
-                env_human_mean_lengths[frame, chirp],
-                env_human_max_lengths[frame, chirp],
-            ) = _path_length_stats(
-                coupling.env_human_valid,
-                coupling.env_human_delays_s,
-            )
-
-            chirp_gain = float(gain_map[frame, chirp])
-            human_env_adc_t0 = time.perf_counter()
-            human_env_adc[frame, chirp] = chirp_gain * simulator.synthesize_adc(
-                coupling.human_env_coefficients,
-                coupling.human_env_delays_s,
-                coupling.human_env_valid,
-                radar.fmcw,
-                backend=simulator.adc_compute_backend,
-                precision=simulator.adc_compute_precision,
-            )
-            human_env_adc_elapsed_s = time.perf_counter() - human_env_adc_t0
-            env_human_adc_t0 = time.perf_counter()
-            env_human_adc[frame, chirp] = chirp_gain * simulator.synthesize_adc(
-                coupling.env_human_coefficients,
-                coupling.env_human_delays_s,
-                coupling.env_human_valid,
-                radar.fmcw,
-                backend=simulator.adc_compute_backend,
-                precision=simulator.adc_compute_precision,
-            )
-            env_human_adc_elapsed_s = time.perf_counter() - env_human_adc_t0
-            runtime_profile_s["hybrid_human_env_adc_synthesis"] += (
-                human_env_adc_elapsed_s
-            )
-            runtime_profile_counts["hybrid_human_env_adc_synthesis"] += 1
-            runtime_profile_s["hybrid_env_human_adc_synthesis"] += (
-                env_human_adc_elapsed_s
-            )
-            runtime_profile_counts["hybrid_env_human_adc_synthesis"] += 1
-            runtime_profile_s["hybrid_coupling_adc_synthesis"] += (
-                human_env_adc_elapsed_s + env_human_adc_elapsed_s
-            )
-            runtime_profile_counts["hybrid_coupling_adc_synthesis"] += 1
-
-        completed_frames = frame + 1
-        if progress and (
-            completed_frames == 1
-            or completed_frames == times.shape[0]
-            or completed_frames % progress_every_frames == 0
-        ):
-            completed_chirps = completed_frames * times.shape[1]
-            elapsed_s = time.perf_counter() - frame_start_s
-            print(
-                f"Coupling progress: frame {completed_frames}/{times.shape[0]} "
-                f"({completed_chirps}/{times.size} chirps), "
-                f"elapsed={elapsed_s:.1f} s, "
-                f"H_env mean paths={np.mean(human_env_counts[:completed_frames]):.1f}, "
-                f"E_human mean paths={np.mean(env_human_counts[:completed_frames]):.1f}",
-                flush=True,
-            )
-
-    return _CouplingPass(
-        human_env_adc=human_env_adc,
-        env_human_adc=env_human_adc,
-        human_env_counts=human_env_counts,
-        env_human_counts=env_human_counts,
-        human_env_min_lengths=human_env_min_lengths,
-        human_env_mean_lengths=human_env_mean_lengths,
-        human_env_max_lengths=human_env_max_lengths,
-        env_human_min_lengths=env_human_min_lengths,
-        env_human_mean_lengths=env_human_mean_lengths,
-        env_human_max_lengths=env_human_max_lengths,
-        runtime_profile_s=runtime_profile_s,
-        runtime_profile_counts=runtime_profile_counts,
-        wall_time_s=time.perf_counter() - total_t0,
-    )
-
-
+@_with_target_detached("scene")
 def hybrid_rt_path_coupling(
     *,
     scene,
@@ -2029,11 +1636,12 @@ def hybrid_rt_path_coupling(
     """Recomputes H_env/E_human from a cached H_direct/E_static base cube.
 
     The base cube is expected to contain the direct human PO and blocked static
-    RT components. This helper retraces the static scene only to rebuild the
-    RT-derived reflector bank, synthesizes the two single-bounce coupling
-    components, and returns an assembled hybrid cube.
+    RT components. This helper selects image planes directly from the scene
+    geometry, synthesizes the two single-bounce coupling components, and
+    returns an assembled hybrid cube.
     """
 
+    simulator.check_cancelled()
     if tdm_expansion_required(radar):
         expanded_result = hybrid_rt_path_coupling(
             scene=scene,
@@ -2072,51 +1680,17 @@ def hybrid_rt_path_coupling(
     )
 
     times = base_cube.times.copy()
-    _, adc_complex_dtype = simulator.numpy_dtypes_for_precision(
-        simulator.adc_compute_precision
-    )
     profile_s = dict(base_cube.metadata.runtime_profile_s or {})
     profile_counts = dict(base_cube.metadata.runtime_profile_counts or {})
     _reset_runtime_keys(profile_s, profile_counts)
 
+    reflector_bank = None
     if recompute:
-        human_env_adc = np.zeros_like(base_cube.adc, dtype=adc_complex_dtype)
-        env_human_adc = np.zeros_like(base_cube.adc, dtype=adc_complex_dtype)
-        (
-            human_env_counts,
-            env_human_counts,
-            human_env_min_lengths,
-            human_env_mean_lengths,
-            human_env_max_lengths,
-            env_human_min_lengths,
-            env_human_mean_lengths,
-            env_human_max_lengths,
-        ) = _zeroed_metadata_arrays(times.shape)
-
+        simulator.adc_if_filter = {}
         total_t0 = time.perf_counter()
         radar.configure_scene(scene)
-        trace_t0 = time.perf_counter()
-        paths = simulator.trace_scene(scene)
-        profile_s["hybrid_static_trace"] = time.perf_counter() - trace_t0
-        profile_counts["hybrid_static_trace"] = 1
-
-        extraction_t0 = time.perf_counter()
-        static_bank = extract_static_path_bank(
-            paths,
-            radar,
-            virtual_channel_order=radar.hardware.virtual_channel_order,
-        )
-        profile_s["hybrid_segment_extraction"] = time.perf_counter() - extraction_t0
-        profile_counts["hybrid_segment_extraction"] = 1
-
         reflector_t0 = time.perf_counter()
-        reflector_bank = extract_rt_reflector_bank(
-            scene,
-            static_bank,
-            max_reflectors=config.coupling_max_reflectors,
-            min_area_m2=config.coupling_min_reflector_area_m2,
-            frequency_hz=radar.fmcw.carrier_frequency,
-        )
+        reflector_bank = _select_reflectors(scene, radar, target, times, config)
         profile_s["hybrid_reflector_extraction"] = time.perf_counter() - reflector_t0
         profile_counts["hybrid_reflector_extraction"] = 1
         reflector_count = int(reflector_bank.vertices.shape[0])
@@ -2126,155 +1700,26 @@ def hybrid_rt_path_coupling(
         po_calibration = base_cube.metadata.po_calibration or {}
         human_po_gain = float(po_calibration.get("human_po_amplitude_gain", 1.0))
         human_po_gain_map = calibration_gain_array(
-            po_calibration,
-            times.shape,
-            fallback=human_po_gain,
+            po_calibration, times.shape, fallback=human_po_gain,
         )
-        if progress:
-            print(
-                "Human PO calibration [mode, gain, dB, reference chirps]:",
-                (
-                    po_calibration.get("mode", "none"),
-                    human_po_gain,
-                    po_calibration.get("human_po_amplitude_gain_db", 0.0),
-                    po_calibration.get("reference_chirps", 0),
-                ),
-                flush=True,
-            )
-
-        coupling_po_config = config.human_po_config
-        coupling_compute_backend = (
-            simulator.compute_backend if coupling_po_config.compute_backend is None
-            else coupling_po_config.compute_backend
+        coupling_pass = _run_coupling_pass(
+            scene=scene, radar=radar, target=target, times=times,
+            simulator=simulator, config=config, reflector_bank=reflector_bank,
+            gain_map=human_po_gain_map, progress=progress,
+            progress_every_frames=progress_every_frames,
         )
-        coupling_compute_precision = (
-            simulator.compute_precision if coupling_po_config.compute_precision is None
-            else coupling_po_config.compute_precision
-        )
-        visibility_scene = HumanVisibilityScene(
-            target.mesh_sequence.faces,
-            target.mesh_sequence.vertices_at(float(times.reshape(-1)[0])),
-            name="hybrid-coupling-human",
-        )
-
-        if config.coupling_enabled and reflector_count > 0:
-            progress_t0 = time.perf_counter()
-            for frame in range(times.shape[0]):
-                for chirp in range(times.shape[1]):
-                    chirp_time = float(times[frame, chirp])
-                    vertices = target.mesh_sequence.vertices_at(chirp_time)
-                    visibility_scene.update_vertices(vertices)
-
-                    coupling_t0 = time.perf_counter()
-                    coupling = compute_env_human_coupling_channels(
-                        vertices=vertices,
-                        faces=target.mesh_sequence.faces,
-                        tx_positions=radar.world_tx_positions(),
-                        rx_positions=radar.world_rx_positions(),
-                        virtual_channel_tx_indices=(
-                            radar.hardware.virtual_tx_indices()
-                        ),
-                        virtual_channel_rx_indices=(
-                            radar.hardware.virtual_rx_indices()
-                        ),
-                        virtual_channel_order=(
-                            radar.hardware.virtual_channel_order
-                        ),
-                        frequency_hz=radar.fmcw.carrier_frequency,
-                        human_material=target.material,
-                        reflectors=reflector_bank,
-                        human_visibility_scene=visibility_scene,
-                        static_visibility_scene=scene.mi_scene,
-                        reflection_scale=config.coupling_reflection_scale,
-                        backend=coupling_compute_backend,
-                        precision=coupling_compute_precision,
-                    )
-                    coupling_elapsed_s = time.perf_counter() - coupling_t0
-                    profile_s["hybrid_coupling_channel"] += coupling_elapsed_s
-                    profile_counts["hybrid_coupling_channel"] += 1
-                    coupling_profile_s = coupling.runtime_profile_s or {}
-                    coupling_profile_counts = coupling.runtime_profile_counts or {}
-                    profile_s["hybrid_coupling_setup"] += (
-                        coupling_profile_s.get("coupling_setup", 0.0)
-                        + coupling_profile_s.get("coupling_assembly", 0.0)
-                    )
-                    profile_counts["hybrid_coupling_setup"] += (
-                        coupling_profile_counts.get("coupling_setup", 0)
-                        + coupling_profile_counts.get("coupling_assembly", 0)
-                    )
-                    profile_s["hybrid_human_env_channel"] += coupling_profile_s.get(
-                        "human_env_channel", 0.0
-                    )
-                    profile_counts["hybrid_human_env_channel"] += (
-                        coupling_profile_counts.get("human_env_channel", 0)
-                    )
-                    profile_s["hybrid_env_human_channel"] += coupling_profile_s.get(
-                        "env_human_channel", 0.0
-                    )
-                    profile_counts["hybrid_env_human_channel"] += (
-                        coupling_profile_counts.get("env_human_channel", 0)
-                    )
-
-                    human_env_counts[frame, chirp] = int(np.count_nonzero(coupling.human_env_valid))
-                    env_human_counts[frame, chirp] = int(np.count_nonzero(coupling.env_human_valid))
-                    (
-                        human_env_min_lengths[frame, chirp],
-                        human_env_mean_lengths[frame, chirp],
-                        human_env_max_lengths[frame, chirp],
-                    ) = _path_length_stats(coupling.human_env_valid, coupling.human_env_delays_s)
-                    (
-                        env_human_min_lengths[frame, chirp],
-                        env_human_mean_lengths[frame, chirp],
-                        env_human_max_lengths[frame, chirp],
-                    ) = _path_length_stats(coupling.env_human_valid, coupling.env_human_delays_s)
-
-                    human_env_adc_t0 = time.perf_counter()
-                    chirp_gain = human_po_gain_map[frame, chirp]
-                    human_env_adc[frame, chirp] = chirp_gain * simulator.synthesize_adc(
-                        coupling.human_env_coefficients,
-                        coupling.human_env_delays_s,
-                        coupling.human_env_valid,
-                        radar.fmcw,
-                        backend=simulator.adc_compute_backend,
-                        precision=simulator.adc_compute_precision,
-                    )
-                    human_env_adc_elapsed_s = time.perf_counter() - human_env_adc_t0
-                    env_human_adc_t0 = time.perf_counter()
-                    env_human_adc[frame, chirp] = chirp_gain * simulator.synthesize_adc(
-                        coupling.env_human_coefficients,
-                        coupling.env_human_delays_s,
-                        coupling.env_human_valid,
-                        radar.fmcw,
-                        backend=simulator.adc_compute_backend,
-                        precision=simulator.adc_compute_precision,
-                    )
-                    env_human_adc_elapsed_s = time.perf_counter() - env_human_adc_t0
-                    profile_s["hybrid_human_env_adc_synthesis"] += human_env_adc_elapsed_s
-                    profile_counts["hybrid_human_env_adc_synthesis"] += 1
-                    profile_s["hybrid_env_human_adc_synthesis"] += env_human_adc_elapsed_s
-                    profile_counts["hybrid_env_human_adc_synthesis"] += 1
-                    profile_s["hybrid_coupling_adc_synthesis"] += (
-                        human_env_adc_elapsed_s + env_human_adc_elapsed_s
-                    )
-                    profile_counts["hybrid_coupling_adc_synthesis"] += 1
-
-                completed_frames = frame + 1
-                if progress and (
-                    completed_frames == 1
-                    or completed_frames == times.shape[0]
-                    or completed_frames % progress_every_frames == 0
-                ):
-                    completed_chirps = completed_frames * times.shape[1]
-                    elapsed_s = time.perf_counter() - progress_t0
-                    print(
-                        f"Coupling progress: frame {completed_frames}/{times.shape[0]} "
-                        f"({completed_chirps}/{times.size} chirps), "
-                        f"elapsed={elapsed_s:.1f} s, "
-                        f"H_env mean paths={np.mean(human_env_counts[:completed_frames]):.1f}, "
-                        f"E_human mean paths={np.mean(env_human_counts[:completed_frames]):.1f}",
-                        flush=True,
-                    )
-
+        human_env_adc = coupling_pass.human_env_adc
+        env_human_adc = coupling_pass.env_human_adc
+        human_env_counts = coupling_pass.human_env_counts
+        env_human_counts = coupling_pass.env_human_counts
+        human_env_min_lengths = coupling_pass.human_env_min_lengths
+        human_env_mean_lengths = coupling_pass.human_env_mean_lengths
+        human_env_max_lengths = coupling_pass.human_env_max_lengths
+        env_human_min_lengths = coupling_pass.env_human_min_lengths
+        env_human_mean_lengths = coupling_pass.env_human_mean_lengths
+        env_human_max_lengths = coupling_pass.env_human_max_lengths
+        profile_s.update(coupling_pass.runtime_profile_s)
+        profile_counts.update(coupling_pass.runtime_profile_counts)
         coupling_wall_time_s = time.perf_counter() - total_t0
     else:
         _require_components(base_cube, {"human_env", "env_human"})
@@ -2359,17 +1804,26 @@ def hybrid_rt_path_coupling(
     base_events = list(base_cube.metadata.events or [])
     event = {
         "reason": "loaded_base_recomputed_rt_path_coupling",
-        "coupling_candidate_source": "static_rt_paths",
+        "coupling_candidate_source": "scene_geometry_image_source_power",
         "coupling_recomputed": bool(recompute),
+        "coupling_power_threshold_db": config.coupling_power_threshold_db,
         "coupling_max_reflectors": int(config.coupling_max_reflectors),
+        "reflector_selection": getattr(reflector_bank, "selection_metadata", None),
         "po_calibration_gain": (base_cube.metadata.po_calibration or {}).get(
             "human_po_amplitude_gain", 1.0
         ),
     }
     if base_cube_path is not None:
         event["base_cube_path"] = str(base_cube_path)
+    receiver_components = dict((base_cube.metadata.adc_if_filter or {}).get("components", {}))
+    if recompute:
+        if not receiver_components and base_cube.metadata.adc_if_filter:
+            receiver_components["base"] = base_cube.metadata.adc_if_filter
+        receiver_components["coupling"] = getattr(simulator, "adc_if_filter", {})
     hybrid_metadata = replace(
         base_cube.metadata,
+        adc_if_filter=(merge_if_filter_diagnostics(**receiver_components)
+                       if recompute else base_cube.metadata.adc_if_filter),
         events=base_events + [event],
         path_counts=path_counts,
         runtime_profile_s=profile_s,
@@ -2418,6 +1872,7 @@ def recompute_hybrid_rt_path_coupling(
     return hybrid_rt_path_coupling(**kwargs)
 
 
+@_with_target_detached("scene", "coupling_scene")
 def run_calibrated_hybrid_po(
     *,
     scene,
@@ -2428,7 +1883,8 @@ def run_calibrated_hybrid_po(
     coupling_scene=None,
     po_visibility_samples_per_face: int = 4,
     coupling_enabled: bool = True,
-    coupling_max_reflectors: int = 0,
+    coupling_power_threshold_db: float = -20.0,
+    coupling_max_reflectors: int = 4,
     coupling_reflection_scale: float = 1.0,
     rt_samples_per_src: int = 80_000,
     rt_max_num_paths_per_src: int = 80_000,
@@ -2448,7 +1904,13 @@ def run_calibrated_hybrid_po(
     cancel_check: Callable[[], bool] | None = None,
     progress_callback: Callable[[dict], None] | None = None,
 ) -> CalibratedHybridPOResult:
-    """Runs calibrated Hybrid PO as an explicit six-stage algorithm flow."""
+    """Runs Hybrid PO as an explicit six-stage algorithm flow.
+
+    Human PO is already absolutely scaled, so the default performs no RT
+    amplitude fit and the human return stays independent of ray budget, seed,
+    and diffuse-scattering settings. Pass an ``rt_sequence`` or
+    ``rt_first_pose`` ``calibration_config`` to opt into the RT fit of stage 1.
+    """
 
     num_frames = int(num_frames)
     if num_frames <= 0:
@@ -2467,6 +1929,7 @@ def run_calibrated_hybrid_po(
             coupling_scene=coupling_scene,
             po_visibility_samples_per_face=po_visibility_samples_per_face,
             coupling_enabled=coupling_enabled,
+            coupling_power_threshold_db=coupling_power_threshold_db,
             coupling_max_reflectors=coupling_max_reflectors,
             coupling_reflection_scale=coupling_reflection_scale,
             rt_samples_per_src=rt_samples_per_src,
@@ -2536,16 +1999,14 @@ def run_calibrated_hybrid_po(
     if calibration_config is None and human_po_config is not None:
         calibration_config = human_po_config.calibration
     if calibration_config is None:
-        calibration_config = POCalibrationConfig(
-            mode="rt_sequence",
-            gain_type="amplitude",
-            sample_mode="all_chirps",
-            reference_component="human_touch",
-            alignment="same_index",
-            keep_rt_baseline=False,
-            rt_retrace_once_per_frame=True,
-        )
+        calibration_config = POCalibrationConfig(mode="none")
 
+    if (calibration_config.mode != "none"
+            and calibration_config.reference_component != "single_human_only"):
+        raise ValueError(
+            "Hybrid human-only PO calibration requires reference_component="
+            "'single_human_only'; environment coupling is synthesized separately"
+        )
     raw_calibration_config = replace(calibration_config, mode="none")
     if human_po_config is None:
         human_po_config = HumanPOMobilityConfig(
@@ -2575,7 +2036,8 @@ def run_calibrated_hybrid_po(
             blocking_ray_epsilon_m=1e-5,
             blocking_ray_chunk_size=65536,
             coupling_enabled=False,
-            coupling_max_reflectors=0,
+            coupling_power_threshold_db=coupling_power_threshold_db,
+            coupling_max_reflectors=coupling_max_reflectors,
             coupling_min_reflector_area_m2=1e-4,
             coupling_reflection_scale=coupling_reflection_scale,
             human_po_config=human_po_config,
@@ -2594,6 +2056,7 @@ def run_calibrated_hybrid_po(
             blocking_ray_epsilon_m=1e-5,
             blocking_ray_chunk_size=65536,
             coupling_enabled=coupling_enabled,
+            coupling_power_threshold_db=coupling_power_threshold_db,
             coupling_max_reflectors=coupling_max_reflectors,
             coupling_min_reflector_area_m2=1e-4,
             coupling_reflection_scale=coupling_reflection_scale,
@@ -2658,6 +2121,10 @@ def run_calibrated_hybrid_po(
             targets=[calibration_target],
             simulator=calibration_simulator,
             num_frames=calibration_frame_stop - calibration_frame_start,
+            calibration_reference_component=(
+                calibration_config.reference_component
+                if calibration_config.mode == "rt_sequence" else None
+            ),
         )
         calibration_result = _shift_rt_result_times(
             calibration_result,
@@ -2891,8 +2358,10 @@ def run_calibrated_hybrid_po(
             "coupling_reflector_count": int(
                 static_pass.reflector_bank.vertices.shape[0]
             ),
-            "coupling_candidate_source": "static_rt_paths",
+            "coupling_candidate_source": "scene_geometry_image_source_power",
+            "coupling_power_threshold_db": hybrid_config.coupling_power_threshold_db,
             "coupling_max_reflectors": int(hybrid_config.coupling_max_reflectors),
+            "reflector_selection": getattr(static_pass.reflector_bank, "selection_metadata", None),
             "po_calibration_gain": po_calibration.get(
                 "human_po_amplitude_gain",
                 1.0,
@@ -2901,6 +2370,10 @@ def run_calibrated_hybrid_po(
         {"reason": "po_calibration", **po_calibration},
     ]
     metadata = SensingMetadata(
+        adc_if_filter=merge_if_filter_diagnostics(
+            human_po=raw_human_cube.metadata.adc_if_filter,
+            static=getattr(static_simulator, "adc_if_filter", {}),
+            coupling=getattr(coupling_simulator, "adc_if_filter", {})),
         events=events,
         path_counts=path_counts,
         max_displacements=raw_human_cube.metadata.max_displacements,

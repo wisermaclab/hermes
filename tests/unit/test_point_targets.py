@@ -6,7 +6,7 @@
 import numpy as np
 import pytest
 
-from mmWaveRadar.dsp import range_fft
+from mmWaveRadar.dsp import mvdr_pseudospectrum, range_fft
 from mmWaveRadar.radar import RadarHardware
 from mmWaveRadar.simulation.point_targets import (
     PointTarget,
@@ -201,10 +201,10 @@ def test_range_resolved_angle_fft_preserves_multiple_chirp_snapshots():
         angle_fft_size=(4, 4),
     )
 
-    assert result["range_cube"].shape[:2] == (2, fmcw.num_adc_samples // 2)
+    assert result["range_cube"].shape[:2] == (2, fmcw.num_adc_samples)
     assert result["angle"]["map"].shape[:2] == (
         2,
-        fmcw.num_adc_samples // 2,
+        fmcw.num_adc_samples,
     )
     assert not np.array_equal(
         result["angle"]["map"][0],
@@ -253,6 +253,33 @@ def test_range_resolved_angle_fft_uses_virtual_ura_y_z_spacing():
     assert result["angle"]["v"][v_index] == pytest.approx(target_v)
     assert result["grid_metadata"]["spacing_y_lambda"] == pytest.approx(0.25)
     assert result["grid_metadata"]["spacing_z_lambda"] == pytest.approx(0.75)
+
+
+def test_synthesized_adc_and_steering_estimators_share_angle_sign():
+    hardware = RadarHardware.from_virtual_ura(rows=1, cols=8, wavelength=0.005)
+    fmcw = make_point_target_fmcw_config(
+        carrier_frequency=60.0e9,
+        num_tx=hardware.num_tx,
+    )
+    synthesis = synthesize_virtual_center_point_targets(
+        hardware,
+        fmcw,
+        [PointTarget(1.4, 20.0, 0.0)],
+        include_channel_phase=False,
+    )
+    rt, ranges_m = range_fft(synthesis.adc[None, :, :], fmcw=fmcw, window=None)
+    snapshot = rt[0, int(np.argmin(np.abs(ranges_m - 1.4)))]
+    u_axis = np.linspace(-0.8, 0.8, 401)
+
+    mvdr = mvdr_pseudospectrum(
+        snapshot[None, :],
+        hardware.virtual_channel_positions_lambda[:, 0],
+        u=u_axis,
+        diagonal_loading=1e-2,
+    )
+
+    peak_u = mvdr["u"][int(np.argmax(mvdr["map"]))]
+    assert peak_u == pytest.approx(np.sin(np.deg2rad(20.0)), abs=0.02)
 
 
 def test_virtual_snapshot_grid_maps_half_lambda_virtual_positions():

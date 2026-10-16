@@ -5,6 +5,8 @@
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 from sensing_test_helpers import *  # noqa: F401,F403
 from mmWaveRadar.tutorial_support import BEDROOM_SCENE_BOXES
 
@@ -93,7 +95,7 @@ def test_coherent_rt_path_bank_updates_dynamic_hit_phase_and_delay():
     k0 = 2.0 * pi * radar.fmcw.carrier_frequency / c
     length_delta = update.path_lengths_m[0, 0] - bank.anchor_path_lengths_m[0, 0]
     spread_ratio = bank.anchor_spread_products_m[0, 0] / update.spread_products_m[0, 0]
-    expected_dynamic = 2.0 * np.exp(1j * k0 * length_delta) * spread_ratio
+    expected_dynamic = 2.0 * np.exp(-1j * k0 * length_delta) * spread_ratio
     assert np.allclose(update.coefficients[0, 0], expected_dynamic)
     assert np.allclose(update.coefficients[0, 1], 3.0 + 0.0j)
     assert np.allclose(update.delays_s, [2.2 / c, 2.0 / c])
@@ -289,7 +291,7 @@ def test_coherent_rt_path_update_matches_multichannel_reference_geometry():
     update = update_coherent_rt_path_bank(bank, (moved_vertices,))
 
     expected_phase = np.exp(
-        1j * 2.0 * pi * bank.frequency_hz / c
+        -1j * 2.0 * pi * bank.frequency_hz / c
         * (expected_lengths - anchor_lengths)
     )
     expected_coefficients = (
@@ -408,7 +410,10 @@ def test_extract_rt_reflector_bank_uses_static_path_metadata():
     class FakeObject:
         object_id = 7
         mi_mesh = mesh
-        radio_material = PhysicalOpticsMaterial(1.0, 0.0, model="pec")
+        radio_material = SimpleNamespace(
+            relative_permittivity=4., conductivity=.1, thickness=.05,
+            scattering_coefficient=.6,
+        )
 
     class FakeScene:
         objects = {"reflector": FakeObject()}
@@ -435,10 +440,34 @@ def test_extract_rt_reflector_bank_uses_static_path_metadata():
     assert np.array_equal(reflectors.path_indices, [0])
     assert np.array_equal(reflectors.face_indices, [0])
     assert np.allclose(reflectors.reflection_gains, [1.0 + 0.0j])
+    np.testing.assert_allclose(reflectors.specular_amplitude_scales, [.8])
     assert reflectors.object_names == ("reflector",)
 
 
-def test_extract_rt_reflector_bank_derives_reflection_gain_from_static_rt():
+def test_free_space_deembedding_matches_real_sionna_cir():
+    from mmWaveRadar.simulation.env_human_coupling import _rt_calibrated_reflection_gain
+
+    radar = _phase_one_radar(num_chirps=1)
+    simulator = MmWaveRadarSimulator(
+        samples_per_src=100, max_num_paths_per_src=100, max_depth=1,
+        compute_backend="numpy",
+    )
+    for distance in (1.0, 1.0 + radar.fmcw.wavelength / 8):
+        scene = load_scene()
+        _, rx = radar.configure_scene(scene)
+        rx.position = (distance, 0., 0.)
+        paths = simulator.trace_scene(scene)
+        bank = extract_static_path_bank(paths, radar)
+        path_index = int(np.flatnonzero(bank.valid)[0])
+        gain = _rt_calibrated_reflection_gain(
+            bank, path_index, frequency_hz=radar.fmcw.carrier_frequency,
+        )
+        # The unity LOS factor must not acquire a distance-dependent phase.
+        np.testing.assert_allclose(gain, 1.0 + 0.0j, atol=2e-3, rtol=0.)
+
+
+@pytest.mark.parametrize("hardware_gain", [None, 1e-4, 2.0j])
+def test_extract_rt_reflector_bank_derives_reflection_gain_from_static_rt(hardware_gain):
     tri = _triangle_from_yz(
         -0.5,
         (-1.0, -1.0),
@@ -469,10 +498,11 @@ def test_extract_rt_reflector_bank_derives_reflection_gain_from_static_rt():
     path_length_m = 2.0
     wavelength_m = 299792458.0 / frequency_hz
     free_space = wavelength_m / (4.0 * np.pi * path_length_m)
-    free_space *= np.exp(1j * 2.0 * np.pi * path_length_m / wavelength_m)
+    free_space *= np.exp(-1j * 2.0 * np.pi * path_length_m / wavelength_m)
     expected_gain = 0.25 - 0.1j
+    propagation = np.array([[expected_gain * free_space]], dtype=np.complex128)
     bank = StaticPathBank(
-        coefficients=np.array([[expected_gain * free_space]], dtype=np.complex128),
+        coefficients=propagation * (1.0 if hardware_gain is None else hardware_gain),
         delays_s=np.array([path_length_m / 299792458.0], dtype=float),
         valid=np.array([True], dtype=bool),
         segment_starts=np.zeros((0, 3), dtype=float),
@@ -482,6 +512,7 @@ def test_extract_rt_reflector_bank_derives_reflection_gain_from_static_rt():
         path_interactions=np.array([[InteractionType.SPECULAR]], dtype=np.uint32),
         path_objects=np.array([[7]], dtype=np.uint32),
         path_primitives=np.array([[0]], dtype=np.uint32),
+        propagation_coefficients=None if hardware_gain is None else propagation,
     )
 
     reflectors = extract_rt_reflector_bank(
@@ -1098,7 +1129,7 @@ def test_periodic_retrace_transition_counts_only_same_frame_pairs():
 
 
 def test_rt_coherent_bank_updates_adc_between_frame_retraces():
-    fmcw = FMCWConfig(carrier_frequency=60e9, slope=1e12,
+    fmcw = FMCWConfig(carrier_frequency=60e9, slope=1e10,
                       chirp_duration=1e-3, chirp_repetition_time=0.5,
                       sampling_frequency=1e3, num_adc_samples=1,
                       num_chirps_per_frame=3, frame_period=2.0)
@@ -1192,7 +1223,7 @@ def test_rt_coherent_bank_updates_adc_between_frame_retraces():
 
 
 def test_rt_baseline_helper_uses_coherent_bank_mode():
-    fmcw = FMCWConfig(carrier_frequency=60e9, slope=1e12,
+    fmcw = FMCWConfig(carrier_frequency=60e9, slope=1e10,
                       chirp_duration=1e-3, chirp_repetition_time=0.5,
                       sampling_frequency=1e3, num_adc_samples=1,
                       num_chirps_per_frame=3, frame_period=2.0)
@@ -1265,17 +1296,22 @@ def test_rt_baseline_helper_uses_coherent_bank_mode():
         targets=[target],
         simulator=sim,
         num_frames=1,
+        calibration_reference_component="single_human_only",
     )
 
     slow_adc = result.cube.adc[0, :, 0, 0]
     assert sim.trace_count == 1
     assert result.cube.metadata.mode == "rt_baseline"
     assert result.cube.metadata.events[0]["coherent_path_update"] is True
+    np.testing.assert_allclose(
+        result.reference_adc_power["single_human_only"],
+        np.mean(np.abs(result.cube.adc) ** 2, axis=2),
+    )
     assert np.linalg.norm(slow_adc - slow_adc[0]) > 1e-6
 
 
 def test_rt_baseline_calibration_forces_coherent_bank_from_hybrid_mode():
-    fmcw = FMCWConfig(carrier_frequency=60e9, slope=1e12,
+    fmcw = FMCWConfig(carrier_frequency=60e9, slope=1e10,
                       chirp_duration=1e-3, chirp_repetition_time=0.5,
                       sampling_frequency=1e3, num_adc_samples=1,
                       num_chirps_per_frame=3, frame_period=2.0)

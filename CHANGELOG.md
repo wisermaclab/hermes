@@ -127,6 +127,68 @@ All notable changes to HERMES will be recorded in this file.
 
 ### Fixed
 
+- Fixed authenticated Chrome WebSocket connections when Fetch Metadata is
+  omitted on an upgrade, while retaining signed-cookie and Origin checks.
+- Fixed the theme button's unmounted path references and restoration callbacks
+  that could invalidate cached products. Completed workflow results now retain
+  settings fingerprints, remain visible after edits, and show named changes
+  with Rerun/Revert actions and a stale marker on the workflow tab.
+- Staged radar and solver edits behind one Apply/Cancel action, added an optional
+  active-page rerun, and kept human motion coordinates in Settings with the same
+  Apply/Cancel behavior. Dynamic simulation modes appear in two rows. Bundle
+  Comparison now explicitly identifies its bundle-owned solver settings and
+  retains selected simulation modes across theme reloads.
+- Corrected the radar summary to use sampled bandwidth, disabled Start until
+  motion is loaded, made idle Stop controls neutral, and cleared progress panes
+  on failures without double-escaping error messages.
+- Kept Start disabled during dynamic solver overlays and rejected overlapping
+  dynamic work. Stopping before the first mode completes now replaces the
+  progress pane with a stopped message while preserving any previous products.
+- Saved ADC frame, chirp, and channel selections immediately and captured their
+  current browser values before a theme reload.
+- Made Scene and motion the Dynamic Scenes landing tab on page loads and theme
+  reloads, while retaining completed products in Simulation results.
+- Restored the original workflow layout, control widths, directly visible tips
+  and overlay controls, and expanded, stacked Bundle Comparison sections. Sized tabs to
+  active content. Improved both themes,
+  section headings, 3-D axis labels, numeric precision and icon accessibility;
+  styled the launcher login page to match the GUI.
+- Redesigned the launch screen with an animated radar-scene illustration,
+  responsive HERMES branding, keyboard-friendly sign-in, and inline password
+  errors. The illustration respects reduced-motion preferences.
+- Added ordered playback controls with a frame counter, ADC frame/chirp/channel
+  selectors, readable run summaries with advanced JSON, and actionable refinement
+  warnings.
+- Fixed Tabler playback icon sizing and Reverse orientation, redrew stale tab
+  headers, labelled stale results as LAST RUN (out of date), and standardized
+  frame selectors and counters on zero-based indices. Added dark secondary
+  buttons, a secondary motion-preview action, sorted stage timings, and a sticky
+  Static Target scene.
+- Grouped position and orientation into compact numeric rows on both scene
+  pages, tightened upload and mode help spacing, and inset mode checkboxes.
+  Reverse now matches the outline Play icon. Uploaded motion previews
+  automatically; the default-motion action disappears once motion is loaded.
+- Put all three workflows on one layout. A control rail with its own scroll
+  keeps every control visible in headed groups, with a jump bar to each group.
+  Beside it, a sticky run bar shows the page title and help, the run status,
+  the Start/Stop or higher-fidelity actions, and the stale-result banner with
+  Rerun/Revert above the plots. Bundle Comparison steps moved into the rail, so
+  its plots start at the top. Narrow windows stack the rail above the run bar
+  and plots.
+- Reorganized the Settings dialog into Radar configuration, Solver settings,
+  and Motion coordinates tabs. Settings are grouped into headed sections laid
+  out in columns, each noting the workflows it affects. A Derived card keeps the
+  channel count, bandwidth, range resolution, and maximum range beside the
+  radar form. Apply, Cancel, and Apply & rerun stay pinned to the bottom of the
+  dialog. The dialog keeps one size on every tab, so switching tabs no longer
+  moves it, and a taller tab scrolls inside it.
+- Fixed an intermittent theme-switch failure that dropped restored Dynamic
+  Scenes result tabs and stale-result banners with a browser "reference isn't
+  known" error. The browser reports its saved session before the page is ready.
+  Panel then holds the restored result views unsent, and a browser message in
+  that window made Bokeh treat them as already delivered. Saved sessions and
+  uploads are now restored once the page is ready.
+
 - Added an explicit, default-off TDM acquisition policy. Simultaneous mode now
   retains every selected Tx/Rx channel at one-chirp slow-time spacing, while
   TDM mode evaluates physical transmitter slots, records per-channel sample
@@ -188,6 +250,11 @@ All notable changes to HERMES will be recorded in this file.
 
 ### Changed
 
+- Reused the direct-human PO incremental facet updater for both image-source
+  coupling directions. Coupling now caches surface terms per reflector,
+  updates phase/spreading/delay each chirp, and shares geometry-threshold and
+  receiver IF-edge refresh rules with direct-human PO. Runtime metadata counts
+  reintegrated and phase-updated coupling facets.
 - Accelerated adaptive PO without changing its numerical result by caching
   Tx-independent quadrature distances, fixed human-mesh face adjacency,
   immutable ADC fast-time tensors, and sorted incremental face-bank lookups,

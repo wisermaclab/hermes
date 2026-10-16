@@ -38,9 +38,11 @@ def analytical_array_psf(
     u_lag = _centered_lag_axis(u_axis)
     weights = _channel_weights(channel_weights, positions.shape[0])
 
+    # Beamforming conjugates the negative-phase steering vector, so the
+    # response to a direction-cosine lag has a positive spatial phase.
     if v_axis is None:
         phase = positions[:, 0, None] * u_lag[None, :]
-        response = np.sum(weights[:, None] * np.exp(-1j * 2.0 * np.pi * phase), axis=0)
+        response = np.sum(weights[:, None] * np.exp(1j * 2.0 * np.pi * phase), axis=0)
         psf = np.abs(response) ** 2
     else:
         v_lag = _centered_lag_axis(v_axis)
@@ -50,7 +52,7 @@ def analytical_array_psf(
             + positions[:, 1, None, None] * vv[None, :, :]
         )
         response = np.sum(
-            weights[:, None, None] * np.exp(-1j * 2.0 * np.pi * phase),
+            weights[:, None, None] * np.exp(1j * 2.0 * np.pi * phase),
             axis=0,
         )
         psf = np.abs(response) ** 2

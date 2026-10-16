@@ -119,10 +119,12 @@ def _parse_args() -> argparse.Namespace:
         default=True,
     )
     parser.add_argument(
-        "--coupling-max-reflectors",
-        type=int,
-        default=0,
-        help="0 means all RT single-specular reflector candidates.",
+        "--coupling-power-threshold-db", type=float, default=-20.0,
+        help="Minimum image-source power relative to the strongest candidate, in dB (<= 0).",
+    )
+    parser.add_argument(
+        "--coupling-max-reflectors", type=int, choices=range(1, 5), default=4,
+        help="Maximum retained image-source reflectors after power filtering (1-4).",
     )
     parser.add_argument("--coupling-reflection-scale", type=float, default=1.0)
     parser.add_argument("--rt-samples-per-src", type=int, default=80_000)
@@ -359,6 +361,7 @@ def main() -> int:
         ),
         po_visibility_samples_per_face=int(args.po_visibility_samples_per_face),
         coupling_enabled=bool(args.coupling_enabled),
+        coupling_power_threshold_db=float(args.coupling_power_threshold_db),
         coupling_max_reflectors=int(args.coupling_max_reflectors),
         coupling_reflection_scale=float(args.coupling_reflection_scale),
         rt_samples_per_src=int(args.rt_samples_per_src),

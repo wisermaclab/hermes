@@ -168,7 +168,7 @@ def range_doppler_map(
     if any(size == 0 for size in x.shape):
         raise ValueError("adc dimensions must be non-empty")
 
-    rt, ranges_m = range_fft(x, sampling_frequency, slope, window=win_range)
+    rt, ranges_m = range_fft(x, sampling_frequency, slope, fmcw=fmcw, window=win_range)
     if remove_mean_clutter:
         rt = remove_slow_time_mean(rt)
     wd = window_1d(rt.shape[0], win_doppler)[:, None, None]
@@ -339,6 +339,7 @@ def doppler_time_spectrum(
         x,
         sampling_frequency,
         slope,
+        fmcw=fmcw,
         window=win_range,
         nfft_mult=nfft_mult,
     )

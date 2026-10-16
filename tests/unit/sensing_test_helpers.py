@@ -45,6 +45,7 @@ from mmWaveRadar.simulation import (
     extract_rt_reflector_bank,
     extract_static_path_bank,
     fit_sequence_path_power_calibration,
+    fit_sequence_adc_calibration,
     load_radar_cube_npz,
     make_incremental_po_config,
     po_channel,
@@ -108,7 +109,7 @@ def _single_face_mesh_sequence(*, x0: float, x1: float | None = None) -> MeshSeq
 
 
 def _phase_one_radar(num_chirps: int = 3, chirp_repetition_time: float = 0.5):
-    fmcw = FMCWConfig(carrier_frequency=60e9, slope=1e12,
+    fmcw = FMCWConfig(carrier_frequency=60e9, slope=1e10,
                       chirp_duration=1e-3,
                       chirp_repetition_time=chirp_repetition_time,
                       sampling_frequency=2e3, num_adc_samples=4,

@@ -91,27 +91,28 @@ def test_bedroom_xml_geometry_matches_preview_boxes():
         ) == pytest.approx(box["translate"])
 
 
-def test_bedroom_right_wall_uses_the_metal_reflector():
+def test_bedroom_box_materials_are_derived_from_the_xml():
     scene = ET.fromstring(bedroom_scene_xml())
-    wall_material = scene.find("./bsdf[@id='mat-wall']")
-    material = scene.find("./bsdf[@id='mat-reflective-wall']")
-    right_wall = scene.find("./shape[@id='right_wall']")
-
-    assert wall_material is not None
-    assert float(
-        wall_material.find("./float[@name='scattering_coefficient']").attrib[
+    material_types = {
+        material.attrib["id"]: material.find("./string[@name='type']").attrib[
             "value"
         ]
-    ) == pytest.approx(0.2)
-    assert material is not None
-    assert material.find("./string[@name='type']").attrib["value"] == "metal"
-    assert float(
-        material.find("./float[@name='scattering_coefficient']").attrib["value"]
-    ) == pytest.approx(0.2)
-    assert right_wall is not None
-    assert right_wall.find("./ref[@name='bsdf']").attrib["id"] == (
-        "mat-reflective-wall"
-    )
+        for material in scene.findall("./bsdf")
+    }
+    shapes = {
+        shape.attrib["id"]: shape for shape in scene.findall("./shape")
+    }
+
+    for box in BEDROOM_SCENE_BOXES:
+        material_id = shapes[box["id"]].find("./ref[@name='bsdf']").attrib[
+            "id"
+        ]
+        assert box["material_id"] == material_id
+        assert box["material"] == material_types[material_id]
+
+    boxes = {box["id"]: box for box in BEDROOM_SCENE_BOXES}
+    assert boxes["floor"]["material"] == "concrete"
+    assert boxes["right_wall"]["material"] == "plasterboard"
 
 
 def test_mesh_preview_uses_fixed_legend_locations(monkeypatch):

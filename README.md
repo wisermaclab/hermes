@@ -77,6 +77,19 @@ Do not commit or redistribute these model files.
 
 ## Examples
 
+Ensure that jupyter is running within the virtual environment
+
+```bash
+$ source .venv/bin/activate
+$ realpath --relative-to . `which pip`  # check that the right `pip` is in use
+.venv/bin/pip
+$ pip install jupyter
+$ pip install jupyter_collaboration  # needed due to a bug in jupyter as of this writing
+$ source .venv/bin/activate  # reactivate the environment for jupyter
+$ realpath --relative-to . `which jupyter`  # check that the right `jupyter` is in use
+.venv/bin/jupyter
+```
+
 The notebooks are source-checkout examples. Clone the public repository, enter
 its root, and start with the data-free point-target notebook:
 
@@ -119,15 +132,74 @@ The GUI provides three workflows:
 - **Static Target** compares RT and PO for plates, corner reflectors, and
   uploaded meshes, with range, angle, and path/facet diagnostics.
 - **Dynamic Scenes** runs full or coherent RT, human-only PO, and Hybrid PO for
-  a prepared or uploaded room with AMASS-compatible motion.
+  a prepared or uploaded room with AMASS-compatible poses or evaluated mesh motion.
 - **Bundle Comparison** validates a
   [HERMES Bundle v1](https://github.com/wisermaclab/hermes/blob/main/validation/BUNDLE_SPEC.md),
   explores its ADC and DSP products, and compares them with fresh or saved
   simulations.
 
 The Settings dialog configures TI hardware, active Tx/Rx elements, the FMCW
-waveform, antenna response, and solver budgets. The radar phase center remains
+waveform, antenna response, solver budgets, and human motion coordinates. The radar phase center remains
 at `(0, 0, 0)`; scene and target positions are relative to it.
+Edits are staged until **Apply**; **Cancel**, Escape, or dismissing the dialog
+restores the previous values. **Apply & rerun this page** also starts the active
+workflow. Each settings group names the workflows that use it. Bundle Comparison
+uses the radar and solver settings in its primary bundle, independently of this
+dialog. The radar summary reports bandwidth over the sampled ADC window and its
+corresponding range resolution.
+
+Each workflow remembers the settings behind its last completed results. Editing
+those settings keeps the plots visible and shows a banner naming the changes,
+with **Rerun** and **Revert** actions. A dot on the workflow tab marks stale
+results, and exports remain disabled until the settings match or a new run
+finishes. Theme reloads retain completed results and their settings in a bounded
+server-memory cache; restarting the server clears that cache.
+Plot interaction tips and diagnostic controls remain visible alongside the plots;
+the Static Target scene stays visible while scrolling through its controls.
+Each tab fits its active content. Dynamic Scenes opens on **Scene and motion**.
+Its four simulation modes appear in two rows. Dynamic playback includes a frame
+counter, and the ADC tab provides frame, chirp and channel selection. Frame
+indices start at zero throughout the playback and result selectors. Run metadata
+shows runtime, path/facet counts and calibration status; the largest measured
+stages appear in a sorted table, with the full profile under **Advanced**.
+
+The default **PO facet integration** mode is **Adaptive analytic parent facet**.
+It splits a triangle into four children when either its centroid-linearized
+phase span exceeds **6 rad** or its edge-midpoint curvature error exceeds
+**0.005 rad**. The curvature test uses `kc/3` times the largest midpoint path
+interpolation error over all edges and Tx/Rx combinations. Each leaf uses the
+existing exact linear-phase triangle integral. Children inherit the original
+facet's visibility weight and sum coherently under its persistent identity.
+Both tolerances are configurable in **Settings → Solver settings**. The GUI
+remembers a separate phase span for each integration mode across browser
+and theme reloads; quadrature initially uses **1 rad**.
+The existing depth **3** and **64 children per parent** budgets still apply; the
+GUI reports when these limits leave facets above a tolerance. The earlier
+quadrature and Fraunhofer analytic modes remain available for comparisons.
+
+Hybrid PO uses shared static-blocking and environment-coupling passes in the
+simulator, the GUI/notebook pipeline, and cached coupling recomputation.
+Recomputation follows the same configured visibility-refresh schedule as a
+fresh run and checks cancellation between chirps and after each coupling solve.
+Direct-human PO and both coupling directions share the same incremental facet
+updater. Coupling reuses the selected image-source bank and caches surface
+contributions separately for each reflector and direction. Each chirp updates
+phase, spreading, and delay; new facets and facets exceeding the configured
+normal, centroid-displacement, or area-change thresholds are reintegrated.
+Periodic full refreshes use the human PO configuration, and facets near the
+receiver IF cutoff retain exact integration for clipping. As with direct-human
+incremental PO, reuse approximates changes in scattering between exact solves.
+Runtime counts include `hybrid_coupling_recomputed_faces` and
+`hybrid_coupling_phase_updated_faces` when coupling reuse is enabled.
+
+In **Settings → Solver settings → Image-source reflectors · Hybrid PO**, the
+power cutoff defaults to **−20 dB relative to the strongest candidate** and
+the maximum count defaults to **4** (adjustable from 1 to 4). Candidates come
+from scene geometry and are ranked by estimated coupling power toward the
+human motion volume, including reflection loss, distance, antenna response,
+and static obstruction. The cutoff is applied first, then the count cap;
+selection stays fixed throughout the run. This estimate is a selection proxy
+and does not bound the final coherent PO signal power.
 
 GUI exports are portable HERMES Bundle v1 archives containing the ADC products,
 sensor and frame metadata, scene inputs, diagnostics, and reproducible
@@ -145,9 +217,26 @@ Check optional dependencies and source-checkout fixtures with:
 hermes-gui --self-check
 ```
 
-Dynamic Scenes requires an authorized SMPL-family model configured in the GUI
-or through `MMWAVE_SMPL_MODEL_DIR`. Static Target and measurement-only bundle
-comparison do not. The public release contains no licensed body model.
+Dynamic Scenes accepts evaluated mesh motion archives containing `vertices`
+(`[frames, vertices, 3]`), `faces` (`[triangles, 3]`), and `times` (`[frames]`).
+Supplied meshes take precedence over any pose parameters in the same archive
+and do not require a body model. Pose-only archives require an authorized
+SMPL-family model configured in the GUI or through `MMWAVE_SMPL_MODEL_DIR`.
+Static Target and measurement-only bundle comparison do not require one.
+The public release contains no licensed body model. Uploading motion loads its
+preview automatically. **Load default motion** is shown only before motion is
+loaded and uses the bundled example. Both scene pages group position and
+orientation into compact numeric rows with up/down controls.
+
+In **Settings → Solver settings → Human motion coordinates**, either keep the
+file's `output_axes`/`output_signs` mapping or explicitly select its source up
+axis, forward axis, handedness, and evaluated mesh units. The manual selection
+overrides the file mapping and converts evaluated vertices to the radar frame
+(+X forward, +Y left, +Z up, metres) before applying human yaw and position.
+The preview and simulation use the same conversion, which is recorded in the
+exported experiment metadata. The source file is not modified. Local joint
+rotations are not permuted; SMPL is evaluated first, and its translations are
+expected in metres.
 
 ## Data and external models
 
@@ -269,6 +358,24 @@ fmcw = FMCWConfig(
 )
 radar = RadarSensor.from_ti_board("IWR6843AOPEVM", fmcw=fmcw)
 ```
+
+`FMCWConfig.adc_mode` defaults to `"complex1x"`. Range FFTs retain all
+`NFFT` bins in that mode, ordered by increasing range even for a negative
+chirp slope. Set `"complex2x"` or `"real"` for half-band processing.
+Synthesis applies an ideal IF cutoff before sampling: 0.9 times the sample
+rate for Complex 1x, or 0.45 for Complex 2x/real, capped by the board's analog
+bandwidth and optional `if_bandwidth_hz`. These usable-band limits follow
+the [TI interface specification](https://dr-download.ti.com/software-development/firmware/MD-074SwD074J/02.02.04.00/mmWave-Radar-Interface-Control.pdf#page=123).
+ADC mode and IF cap are also available under the GUI's FMCW settings.
+
+`cube.metadata.adc_if_filter` records tested, rejected, and partially filtered
+path-channel evaluations. For delay-resolved PO these counts refer to original
+parent facets; analytic facets crossing the cutoff are clipped and integrated
+analytically before coherent summation. Counts cover synthesis calls, including
+diagnostic/reference products, rather than distinct physical reflectors.
+Low-level `synthesize_adc_from_paths(..., diagnostics=counts)` can accumulate
+the same information in a caller-owned dictionary. Existing sampled ADC cannot
+be unaliased by this filter; it applies during synthesis.
 
 The default `pattern_mode="cosine30"` is data-free. Use `"none"` for scalar
 gain and phase signs only, or `"digitized"` with an authorized archive selected

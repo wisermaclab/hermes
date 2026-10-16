@@ -340,6 +340,8 @@ def _fmcw_from_mapping(
         ),
         num_tx=num_tx,
         tdm_enabled=tdm_enabled,
+        adc_mode=str(data.get("adc_mode", "complex1x")),
+        if_bandwidth_hz=data.get("if_bandwidth_hz"),
     )
 
 

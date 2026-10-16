@@ -1,7 +1,13 @@
 # SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
 # Copyright (c) 2026 Wireless System Research Group, McMaster University
 
-"""FFT angle spectrum helpers."""
+"""FFT angle spectrum helpers.
+
+ADC snapshots follow the ``tx(t) * conj(rx(t))`` mixer convention shared by the
+simulator and TI hardware, so a source at direction cosine ``u`` gives element
+phases ``exp(-j 2 pi p u)``. The spatial transforms below therefore use the
+unscaled inverse DFT, which peaks at the physical ``+u`` on unchanged axes.
+"""
 
 from __future__ import annotations
 
@@ -84,8 +90,8 @@ def angle_map_2d_fft(
     wz = window_1d(nz, window)
     wy = window_1d(ny, window)
     spec = np.fft.fftshift(
-        np.fft.fft2(x_ura * (wz[:, None] * wy[None, :]),
-                    s=(nfft_z, nfft_y), axes=(-2, -1)),
+        np.fft.ifft2(x_ura * (wz[:, None] * wy[None, :]),
+                     s=(nfft_z, nfft_y), axes=(-2, -1), norm="forward"),
         axes=(-2, -1))
     fy = np.fft.fftshift(
         np.fft.fftfreq(nfft_y, d=wavelength * spacing_y)
@@ -153,8 +159,9 @@ def angle_map_fft(
         nfft = ny if fft_size is None else (
             int(fft_size) if isinstance(fft_size, int) else int(fft_size[1]))
         wy = window_1d(ny, window)
-        spec = np.fft.fftshift(np.fft.fft(x_array * wy, n=nfft, axis=-1),
-                               axes=(-1,))
+        spec = np.fft.fftshift(
+            np.fft.ifft(x_array * wy, n=nfft, axis=-1, norm="forward"),
+            axes=(-1,))
         fy = np.fft.fftshift(
             np.fft.fftfreq(nfft, d=wavelength * spacing_y)
         )
@@ -169,7 +176,8 @@ def angle_map_fft(
             int(fft_size) if isinstance(fft_size, int) else int(fft_size[0]))
         wz = window_1d(nz, window)
         spec = np.fft.fftshift(
-            np.fft.fft(x_array * wz[:, None], n=nfft, axis=-2),
+            np.fft.ifft(x_array * wz[:, None], n=nfft, axis=-2,
+                        norm="forward"),
             axes=(-2,))
         fz = np.fft.fftshift(
             np.fft.fftfreq(nfft, d=wavelength * spacing_z)

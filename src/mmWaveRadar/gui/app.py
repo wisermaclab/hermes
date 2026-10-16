@@ -18,6 +18,7 @@ import queue
 import secrets
 import threading
 from tempfile import TemporaryDirectory
+from types import SimpleNamespace
 import xml.etree.ElementTree as ET
 import zipfile
 
@@ -37,6 +38,7 @@ from ..experiments import (
     load_amass_motion,
     load_scene_xml,
     material_preset_parameters,
+    motion_source_to_radar_transform,
     prepare_human_room_preview,
     prepared_room_boxes,
     run_human_room_diagnostics,
@@ -61,7 +63,10 @@ from ..simulation import (
     calibrate_range_cube_channel_phase,
     virtual_snapshot_grid,
 )
+from ..simulation.physical_optics import default_phase_span_scale_rad
+from ..radar.adc import if_cutoff_hz
 from ..targets import MeshSequence
+from ..tutorial_support import bedroom_scene_xml_for_boxes
 
 
 _APP_CSS = """
@@ -96,24 +101,6 @@ h3 { font-size: 20px !important; }
   padding: 12px 18px !important;
 }
 
-.hermes-hero {
-  border-bottom: 1px solid var(--hermes-border);
-  margin-bottom: 14px;
-  padding: 4px 2px 14px 2px;
-}
-
-.hermes-hero p {
-  color: var(--hermes-text);
-  font-size: 17px !important;
-  margin-bottom: 0;
-}
-
-.hermes-hero-no-rule {
-  border-bottom: 0 !important;
-  margin-bottom: 6px;
-  padding-bottom: 4px;
-}
-
 .hermes-callout {
   background: rgba(56, 189, 248, 0.09);
   border: 1px solid rgba(56, 189, 248, 0.28);
@@ -122,16 +109,10 @@ h3 { font-size: 20px !important; }
   padding: 12px 14px;
 }
 
-.hermes-compact-hint p {
+.hermes-compact-hint p, :host(.hermes-compact-hint) p {
   font-size: 14px !important;
   line-height: 1.35;
   margin: 0;
-}
-
-.hermes-control-card {
-  border: 1px solid var(--hermes-border);
-  border-radius: 10px;
-  box-shadow: 0 12px 30px rgba(0, 0, 0, 0.18);
 }
 
 .hermes-status {
@@ -153,6 +134,11 @@ h3 { font-size: 20px !important; }
  * so Markdown panes remain readable without changing the dark theme.
  */
 .hermes-theme-light {
+  --hermes-panel: #ffffff;
+  --hermes-link: #0369a1;
+  --hermes-link-tint: rgba(3, 105, 161, 0.12);
+  --code-text-color: #075985;
+  --code-bg-color: #e8eff5;
   --hermes-text: #172033;
   --neutral-foreground-rest: #172033;
   --design-background-text-color: #172033;
@@ -160,13 +146,340 @@ h3 { font-size: 20px !important; }
 }
 
 .hermes-theme-dark {
+  --hermes-panel: #1f242b;
+  --hermes-link: #38bdf8;
+  --hermes-link-tint: rgba(56, 189, 248, 0.14);
   --hermes-text: #e7eef8;
   --neutral-foreground-rest: #e7eef8;
   --design-background-text-color: #e7eef8;
   color: #e7eef8;
 }
 
+.hermes-theme-light .bk-btn-light {
+  background: #e2e8f0 !important;
+  color: #172033 !important;
+  border: 1px solid #94a3b8 !important;
+}
+
+/*
+ * Settings dialog: one fixed size for every tab, so switching tabs never moves
+ * the dialog, its tabs, or its Apply/Cancel footer. A taller tab scrolls
+ * inside the content box; a shorter one leaves the footer at the bottom.
+ */
+fast-dialog#pn-Modal {
+  --dialog-height: min(980px, calc(100vh - 32px));
+  --dialog-width: min(1040px, calc(100vw - 32px));
+}
+
+/* The template places the close button for its default 80% width. */
+#pn-Modal .pn-modal-close {
+  margin-top: 12px;
+  right: calc((100% - min(1040px, 100% - 32px)) / 2 + 12px);
+}
+
+#pn-Modal .pn-modal-content {
+  height: 100%;
+  margin: 0 auto;
+  max-width: min(980px, calc(100vw - 48px));
+  overflow-x: hidden;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+}
+
+.hermes-settings { min-height: min(980px, calc(100vh - 32px)); }
+
+.hermes-settings-title {
+  font-size: 24px;
+  font-weight: 650;
+  line-height: 1.25;
+  padding-top: 8px;
+}
+
+.hermes-settings-sub {
+  font-size: 14px !important;
+  margin: 4px 0 6px;
+  opacity: 0.78;
+}
+
+.hermes-settings-note p, :host(.hermes-settings-note) p {
+  margin: 4px 0;
+  opacity: 0.8;
+}
+
+.hermes-settings-section {
+  border-top: 1px solid var(--hermes-border);
+  padding: 8px 0 4px;
+}
+
+.hermes-section-head {
+  align-items: baseline;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 2px 12px;
+  justify-content: space-between;
+}
+
+.hermes-used-by {
+  font-size: 12.5px;
+  opacity: 0.65;
+}
+
+.hermes-settings-grid {
+  align-items: end;
+  display: grid;
+}
+
+.hermes-settings-cols-2 { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+.hermes-settings-cols-3 { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+.hermes-settings-cols-4 { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+
+.hermes-settings-wide { grid-column: span 2; }
+
+.hermes-settings-split {
+  align-items: flex-start;
+  gap: 16px;
+}
+
+.hermes-settings-readout {
+  background: var(--hermes-panel);
+  border: 1px solid var(--hermes-border);
+  border-left: 4px solid var(--hermes-link);
+  border-radius: 10px;
+  padding: 8px 2px;
+  position: sticky;
+  top: 12px;
+}
+
+.hermes-settings-footer {
+  align-items: center;
+  background: var(--hermes-panel);
+  border-top: 1px solid var(--hermes-border);
+  bottom: 0;
+  gap: 10px;
+  margin-top: auto;
+  padding: 10px 8px;
+  position: sticky;
+  z-index: 5;
+}
+
+@media (max-width: 860px) {
+  .hermes-settings-split {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .hermes-settings-readout {
+    max-width: none !important;
+    min-width: 0 !important;
+    position: static;
+  }
+}
+
+@media (max-width: 640px) {
+  .hermes-settings-grid { grid-template-columns: minmax(0, 1fr); }
+  .hermes-settings-wide { grid-column: auto; }
+}
+
+/*
+ * Workflow template: a control rail with its own scroll beside a work column.
+ * The work column starts with a sticky run bar, so the run state and actions
+ * stay visible while the plots scroll. Nothing in the rail collapses.
+ */
+.hermes-page {
+  align-items: flex-start;
+  gap: 20px;
+}
+
+.hermes-rail {
+  background: var(--hermes-panel);
+  border: 1px solid var(--hermes-border);
+  border-radius: 10px;
+  max-height: calc(100vh - 92px);
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  position: sticky;
+  scrollbar-gutter: stable;
+  top: 0;
+}
+
+.hermes-rail-nav {
+  background: var(--hermes-panel);
+  border-bottom: 1px solid var(--hermes-border);
+  position: sticky;
+  top: 0;
+  z-index: 3;
+}
+
+.hermes-rail-nav-links {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 2px;
+  padding: 8px 10px;
+}
+
+.hermes-rail-nav-links button {
+  background: none;
+  border: 0;
+  border-radius: 6px;
+  color: inherit;
+  cursor: pointer;
+  font: inherit;
+  font-size: 14px;
+  opacity: 0.72;
+  padding: 4px 9px;
+  white-space: nowrap;
+}
+
+.hermes-rail-nav-links button:hover { opacity: 1; }
+
+.hermes-rail-nav-links button[aria-current="true"] {
+  background: var(--hermes-link-tint);
+  color: var(--hermes-link);
+  font-weight: 650;
+  opacity: 1;
+}
+
+.hermes-rail-nav-links button:focus-visible {
+  outline: 2px solid var(--hermes-link);
+  outline-offset: 1px;
+}
+
+.hermes-group {
+  border-bottom: 1px solid var(--hermes-border);
+  padding: 8px 0 10px;
+  transition: background-color 0.6s ease;
+}
+
+.hermes-group:last-child { border-bottom: 0; }
+
+.hermes-group-flash {
+  background: var(--hermes-link-tint);
+  transition: none;
+}
+
+.hermes-group-title, .hermes-card-title {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12px;
+  font-weight: 650;
+  letter-spacing: 0.09em;
+  opacity: 0.75;
+  padding-top: 2px;
+  text-transform: uppercase;
+}
+
+.hermes-runbar {
+  background: var(--hermes-panel);
+  border: 1px solid var(--hermes-border);
+  border-left: 4px solid var(--hermes-link);
+  border-radius: 10px;
+  box-shadow: 0 12px 24px -20px rgba(0, 0, 0, 0.6);
+  padding: 4px 6px 4px 8px;
+  position: sticky;
+  top: 0;
+  z-index: 5;
+}
+
+.hermes-runbar-stale { border-left-color: #d69e2e; }
+
+.hermes-runbar-banner {
+  align-items: center;
+  flex-direction: row;
+  flex-wrap: wrap;
+  gap: 0 12px;
+}
+
+.hermes-banner-text {
+  flex: 1 1 320px;
+  min-width: 0;
+  width: auto !important;
+}
+
+.hermes-banner-actions {
+  flex: 0 0 auto;
+  width: auto !important;
+}
+
+.hermes-runbar-heading, .hermes-runbar-status {
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 4px 10px;
+}
+
+.hermes-runbar-title {
+  font-size: 22px;
+  font-weight: 650;
+  line-height: 1.25;
+  white-space: nowrap;
+}
+
+.hermes-runbar-sub {
+  font-size: 15px !important;
+  margin: 0;
+  opacity: 0.78;
+}
+
+.hermes-work, .hermes-workspace { min-width: 0; }
+
+/* Contain Plotly's high z-index mode bars below the sticky run bar. */
+.hermes-workspace { isolation: isolate; }
+
+.hermes-card {
+  background: var(--hermes-panel);
+  border: 1px solid var(--hermes-border);
+  border-radius: 10px;
+  min-width: 0;
+  padding: 6px 4px;
+}
+
+@media (max-width: 1100px) {
+  /* Panel propagates the rail and button widths as minimums; drop them. */
+  .hermes-page, .hermes-theme-dark, .hermes-theme-light {
+    min-width: 0 !important;
+  }
+
+  .hermes-page {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  /* The run bar leads, pinned on top; the controls and then the plots follow. */
+  .hermes-work { display: contents; }
+
+  .hermes-runbar { order: -1; }
+
+  /* Stretch-width children use a zero flex basis; in a column it would
+     collapse their height, so the stacked blocks size to their content. */
+  .hermes-rail, .hermes-runbar, .hermes-workspace {
+    align-self: stretch !important;
+    flex: 0 0 auto !important;
+    height: auto !important;
+  }
+
+  .hermes-rail {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    max-height: none;
+    max-width: none !important;
+    min-width: 0 !important;
+    overflow: visible;
+    position: static;
+    width: auto !important;
+  }
+
+  .hermes-rail-nav { display: none; }
+}
+
+@media (max-width: 700px) {
+  .hermes-rail { grid-template-columns: minmax(0, 1fr); }
+}
+
 """
+
+# Rail and Settings controls use a smaller type size so groups stay compact.
+_COMPACT_CONTROL_CSS = (
+    "label, .bk-input, .bk-btn, p, li {font-size:14px !important;} "
+    "label {line-height:1.3; white-space:normal !important;}"
+)
 
 _HERMES_ICON_PNG = base64.b64decode(
     "iVBORw0KGgoAAAANSUhEUgAAALQAAAC0CAYAAAA9zQYyAAACkElEQVR42u3cMa6C"
@@ -192,7 +505,7 @@ _MAX_DROPPED_FILES = 1024
 _MAX_DROPPED_FILE_BYTES = 256 * _MIB
 _MAX_DROPPED_TOTAL_BYTES = 512 * _MIB
 _MAX_STATIC_MESH_UPLOAD_BYTES = 64 * _MIB
-_MAX_MOTION_UPLOAD_BYTES = 64 * _MIB
+_MAX_MOTION_UPLOAD_BYTES = 128 * _MIB
 _MAX_SCENE_XML_UPLOAD_BYTES = 2 * _MIB
 _MAX_GUI_OBJ_LINE_BYTES = 4 * _MIB
 _MAX_GUI_OBJ_VERTICES = 2_000_000
@@ -277,9 +590,50 @@ def _preflight_gui_mesh_obj(payload: bytes) -> None:
 
 
 def _preflight_gui_motion_npz(payload: bytes) -> None:
-    """Reject oversized or malformed browser AMASS arrays before allocation."""
+    """Validate browser pose or mesh motion arrays before allocation."""
 
     arrays = preflight_npz(payload, limits=GUI_NPZ_LIMITS)
+    if "vertices" in arrays:
+        vertices = require_array(
+            arrays,
+            "vertices",
+            allowed_ndim=(3,),
+            dtype_kinds=frozenset({"i", "u", "f"}),
+            trailing_shape=(3,),
+            max_elements=30_000_000,
+            max_bytes=128 * _MIB,
+        )
+        require_array(
+            arrays,
+            "faces",
+            allowed_ndim=(2,),
+            dtype_kinds=frozenset({"i", "u"}),
+            trailing_shape=(3,),
+            max_elements=6_000_000,
+            max_bytes=32 * _MIB,
+        )
+        timing_key = next(
+            (key for key in ("bundle_times", "times") if key in arrays), None
+        )
+        if timing_key is not None:
+            timing = require_array(
+                arrays,
+                timing_key,
+                allowed_ndim=(1,),
+                dtype_kinds=frozenset({"i", "u", "f"}),
+                max_elements=10_000_000,
+            )
+            if timing.shape != (vertices.shape[0],):
+                raise ValueError("mesh motion times must match its frame count")
+        else:
+            require_array(
+                arrays,
+                "mocap_framerate",
+                allowed_ndim=(0, 1),
+                dtype_kinds=frozenset({"i", "u", "f"}),
+                max_elements=1,
+            )
+        return
     poses = require_array(
         arrays,
         "poses",
@@ -475,7 +829,7 @@ def _materialize_dropped_files(
     return destination
 
 
-def _file_input_stylesheet(plot_template: str) -> str:
+def _file_input_stylesheet(plot_template: str, *, compact: bool = True) -> str:
     """Style a clipped native file chooser consistently in both themes."""
 
     if plot_template == "plotly_dark":
@@ -492,6 +846,15 @@ def _file_input_stylesheet(plot_template: str) -> str:
             "#172033",
             "#94a3b8",
         )
+    if not compact:
+        return f"""
+input[type=file] {{background: {background}; color: {foreground}; max-width:100%;}}
+input[type=file]::file-selector-button {{
+  background:{background}; color:{foreground}; border:1px solid {border};
+  border-radius:6px; padding:7px 12px; margin-right:8px;
+}}
+input[type=file]::file-selector-button:hover {{background:{hover};}}
+"""
     return f"""
 :host {{
   overflow: hidden !important;
@@ -607,6 +970,13 @@ _PLOT_FONT_FAMILY = (
 # The negative-y component makes increasing range (+x) read left-to-right on
 # screen, while the negative-x component keeps front-facing plates visible.
 _SCENE_CAMERA_EYE = {"x": -1.45, "y": -1.55, "z": 0.80}
+_PO_POWER_LIGHTING = {
+    "ambient": 1.0,
+    "diffuse": 0.0,
+    "specular": 0.0,
+    "roughness": 1.0,
+    "fresnel": 0.0,
+}
 
 _HUMAN_ROOM_MODE_LABELS = {
     "full_rt": "Full RT",
@@ -621,13 +991,21 @@ _HUMAN_ROOM_MODE_HELP = {
     ),
     "human_only_po": "Human-only PO excludes environment channels.",
     "hybrid_po": (
-        "Hybrid PO includes blocking, coupling, and coherent-RT sequence "
-        "calibration."
+        "Hybrid PO includes blocking and coupling with absolute, "
+        "uncalibrated PO amplitudes."
     ),
 }
 
 _SOLVER_SETTINGS_SCHEMA_VERSION = 1
 _SOLVER_SETTINGS_STORAGE_KEY = "hermes.solver-settings.v1"
+_PO_DEFAULTS_VERSION = 3
+_PO_INTEGRATION_MODES = (
+    "parent_face_quadrature",
+    "parent_face_adaptive_analytic",
+    "parent_face_far_field_analytic",
+    "face_centroid",
+)
+_IMAGE_SOURCE_SELECTION_VERSION = 1
 _GUI_SESSION_STORAGE_KEY = "hermes.gui-session.v1"
 _GUI_SESSION_DB_NAME = "hermes-gui-session-v1"
 _GUI_SESSION_DB_STORE = "uploads"
@@ -638,10 +1016,13 @@ _THEME_GUI_RESULT_CACHE_MAX_ENTRIES = 4
 _THEME_GUI_RESULT_CACHE: OrderedDict[str, dict[str, object]] = OrderedDict()
 _THEME_GUI_RESULT_CACHE_LOCK = threading.Lock()
 _SOLVER_SETTINGS_DEFAULTS = {
-    "po_integration_mode": "parent_face_quadrature",
-    "po_quadrature_phase_span_scale_rad": 1.0,
-    "po_quadrature_max_refinement_depth": 2,
-    "po_quadrature_max_subfaces_per_parent": 16,
+    "po_integration_mode": "parent_face_adaptive_analytic",
+    "po_quadrature_phase_span_scale_rad": 6.0,
+    "po_curvature_error_rad": 0.005,
+    "po_quadrature_max_refinement_depth": 3,
+    "po_quadrature_max_subfaces_per_parent": 64,
+    "coupling_power_threshold_db": -20.0,
+    "coupling_max_reflectors": 4,
     "rt_samples_per_source": 100_000,
     "rt_max_paths_per_source": 5_000,
     "rt_max_depth": 3,
@@ -672,12 +1053,44 @@ _RT_SOLVER_SETTING_HELP = {
 }
 _SOLVER_SETTINGS_NUMERIC_BOUNDS = {
     "po_quadrature_phase_span_scale_rad": (0.05, 20.0, False),
-    "po_quadrature_max_refinement_depth": (0, 8, True),
+    "po_curvature_error_rad": (0.000001, 10.0, False),
+    "po_quadrature_max_refinement_depth": (0, 16, True),
     "po_quadrature_max_subfaces_per_parent": (0, 4096, True),
+    "coupling_power_threshold_db": (-120.0, 0.0, False),
+    "coupling_max_reflectors": (1, 4, True),
     "rt_samples_per_source": (100, 2_000_000, True),
     "rt_max_paths_per_source": (100, 2_000_000, True),
     "rt_max_depth": (1, 10, True),
 }
+
+
+def _human_room_running_status(progress: dict) -> str:
+    """Describe the current solver pass, frame, and chirp."""
+
+    mode = progress.get("simulation_mode")
+    mode_label = _HUMAN_ROOM_MODE_LABELS.get(
+        mode, str(mode).replace("_", " ").title()
+    )
+    parts = [f"**RUNNING** · {mode_label}"]
+    solver_mode = progress.get("solver_mode")
+    if solver_mode == "setup":
+        return " · ".join([*parts, "Preparing"])
+    if mode == "hybrid_po":
+        pass_label = {
+            "human_only_po": "Human PO",
+            "hybrid_static_environment": "Static environment",
+            "hybrid_coupling": "Human/environment coupling",
+        }.get(solver_mode)
+        if pass_label is not None:
+            parts.append(pass_label)
+    frame_index = max(int(progress.get("frame_index", 0)), 0)
+    num_frames = max(int(progress.get("num_frames", 1)), 1)
+    parts.append(f"frame {min(frame_index + 1, num_frames)}/{num_frames}")
+    if "chirp_index" in progress and "num_chirps" in progress:
+        chirp_index = max(int(progress["chirp_index"]), 0)
+        num_chirps = max(int(progress["num_chirps"]), 1)
+        parts.append(f"chirp {min(chirp_index + 1, num_chirps)}/{num_chirps}")
+    return " · ".join(parts)
 
 
 def _rounded_gui_float(value: float) -> float:
@@ -693,10 +1106,424 @@ def _safe_markdown_text(value: object) -> str:
 
 
 def _safe_markdown_code(value: object) -> str:
-    """Render untrusted text as a Markdown code span with escaped contents."""
+    """Escape once inside an inline HTML code element."""
 
     escaped = _safe_markdown_text(value).replace("`", "&#96;")
-    return f"`{escaped}`"
+    return f"<code>{escaped}</code>"
+
+
+def _fit_active_tab_height(tabs):
+    """Keep eager tab models mounted while sizing only the selected pane."""
+
+    def show_active(_event=None):
+        for index, child in enumerate(tabs):
+            child.visible = index == tabs.active
+
+    tabs.param.watch(show_active, "active")
+    show_active()
+
+
+def _readable_markdown(root, pn, plot_template):
+    tokens = _plot_theme_tokens(plot_template)
+    css = (f"code {{color:{tokens['accent']} !important; background:transparent !important;}}"
+           "h2 {font-size:27px !important;} h3 {font-size:20px !important;}")
+    for pane in root.select(pn.pane.Markdown):
+        if css not in pane.stylesheets:
+            pane.stylesheets = [*pane.stylesheets, css]
+    for card in root.select(pn.Card):
+        header = card._header  # pylint: disable=protected-access
+        if header is not None:
+            header.stylesheets = ["h3 {font-size:20px !important; line-height:1.35; margin:4px 0; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;}"]
+
+
+def _style_secondary_buttons(root, pn, plot_template):
+    dark = plot_template == "plotly_dark"
+    background, foreground, border, hover = (
+        ("#182536", "#e7eef8", "#64748b", "#26384d") if dark else
+        ("#e2e8f0", "#172033", "#94a3b8", "#cbd5e1")
+    )
+    css = f"""
+.bk-btn-light {{
+  background: {background} !important; color: {foreground} !important;
+  border: 1px solid {border} !important;
+}}
+.bk-btn-light:hover:enabled {{ background: {hover} !important; }}
+.bk-btn-light:disabled {{ opacity: 0.55; }}
+"""
+    for widget in root.select(pn.widgets.Widget):
+        if "color" in widget.param and widget.color == "light":
+            widget.stylesheets = [*widget.stylesheets, css]
+
+
+def _rail_nav_component(pn, items):
+    """Jump links that scroll the enclosing control rail to one group.
+
+    ``items`` pairs a group anchor (see ``_rail_group``) with its link label.
+    The current group is marked while the rail scrolls; nothing collapses.
+    """
+
+    import param
+
+    class RailNav(pn.reactive.ReactiveHTML):
+        items = param.List(default=[])
+
+        _template = (
+            '<nav id="nav" class="hermes-rail-nav-links" '
+            'aria-label="Jump to a group of controls"></nav>'
+        )
+        _scripts = {
+            "render": """
+const ancestor = (node, name) => {
+  while (node != null) {
+    if (node.classList?.contains(name)) return node
+    node = node instanceof ShadowRoot ? node.host : node.parentNode
+  }
+  return null
+}
+const deepFind = (root, name) => {
+  for (const element of root?.querySelectorAll?.('*') ?? []) {
+    if (element.classList.contains(name)) return element
+    if (element.shadowRoot != null) {
+      const nested = deepFind(element.shadowRoot, name)
+      if (nested != null) return nested
+    }
+  }
+  return null
+}
+state.rail = () => ancestor(nav, 'hermes-rail')
+state.bar = () => ancestor(nav, 'hermes-rail-nav')
+state.group = anchor => {
+  const rail = state.rail()
+  return rail == null ? null : deepFind(rail.shadowRoot ?? rail, 'hermes-group-' + anchor)
+}
+state.buttons = []
+nav.replaceChildren()
+for (const [anchor, label] of data.items) {
+  const button = document.createElement('button')
+  button.type = 'button'
+  button.textContent = label
+  button.dataset.anchor = anchor
+  button.addEventListener('click', () => state.jump(anchor))
+  nav.appendChild(button)
+  state.buttons.push(button)
+}
+state.mark = anchor => state.buttons.forEach((button, index) => button.setAttribute(
+  'aria-current',
+  String(anchor == null ? index === 0 : button.dataset.anchor === anchor),
+))
+// In narrow windows the rail stops scrolling and the page scrolls instead.
+state.scrolls = rail => rail != null
+  && rail.scrollHeight > rail.clientHeight + 1
+  && getComputedStyle(rail).overflowY !== 'visible'
+state.jump = anchor => {
+  const rail = state.rail()
+  const target = state.group(anchor)
+  if (target == null) return
+  state.mark(anchor)
+  state.hold = Date.now() + 700
+  const behavior = window.matchMedia('(prefers-reduced-motion: reduce)').matches
+    ? 'auto' : 'smooth'
+  if (state.scrolls(rail)) {
+    const top = rail.scrollTop + target.getBoundingClientRect().top
+      - rail.getBoundingClientRect().top - (state.bar()?.offsetHeight ?? 0)
+    rail.scrollTo({top: Math.max(0, top), behavior})
+  } else {
+    target.scrollIntoView({block: 'start', behavior})
+  }
+  target.classList.add('hermes-group-flash')
+  setTimeout(() => target.classList.remove('hermes-group-flash'), 450)
+}
+state.spy = () => {
+  const rail = state.rail()
+  if (!state.scrolls(rail) || Date.now() < (state.hold ?? 0)) return
+  const line = rail.getBoundingClientRect().top + (state.bar()?.offsetHeight ?? 0) + 16
+  let current = null
+  for (const [anchor] of data.items) {
+    const target = state.group(anchor)
+    if (target != null && target.getBoundingClientRect().top <= line) current = anchor
+  }
+  if (rail.scrollTop + rail.clientHeight >= rail.scrollHeight - 2) {
+    current = data.items[data.items.length - 1][0]
+  }
+  state.mark(current)
+}
+state.mark(null)
+state.attach = () => {
+  const rail = state.rail()
+  if (rail == null) {
+    state.timer = setTimeout(state.attach, 250)
+    return
+  }
+  state.attached = rail
+  rail.addEventListener('scroll', state.spy, {passive: true})
+}
+state.attach()
+""",
+            "remove": """
+clearTimeout(state.timer)
+state.attached?.removeEventListener('scroll', state.spy)
+""",
+        }
+
+    return RailNav(
+        items=[list(item) for item in items],
+        css_classes=["hermes-rail-nav"],
+        sizing_mode="stretch_width",
+        margin=0,
+    )
+
+
+def _rail_group(pn, anchor, title, *objects, heading=None):
+    """Group rail controls under one small, always-visible heading."""
+
+    if heading is None:
+        heading = pn.pane.HTML(
+            '<div class="hermes-group-title" role="heading" aria-level="3">'
+            f"{html.escape(title)}</div>",
+            sizing_mode="stretch_width",
+            margin=(0, 10),
+        )
+    return pn.Column(
+        heading,
+        *objects,
+        name=title,
+        sizing_mode="stretch_width",
+        margin=0,
+        css_classes=["hermes-group", f"hermes-group-{anchor}"],
+    )
+
+
+def _settings_section(pn, title, used_by, *objects):
+    """One Settings section: a small heading, the workflows it affects, controls."""
+
+    heading = pn.pane.HTML(
+        '<div class="hermes-section-head">'
+        '<span class="hermes-group-title" role="heading" aria-level="3">'
+        f"{html.escape(title)}</span>"
+        f'<span class="hermes-used-by">Used by {html.escape(used_by)}</span>'
+        "</div>",
+        sizing_mode="stretch_width",
+        margin=(0, 10),
+    )
+    return pn.Column(
+        heading,
+        *objects,
+        name=title,
+        sizing_mode="stretch_width",
+        margin=0,
+        css_classes=["hermes-settings-section"],
+    )
+
+
+def _settings_grid(pn, *widgets, columns=2):
+    """Lay settings out in a fixed number of columns so rows stay balanced."""
+
+    return pn.Column(
+        *widgets,
+        sizing_mode="stretch_width",
+        margin=0,
+        css_classes=["hermes-settings-grid", f"hermes-settings-cols-{columns}"],
+    )
+
+
+def _settings_note(pn, text):
+    """A short explanatory line at the top of a Settings tab."""
+
+    return pn.pane.Markdown(
+        text,
+        sizing_mode="stretch_width",
+        css_classes=["hermes-settings-note"],
+    )
+
+
+def _compact_controls(root, pn):
+    """Apply the smaller control type size to every control inside ``root``."""
+
+    for component in root.select(pn.viewable.Viewable):
+        if isinstance(component, (pn.widgets.Widget, pn.pane.Markdown)):
+            if _COMPACT_CONTROL_CSS not in component.stylesheets:
+                component.stylesheets = [*component.stylesheets, _COMPACT_CONTROL_CSS]
+
+
+def _run_bar(pn, *, title, subtitle, help_text, status, actions=(), banner):
+    """Sticky page header: title, help, run status, actions and stale state."""
+
+    heading = pn.Row(
+        pn.pane.HTML(
+            f'<div class="hermes-runbar-title" role="heading" aria-level="2">'
+            f"{html.escape(title)}</div>",
+            margin=(0, 4),
+            styles={"flex": "0 0 auto", "width": "max-content"},
+            stylesheets=[":host {width:max-content !important;}"],
+        ),
+        pn.widgets.TooltipIcon(
+            value=help_text, width=22, height=22, sizing_mode="fixed", margin=0,
+        ),
+        pn.pane.HTML(
+            f'<p class="hermes-runbar-sub">{html.escape(subtitle)}</p>',
+            margin=(0, 4),
+            sizing_mode="stretch_width",
+            min_width=200,
+        ),
+        sizing_mode="stretch_width",
+        margin=0,
+        css_classes=["hermes-runbar-heading"],
+    )
+    status_row = pn.Row(
+        status,
+        *actions,
+        sizing_mode="stretch_width",
+        margin=0,
+        css_classes=["hermes-runbar-status"],
+    )
+    bar = pn.Column(
+        heading,
+        status_row,
+        banner,
+        sizing_mode="stretch_width",
+        margin=0,
+        css_classes=["hermes-runbar"],
+    )
+
+    def show_stale_edge(event):
+        classes = [name for name in bar.css_classes if name != "hermes-runbar-stale"]
+        bar.css_classes = [*classes, "hermes-runbar-stale"] if event.new else classes
+
+    banner.param.watch(show_stale_edge, "visible")
+    return bar
+
+
+def _runtime_stage_table(stages):
+    """Show the largest measured stages; overlapping stages are not additive."""
+    values = []
+    for key, value in stages.items():
+        seconds = float(value)
+        if np.isfinite(seconds) and seconds > 0:
+            # rt_* entries are aliases of the legacy full_rt_* stages.
+            if key.startswith("rt_") and "full_" + key in stages:
+                continue
+            values.append((str(key), seconds))
+    if not values:
+        return ""
+    threshold = max(0.001, max(seconds for _, seconds in values) * 0.001)
+    largest = sorted((entry for entry in values if entry[1] >= threshold),
+                     key=lambda entry: (-entry[1], entry[0]))[:10]
+    if not largest:
+        return ""
+    rows = ["| Stage | Seconds |", "| --- | ---: |"]
+    for key, seconds in largest:
+        words = [word.upper() if word in {"rt", "po", "adc", "bvh", "fft"} else word
+                 for word in key.split("_")]
+        label = " ".join(words)
+        label = label[0].upper() + label[1:]
+        rows.append(f"| {_safe_markdown_text(label)} | {seconds:,.3f} |")
+    rows.append("\nLargest measured stages; overlapping timings are not additive. "
+                "Entries below 1 ms or 0.1% of the largest stage are omitted. "
+                "All stages are available under Advanced.")
+    return "\n".join(rows)
+
+
+def _modal_events_component(pn):
+    """Report native modal dismissal and label the icon-only buttons."""
+
+    import param
+
+    class ModalEvents(pn.reactive.ReactiveHTML):
+        dismissed = param.Integer(default=0)
+        _template = '<span id="events" style="display:none;"></span>'
+        _scripts = {
+            "render": """
+const modal = document.getElementById('pn-Modal')
+if (modal != null) {
+  let wasOpen = modal.style.display !== 'none' && modal.style.display !== ''
+  state.observer = new MutationObserver(() => {
+    const open = modal.style.display !== 'none' && modal.style.display !== ''
+    if (wasOpen && !open) data.dismissed += 1
+    wasOpen = open
+  })
+  state.observer.observe(modal, {attributes: true, attributeFilter: ['style']})
+  state.escape = event => {
+    if (event.key === 'Escape' && wasOpen) modal.style.display = 'none'
+  }
+  document.addEventListener('keydown', state.escape)
+}
+let attempts = 0
+state.buttonObservers = []
+const watched = new WeakSet()
+const labelButtons = () => {
+  const found = new Set()
+  const labels = {
+    'hermes-icon-settings': 'Radar and solver settings',
+    'hermes-icon-theme': 'Switch colour theme',
+    'hermes-icon-download': 'Download simulated ADC',
+  }
+  const findButton = root => {
+    const button = root.querySelector('button')
+    if (button != null) return button
+    for (const element of root.querySelectorAll('*')) {
+      if (element.shadowRoot) {
+        const nested = findButton(element.shadowRoot)
+        if (nested != null) return nested
+      }
+    }
+    return null
+  }
+  const visit = root => {
+    for (const element of root.querySelectorAll('*')) {
+      for (const [name, label] of Object.entries(labels)) {
+        if (element.classList.contains(name)) {
+          const widgetRoot = element.shadowRoot ?? element
+          const button = findButton(widgetRoot)
+          if (button != null) {
+            button.setAttribute('aria-label', label)
+            button.setAttribute('title', label)
+            found.add(name)
+            if (!watched.has(widgetRoot)) {
+              watched.add(widgetRoot)
+              const observer = new MutationObserver(() => {
+                const current = findButton(widgetRoot)
+                current?.setAttribute('aria-label', label)
+                current?.setAttribute('title', label)
+              })
+              observer.observe(widgetRoot, {childList: true, subtree: true})
+              state.buttonObservers.push(observer)
+            }
+          }
+        }
+      }
+      if (element.shadowRoot) visit(element.shadowRoot)
+    }
+  }
+  visit(document)
+  if (found.size < 3 && ++attempts < 20) state.timer = setTimeout(labelButtons, 250)
+}
+labelButtons()
+""",
+            "remove": """
+state.observer?.disconnect()
+for (const observer of state.buttonObservers ?? []) observer.disconnect()
+document.removeEventListener('keydown', state.escape)
+clearTimeout(state.timer)
+""",
+        }
+
+    return ModalEvents()
+
+
+def _result_settings_fingerprint(values: dict) -> str:
+    """Identify solver inputs independently of widget events and theme."""
+
+    def canonical(value):
+        if isinstance(value, dict):
+            return {key: canonical(item) for key, item in value.items()}
+        if isinstance(value, (list, tuple)):
+            return [canonical(item) for item in value]
+        if isinstance(value, float) and value.is_integer():
+            return int(value)
+        return value
+
+    encoded = json.dumps(canonical(values), sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
 
 def _rounded_target_size(value: float) -> float:
@@ -718,11 +1545,7 @@ def _validated_solver_settings_payload(payload: object) -> dict[str, object]:
 
     validated: dict[str, object] = {}
     integration_mode = settings.get("po_integration_mode")
-    if integration_mode in {
-        "parent_face_quadrature",
-        "parent_face_far_field_analytic",
-        "face_centroid",
-    }:
+    if integration_mode in _PO_INTEGRATION_MODES:
         validated["po_integration_mode"] = integration_mode
 
     for name, (lower, upper, integer) in _SOLVER_SETTINGS_NUMERIC_BOUNDS.items():
@@ -739,6 +1562,38 @@ def _validated_solver_settings_payload(payload: object) -> dict[str, object]:
             validated[name] = converted
         else:
             validated[name] = numeric
+    if payload.get("po_defaults_version") != _PO_DEFAULTS_VERSION:
+        # Migrate earlier GUI profiles once, then retain subsequent PO edits.
+        validated.update({
+            name: value
+            for name, value in _SOLVER_SETTINGS_DEFAULTS.items()
+            if name.startswith("po_")
+        })
+    return validated
+
+
+def _validated_po_phase_span_by_mode(payload: object) -> dict[str, float]:
+    """Return valid remembered spans from a current solver-settings payload."""
+
+    if not isinstance(payload, dict):
+        return {}
+    if (payload.get("schema_version") != _SOLVER_SETTINGS_SCHEMA_VERSION
+            or payload.get("po_defaults_version") != _PO_DEFAULTS_VERSION):
+        return {}
+    spans = payload.get("po_phase_span_by_mode")
+    if not isinstance(spans, dict):
+        return {}
+    lower, upper, _ = _SOLVER_SETTINGS_NUMERIC_BOUNDS[
+        "po_quadrature_phase_span_scale_rad"
+    ]
+    validated = {}
+    for mode, value in spans.items():
+        if (mode not in _PO_INTEGRATION_MODES or isinstance(value, bool)
+                or not isinstance(value, (int, float))):
+            continue
+        numeric = float(value)
+        if np.isfinite(numeric) and lower <= numeric <= upper:
+            validated[mode] = numeric
     return validated
 
 
@@ -936,6 +1791,7 @@ def _cache_theme_comparison(
     clutter_removal: str,
     channel_indices: tuple[int, ...] | None,
     configuration_signature: tuple[object, ...] | None = None,
+    result_settings: dict | None = None,
 ) -> str:
     """Retain completed candidate ADC briefly across a theme reload."""
 
@@ -957,6 +1813,7 @@ def _cache_theme_comparison(
         "clutter_removal": str(clutter_removal),
         "channel_indices": channel_indices,
         "configuration_signature": configuration_signature,
+        "result_settings": result_settings,
     }
     with _THEME_COMPARISON_CACHE_LOCK:
         _THEME_COMPARISON_CACHE[key] = payload
@@ -1117,7 +1974,7 @@ def _style_figure(figure, *, plot_template: str):
             "color": tokens["foreground"],
         }
     )
-    if not dark and any(
+    if any(
         trace.type in {"mesh3d", "scatter3d"} for trace in figure.data
     ):
         scene_axis_style = {
@@ -1126,16 +1983,29 @@ def _style_figure(figure, *, plot_template: str):
             "linecolor": tokens["axis"],
             "zerolinecolor": tokens["axis"],
             "showbackground": True,
-            "title_font": {"size": 16, "color": tokens["foreground"]},
-            "tickfont": {"size": 14, "color": tokens["foreground"]},
+            "title_font": {"size": 13, "color": tokens["foreground"]},
+            "tickfont": {"size": 11, "color": tokens["foreground"]},
+            "nticks": 4,
+            "tickformat": ".2~f",
         }
         figure.update_scenes(
             bgcolor=tokens["background"],
             xaxis=scene_axis_style,
             yaxis=scene_axis_style,
             zaxis=scene_axis_style,
+            xaxis_title_text="x [m]",
+            yaxis_title_text="y [m]",
+            zaxis_title_text="z [m]",
         )
     return figure
+
+
+def _empty_figure(go, plot_template):
+    figure = go.Figure()
+    figure.add_annotation(text="Load a bundle to view its products", showarrow=False)
+    figure.update_layout(xaxis_visible=False, yaxis_visible=False,
+                         margin={"l": 20, "r": 20, "t": 30, "b": 20})
+    return _style_figure(figure, plot_template=plot_template)
 
 
 def _relative_db(values: np.ndarray, *, floor_db: float = -80.0) -> np.ndarray:
@@ -1169,10 +2039,17 @@ def _absolute_db_limits(
 def _face_colors(face_power: np.ndarray) -> list[str]:
     from matplotlib import colormaps, colors
 
-    db = _relative_db(face_power, floor_db=-60.0)
+    power = np.asarray(face_power, dtype=float)
+    if not np.any(power > 0.0):
+        return ["#000000"] * power.size
+    db = _relative_db(power, floor_db=-60.0)
     normalized = np.clip((db + 60.0) / 60.0, 0.0, 1.0)
     cmap = colormaps.get_cmap("inferno")
-    return [colors.to_hex(cmap(float(value)), keep_alpha=False) for value in normalized]
+    return [
+        colors.to_hex(cmap(float(level)), keep_alpha=False)
+        if value > 0.0 else "#000000"
+        for value, level in zip(power, normalized)
+    ]
 
 
 def _target_face_colors(result) -> list[str]:
@@ -1914,25 +2791,8 @@ def _physics_scene_figure(result, go, *, plot_template: str):
         for axis, axis_span in range_spans.items()
     }
     grid_step = _scene_grid_step(largest_range_span)
-    trihedral_faces = result.target_type == "trihedral"
     human_faces = result.target_type == "human_mesh"
     face_colors = _target_face_colors(result)
-    lighting = (
-        {
-            "ambient": 0.88,
-            "diffuse": 0.30,
-            "specular": 0.0,
-            "roughness": 1.0,
-            "fresnel": 0.0,
-        }
-        if trihedral_faces
-        else {
-            "ambient": 0.72,
-            "diffuse": 0.75,
-            "specular": 0.15,
-            "roughness": 0.75,
-        }
-    )
     figure = go.Figure()
     figure.add_trace(
         go.Mesh3d(
@@ -1943,6 +2803,7 @@ def _physics_scene_figure(result, go, *, plot_template: str):
             j=faces[:, 1],
             k=faces[:, 2],
             facecolor=face_colors,
+            opacity=1.0,
             flatshading=True,
             name=result.target_type.replace("_", " ").title(),
             showlegend=False,
@@ -1953,25 +2814,7 @@ def _physics_scene_figure(result, go, *, plot_template: str):
                 "roll_deg": float(result.target_parameters["roll_deg"]),
             },
             hovertemplate="Facet %{pointNumber}<extra></extra>",
-            lighting=lighting,
-            lightposition=(
-                {"x": -1000.0, "y": -1000.0, "z": 1000.0}
-                if trihedral_faces
-                else (
-                    {
-                        "x": float(result.radar_position[0]),
-                        "y": float(result.radar_position[1]),
-                        "z": float(result.radar_position[2]),
-                    }
-                    if human_faces
-                    and hasattr(result, "radar_position")
-                    else (
-                        {"x": 0.0, "y": 0.0, "z": 0.0}
-                        if human_faces
-                        else None
-                    )
-                )
-            ),
+            lighting=_PO_POWER_LIGHTING,
         )
     )
     figure.add_trace(
@@ -2203,7 +3046,7 @@ def _human_room_scene_title(preview, frame_index: int) -> str:
     """Return the dynamic-scene title for a source motion frame."""
 
     if preview is None:
-        return "Dynamic scene · upload AMASS-like motion to place the subject"
+        return "Dynamic scene · upload human motion to place the subject"
     selected_frame = int(
         np.clip(frame_index, 0, len(preview.mesh_sequence.times) - 1)
     )
@@ -2213,6 +3056,51 @@ def _human_room_scene_title(preview, frame_index: int) -> str:
     )
 
 
+def _human_floor_overlay_data(vertices, room_boxes) -> dict:
+    """Mark human vertices below a floor's top surface within its footprint."""
+
+    vertices = np.asarray(vertices, dtype=float)
+    clearance = np.full(len(vertices), np.nan, dtype=float)
+    floor_boxes = [
+        box for box in room_boxes if "floor" in str(box["id"]).lower()
+    ]
+    for box in floor_boxes:
+        center = np.asarray(box["translate"], dtype=float)
+        half_size = np.abs(np.asarray(box["scale"], dtype=float))
+        over_floor = np.all(
+            np.abs(vertices[:, :2] - center[:2]) <= half_size[:2] + 1e-6,
+            axis=1,
+        )
+        floor_top = center[2] + half_size[2]
+        clearance[over_floor] = np.fmin(
+            clearance[over_floor], vertices[over_floor, 2] - floor_top
+        )
+
+    # A 0.1 mm tolerance avoids flagging float32 roundoff at floor contact.
+    penetrating = clearance < -1e-4
+    checked = np.isfinite(clearance)
+    if not floor_boxes:
+        status = "**Floor check unavailable:** no floor geometry in this preview."
+    elif not np.any(checked):
+        status = "**Outside floor footprint:** human vertices are not over the floor."
+    elif np.any(penetrating):
+        depth_cm = -100.0 * float(np.min(clearance[penetrating]))
+        status = (
+            f"**Floor penetration: {depth_cm:.2f} cm** · "
+            f"{np.count_nonzero(penetrating):,} below-floor vertices shown in red."
+        )
+    else:
+        gap_cm = max(100.0 * float(np.min(clearance[checked])), 0.0)
+        status = f"**No floor penetration** · floor clearance: {gap_cm:.2f} cm."
+    return {
+        "x": vertices[penetrating, 0],
+        "y": vertices[penetrating, 1],
+        "z": vertices[penetrating, 2],
+        "customdata": -100.0 * clearance[penetrating],
+        "meta": {"floor_status": status, "floor_boxes": floor_boxes},
+    }
+
+
 def _update_human_room_scene_frame(
     figure,
     preview,
@@ -2220,11 +3108,11 @@ def _update_human_room_scene_frame(
     frame_index: int,
     update_title: bool = True,
 ) -> bool:
-    """Restyle only the human trace during motion playback.
+    """Restyle the human mesh and floor markers during motion playback.
 
     Rebuilding the complete Plotly room for every player tick can make browser
     input outrun server rendering.  A Plotly restyle sends only the moving
-    vertices and preserves the room, radar, and current camera.
+    vertices and floor markers, preserving the room, radar, and current camera.
     """
 
     if figure is None or preview is None:
@@ -2251,14 +3139,24 @@ def _update_human_room_scene_frame(
     # A data-only restyle leaves Plotly's active 3-D camera gesture alone.
     # Sending a layout update on every player tick cancels orbit/zoom drags in
     # the browser, so the title is refreshed only for non-playing changes.
-    figure.plotly_restyle(
-        {
-            "x": [vertices[:, 0]],
-            "y": [vertices[:, 1]],
-            "z": [vertices[:, 2]],
-        },
-        [trace_index],
-    )
+    updates = {
+        "x": [vertices[:, 0]],
+        "y": [vertices[:, 1]],
+        "z": [vertices[:, 2]],
+    }
+    trace_indices = [trace_index]
+    for index, overlay in enumerate(figure.data):
+        if overlay.name == "Below-floor vertices":
+            overlay_data = _human_floor_overlay_data(
+                vertices, overlay.meta["floor_boxes"]
+            )
+            for key, value in overlay_data.items():
+                updates.setdefault(key, [getattr(trace, key)]).append(value)
+            trace_indices.append(index)
+            break
+    # The camera-interaction guard retains only the latest restyle, so the
+    # mesh and floor markers must travel together in a single frame update.
+    figure.plotly_restyle(updates, trace_indices)
     if update_title:
         figure.plotly_relayout(
             {"title.text": _human_room_scene_title(preview, selected_frame)}
@@ -2326,6 +3224,8 @@ def _human_room_scene_figure(
         room_boxes = room_boxes_override
     else:
         room_boxes = prepared_room_boxes()
+    if preview is not None and getattr(preview, "scene_xml", None) is not None:
+        room_boxes = _scene_xml_boxes(preview.scene_xml)
     room_palette = {
         "floor": "#5d7083",
         "back_wall": "#74879a",
@@ -2335,23 +3235,11 @@ def _human_room_scene_figure(
         "nightstand": "#8b6b4e",
         "wardrobe": "#795c44",
     }
-    room_materials = {
-        "floor": "Wood",
-        "back_wall": "Plasterboard",
-        "left_wall": "Plasterboard",
-        "right_wall": "Metal",
-        "bed": "Fabric",
-        "nightstand": "Wood",
-        "wardrobe": "Wood",
-    }
     for box in room_boxes:
         vertices, faces = _box_mesh(box["translate"], box["scale"])
         object_name = str(box["id"]).replace("_", " ").title()
         material_name = str(
-            box.get(
-                "material",
-                room_materials.get(str(box["id"]), "Unspecified"),
-            )
+            box.get("material_display", box.get("material", "Unspecified"))
         )
         figure.add_trace(
             go.Mesh3d(
@@ -2362,7 +3250,12 @@ def _human_room_scene_figure(
                 j=faces[:, 1],
                 k=faces[:, 2],
                 color=room_palette.get(str(box["id"]), "#74879a"),
-                opacity=0.18 if "wall" in str(box["id"]) else 0.45,
+                opacity=(
+                    0.18
+                    if "wall" in str(box["id"])
+                    or "floor" in str(box["id"]).lower()
+                    else 0.45
+                ),
                 flatshading=True,
                 name=object_name,
                 showlegend=False,
@@ -2383,10 +3276,12 @@ def _human_room_scene_figure(
         faces = np.asarray(sequence.faces, dtype=np.int64)
         human_vertices = vertices
         mesh_options = {"color": palette["orange"]}
+        has_po_power = False
         if diagnostics is not None and diagnostics.po is not None:
             po_power = np.asarray(diagnostics.po_face_power, dtype=float)
-            if po_power.shape == (faces.shape[0],) and np.any(po_power > 0.0):
+            if po_power.shape == (faces.shape[0],):
                 mesh_options = {"facecolor": _face_colors(po_power)}
+                has_po_power = True
         figure.add_trace(
             go.Mesh3d(
                 x=vertices[:, 0],
@@ -2396,26 +3291,33 @@ def _human_room_scene_figure(
                 j=faces[:, 1],
                 k=faces[:, 2],
                 **mesh_options,
-                opacity=0.92,
+                opacity=1.0 if has_po_power else 0.92,
                 flatshading=True,
-                name=(
-                    "PO face power"
-                    if diagnostics is not None and diagnostics.po is not None
-                    else "Human mesh"
-                ),
-                showlegend=(
-                    diagnostics is not None and diagnostics.po is not None
-                ),
+                name="PO face power" if has_po_power else "Human mesh",
+                showlegend=has_po_power,
                 hovertemplate=(
                     "Object: Human facet %{pointNumber}<br>"
                     "Material: Human skin<extra></extra>"
                 ),
-                lighting={
+                lighting=_PO_POWER_LIGHTING if has_po_power else {
                     "ambient": 0.68,
                     "diffuse": 0.82,
                     "specular": 0.08,
                     "roughness": 0.86,
                 },
+            )
+        )
+        figure.add_trace(
+            go.Scatter3d(
+                **_human_floor_overlay_data(vertices, room_boxes),
+                mode="markers",
+                marker={"size": 5, "color": "#ef4444"},
+                name="Below-floor vertices",
+                showlegend=False,
+                hovertemplate=(
+                    "Floor penetration: %{customdata:.2f} cm<br>"
+                    "z: %{z:.3f} m<extra></extra>"
+                ),
             )
         )
     if diagnostics is not None and diagnostics.rt is not None:
@@ -2855,6 +3757,8 @@ def _angle_fft_range_products(result) -> dict[str, object]:
         chirp_duration=parameters["chirp_duration_s"],
         chirp_repetition_time=parameters["chirp_repetition_time_s"],
         sampling_frequency=parameters["sampling_frequency_hz"],
+        adc_mode=parameters.get("adc_mode", "complex1x"),
+        if_bandwidth_hz=parameters.get("if_bandwidth_hz"),
         num_adc_samples=parameters["num_adc_samples"],
         num_chirps_per_frame=parameters["num_chirps_per_frame"],
         frame_period=parameters["frame_period_s"],
@@ -3070,11 +3974,17 @@ def _angle_map_figure(
     return _style_figure(figure, plot_template=plot_template)
 
 
-def _adc_trace_figure(products, go, *, title: str, plot_template: str):
+def _adc_trace_figure(products, go, *, title: str, plot_template: str,
+                      frame_index: int = 0, chirp_index: int = 0, channel_index: int = 0):
     palette = _plot_theme_tokens(plot_template)
     adc = np.asarray(products.adc)
-    trace = adc[0, 0, :, 0]
     figure = go.Figure()
+    selection = (int(frame_index), int(chirp_index), int(channel_index))
+    if any(index < 0 or index >= limit for index, limit in zip(selection, (adc.shape[0], adc.shape[1], adc.shape[3]))):
+        figure.add_annotation(text="Selected frame, chirp or channel is unavailable in this ADC.", showarrow=False)
+        figure.update_layout(title=title, xaxis_visible=False, yaxis_visible=False)
+        return _style_figure(figure, plot_template=plot_template)
+    trace = adc[selection[0], selection[1], :, selection[2]]
     figure.add_trace(
         go.Scatter(
             y=trace.real,
@@ -3153,7 +4063,7 @@ def _range_doppler_figure(
     frame_title = title
     if source_frame_index is not None:
         frame_title = (
-            f"{title} · simulated frame {frame_index + 1} · "
+            f"{title} · simulated frame {frame_index} · "
             f"source motion frame {int(source_frame_index)}"
         )
     figure = go.Figure(
@@ -3246,8 +4156,19 @@ def _bundle_scene_boxes(scene_path: Path | None) -> tuple[dict, ...]:
     try:
         if scene_path.stat().st_size > _MAX_SCENE_XML_UPLOAD_BYTES:
             return ()
-        root = ET.parse(scene_path).getroot()
-    except (ET.ParseError, OSError):
+        return _scene_xml_boxes(scene_path.read_bytes())
+    except OSError:
+        return ()
+
+
+def _scene_xml_boxes(scene_xml: bytes) -> tuple[dict, ...]:
+    """Extract axis-aligned cubes for the room preview and floor check."""
+
+    if len(scene_xml) > _MAX_SCENE_XML_UPLOAD_BYTES:
+        return ()
+    try:
+        root = ET.fromstring(scene_xml)
+    except ET.ParseError:
         return ()
 
     def local_name(element) -> str:
@@ -3284,13 +4205,22 @@ def _bundle_scene_boxes(scene_path: Path | None) -> tuple[dict, ...]:
     for shape_index, shape in enumerate(root.iter()):
         if local_name(shape) != "shape" or shape.attrib.get("type") != "cube":
             continue
+        if any(
+            local_name(operation) not in {"scale", "translate"}
+            for transform in shape
+            if local_name(transform) == "transform"
+            for operation in transform
+        ):
+            continue
         try:
             scale = np.ones(3, dtype=float)
             translate = np.zeros(3, dtype=float)
             for transform in shape.iter():
                 name = local_name(transform)
                 if name == "scale":
-                    scale *= vector(transform, (1.0, 1.0, 1.0))
+                    factor = vector(transform, (1.0, 1.0, 1.0))
+                    scale *= factor
+                    translate *= factor
                 elif name == "translate":
                     translate += vector(transform, (0.0, 0.0, 0.0))
         except (TypeError, ValueError):
@@ -3706,10 +4636,10 @@ def _human_room_results_view(
         int(result.range_doppler_power.shape[0]) for result in results
     )
     range_doppler_frame = pn.widgets.IntSlider(
-        label=f"Range-Doppler frame (1–{range_doppler_frame_count})",
-        start=1,
-        end=max(range_doppler_frame_count, 1),
-        value=1,
+        label=f"Range-Doppler frame index (0–{max(range_doppler_frame_count - 1, 0)})",
+        start=0,
+        end=max(range_doppler_frame_count - 1, 0),
+        value=0,
         step=1,
         disabled=range_doppler_frame_count <= 1,
     )
@@ -3726,7 +4656,7 @@ def _human_room_results_view(
         disabled=range_doppler_frame_count <= 1,
     )
     range_doppler_frame_status = pn.pane.Markdown(
-        f"**Displayed frame:** 1 of {range_doppler_frame_count}"
+        f"**Displayed frame index:** 0 / {max(range_doppler_frame_count - 1, 0)}"
     )
     begin_frames = {
         result.simulation_mode: int(
@@ -3776,14 +4706,14 @@ def _human_room_results_view(
         pane.object = figure
 
     def reset_range_doppler(display_frame: int):
-        frame_index = int(display_frame) - 1
-        previous_range_doppler_frame.disabled = display_frame <= 1
+        frame_index = int(display_frame)
+        previous_range_doppler_frame.disabled = display_frame <= 0
         next_range_doppler_frame.disabled = (
-            display_frame >= range_doppler_frame_count
+            display_frame >= range_doppler_frame_count - 1
         )
         range_doppler_frame_status.object = (
-            f"**Displayed frame:** {display_frame} of "
-            f"{range_doppler_frame_count}"
+            f"**Displayed frame index:** {display_frame} / "
+            f"{max(range_doppler_frame_count - 1, 0)}"
         )
         for result, pane in zip(results, range_doppler_panes):
             reset_plot(pane, range_doppler_figure(result, frame_index))
@@ -3796,8 +4726,8 @@ def _human_room_results_view(
         range_doppler_frame.value = int(
             np.clip(
                 int(range_doppler_frame.value) + int(offset),
-                1,
-                range_doppler_frame_count,
+                0,
+                max(range_doppler_frame_count - 1, 0),
             )
         )
 
@@ -3832,6 +4762,7 @@ def _human_room_results_view(
 
     product_tabs.param.watch(reset_active_product, "active")
     metadata_view = {}
+    refinement_notes = []
     for result in results:
         metadata = result.metadata
         metadata_view[mode_label(result)] = {
@@ -3859,7 +4790,19 @@ def _human_room_results_view(
             "po_calibration": metadata.po_calibration,
             "runtime_profile_s": metadata.runtime_profile_s,
         }
-    result_sections = [product_tabs]
+        for event in getattr(metadata, "events", None) or []:
+            if event.get("reason") != "adaptive_po_refinement":
+                continue
+            metadata_view[mode_label(result)]["po_refinement"] = event
+            if event["limited_passes"]:
+                refinement_notes.append(
+                    f"**{mode_label(result)} — PO refinement limit:** "
+                    f"up to {event['max_unresolved_parent_faces']:,} facets remained above a tolerance "
+                    "when subdivision reached its limit. Raise **PO maximum refinement depth** "
+                    "or **PO subfaces per parent (0 = unlimited)** in **Settings → Solver settings**."
+                )
+    _fit_active_tab_height(product_tabs)
+    result_sections = [product_tabs, *[pn.pane.Alert(note, alert_type="warning") for note in refinement_notes]]
     rt_segment_figure = _human_room_rt_segment_histogram(
         results,
         go,
@@ -3872,13 +4815,42 @@ def _human_room_results_view(
                 pn.pane.Plotly(rt_segment_figure, height=340),
             )
         )
+    summary = [
+        "| Mode | Runtime | RT paths (max) | PO visible facets (max) | Calibration |",
+        "| --- | ---: | ---: | ---: | --- |",
+    ]
+    breakdown = []
+    for label, details in metadata_view.items():
+        calibration = details["po_calibration"] or {}
+        calibration_label = str(calibration.get("mode", "applied")) if calibration.get("applied") else "Uncalibrated"
+        paths = details["path_count_max"]
+        facets = details["visible_face_count_max"]
+        summary.append(
+            f"| {label} | {details['runtime_s']:.3g} s | "
+            f"{paths if paths is not None else '—'} | "
+            f"{facets if facets is not None else '—'} | {calibration_label} |"
+        )
+        stages = details["runtime_profile_s"] or {}
+        stage_table = _runtime_stage_table(stages)
+        if stage_table:
+            breakdown.append(f"**{label} measured stages**\n\n{stage_table}")
     result_sections.extend(
         (
             pn.pane.Markdown("### Run metadata"),
-            pn.pane.JSON(metadata_view, depth=4, height=380),
+            pn.pane.Markdown("\n".join(summary)),
+            pn.pane.Markdown("\n\n".join(breakdown)),
+            pn.Card(
+                pn.pane.JSON(metadata_view, depth=2, height=380,
+                             stylesheets=[_comparison_json_stylesheet(plot_template)]),
+                title="Advanced · Raw run metadata", collapsed=True,
+                sizing_mode="stretch_width",
+            ),
         )
     )
-    return pn.Column(*result_sections, sizing_mode="stretch_width")
+    view = pn.Column(*result_sections, sizing_mode="stretch_width")
+    _readable_markdown(view, pn, plot_template)
+    _style_secondary_buttons(view, pn, plot_template)
+    return view
 
 
 def _human_room_result_mode_view(result, pn, go, *, plot_template: str):
@@ -4139,64 +5111,37 @@ def _human_room_scene_xml(result) -> bytes:
     if custom_scene is not None:
         return bytes(custom_scene)
 
-    material_ids = {
-        "floor": "wood",
-        "back_wall": "plasterboard",
-        "left_wall": "plasterboard",
-        "right_wall": "metal",
-        "bed": "chipboard",
-        "nightstand": "wood",
-        "wardrobe": "wood",
-    }
-    rough_materials = {"metal", "plasterboard"}
-    material_lines = "\n".join(
-        (
-            f'  <bsdf type="itu-radio-material" id="mat-{name}">'
-            f'<string name="type" value="{name}"/>'
-            + (
-                '<float name="scattering_coefficient" value="0.2"/>'
-                if name in rough_materials
-                else ""
-            )
-            + "</bsdf>"
-        )
-        for name in sorted(set(material_ids.values()))
+    root = ET.fromstring(
+        bedroom_scene_xml_for_boxes(result.preview.room_boxes)
     )
-    shape_lines = []
-    for box in result.preview.room_boxes:
-        scale = tuple(float(value) for value in box["scale"])
-        translate = tuple(float(value) for value in box["translate"])
-        material = material_ids[str(box["id"])]
-        shape_lines.append(
-            f'  <shape type="cube" id="{box["id"]}">\n'
-            "    <transform name=\"to_world\">"
-            f'<scale x="{scale[0]:.9g}" y="{scale[1]:.9g}" '
-            f'z="{scale[2]:.9g}"/>'
-            f'<translate x="{translate[0]:.9g}" '
-            f'y="{translate[1]:.9g}" z="{translate[2]:.9g}"/>'
-            "</transform>\n"
-            f'    <ref name="bsdf" id="mat-{material}"/>\n'
-            "  </shape>"
-        )
-    shape_lines.append(
-        '  <bsdf type="radio-material" id="human-material">\n'
-        '    <float name="relative_permittivity" value="38"/>\n'
-        '    <float name="conductivity" value="1.5"/>\n'
-        '    <float name="thickness" value="0.01"/>\n'
-        "  </bsdf>\n"
-        '  <shape type="obj" id="human-frame-0">\n'
-        '    <string name="filename" value="target.obj"/>\n'
-        '    <boolean name="face_normals" value="true"/>\n'
-        '    <ref name="bsdf" id="human-material"/>\n'
-        "  </shape>"
+    human_material = ET.SubElement(
+        root, "bsdf", {"type": "radio-material", "id": "human-material"}
     )
-    return (
-        '<?xml version="1.0" encoding="utf-8"?>\n'
-        '<scene version="2.1.0">\n'
-        f"{material_lines}\n"
-        f"{chr(10).join(shape_lines)}\n"
-        "</scene>\n"
-    ).encode("utf-8")
+    for name, value in (
+        ("relative_permittivity", "38"),
+        ("conductivity", "1.5"),
+        ("thickness", "0.01"),
+    ):
+        ET.SubElement(
+            human_material, "float", {"name": name, "value": value}
+        )
+    human_shape = ET.SubElement(
+        root, "shape", {"type": "obj", "id": "human-frame-0"}
+    )
+    ET.SubElement(
+        human_shape,
+        "string",
+        {"name": "filename", "value": "target.obj"},
+    )
+    ET.SubElement(
+        human_shape,
+        "boolean",
+        {"name": "face_normals", "value": "true"},
+    )
+    ET.SubElement(
+        human_shape, "ref", {"name": "bsdf", "id": "human-material"}
+    )
+    return ET.tostring(root, encoding="utf-8", xml_declaration=True)
 
 
 def _human_room_export(result, *, mode_results=None) -> BytesIO:
@@ -4337,6 +5282,8 @@ def _human_room_export(result, *, mode_results=None) -> BytesIO:
             "sampling_frequency_hz": radar_parameters[
                 "sampling_frequency_hz"
             ],
+            "adc_mode": radar_parameters.get("adc_mode", "complex1x"),
+            "if_bandwidth_hz": radar_parameters.get("if_bandwidth_hz"),
             "num_adc_samples": radar_parameters["num_adc_samples"],
             "num_chirps_per_frame": radar_parameters[
                 "num_chirps_per_frame"
@@ -4399,6 +5346,9 @@ def _human_room_export(result, *, mode_results=None) -> BytesIO:
         "motion_mesh": "human_motion.npz",
         "human_position_m": result.preview.human_position_m.tolist(),
         "human_yaw_deg": result.preview.human_yaw_deg,
+        "motion_coordinate_settings": getattr(
+            result.preview, "motion_coordinate_settings", None
+        ),
         "motion_frame_window": {
             "begin_frame_index": begin_frame_index,
             "end_frame_index": end_frame_index,
@@ -4436,6 +5386,8 @@ def _human_room_export(result, *, mode_results=None) -> BytesIO:
         ),
     }
     diagnostic_arrays = {
+        "adc_if_filter_json": np.asarray(json.dumps(
+            getattr(result.metadata, "adc_if_filter", None))),
         "ranges_m": np.asarray(result.ranges_m),
         **{
             f"range_profile_{name}": np.asarray(values)
@@ -4645,7 +5597,7 @@ def build_app(
         width=52,
         height=44,
         margin=(0, 4),
-        css_classes=["hermes-theme-button"],
+        css_classes=["hermes-theme-button", "hermes-icon-theme"],
     )
     settings_button = pn.widgets.Button(
         label="",
@@ -4655,7 +5607,7 @@ def build_app(
         width=52,
         height=44,
         margin=(0, 4),
-        css_classes=["hermes-theme-button"],
+        css_classes=["hermes-theme-button", "hermes-icon-settings"],
     )
     gui_activity_state = {
         "static": False,
@@ -4663,13 +5615,18 @@ def build_app(
         "comparison": False,
         "bundle_load": False,
     }
+    settings_dialog_state = {"editing": False, "values": {}, "phase_spans": {}}
 
     def set_gui_activity(name: str, active: bool) -> None:
         gui_activity_state[name] = bool(active)
         theme_button.disabled = any(gui_activity_state.values())
+        settings_button.disabled = any(gui_activity_state.values())
+        load_motion_preview.disabled = any(gui_activity_state.values())
+        refresh_result_validity()
     po_integration_mode = pn.widgets.Select(
         label="PO facet integration",
         options={
+            "Adaptive analytic parent facet": "parent_face_adaptive_analytic",
             "Adaptive parent-facet quadrature": "parent_face_quadrature",
             "Far-field analytic parent facet": (
                 "parent_face_far_field_analytic"
@@ -4680,13 +5637,42 @@ def build_app(
     )
     po_phase_span = pn.widgets.FloatInput(
         label="PO subdivision phase span [rad]",
+        description="Maximum linear phase span Δφmax for adaptive analytic facets; legacy quadrature uses its sampled phase span.",
         value=_SOLVER_SETTINGS_DEFAULTS[
             "po_quadrature_phase_span_scale_rad"
         ],
+        format="0.[000]",
         step=0.1,
         start=0.05,
         end=20.0,
     )
+    po_curvature = pn.widgets.FloatInput(
+        label="PO curvature tolerance [rad]",
+        description="Split when the edge-midpoint path error δT = kc/3 × max|L(midpoint) − mean L(endpoints)| exceeds εφ.",
+        value=_SOLVER_SETTINGS_DEFAULTS["po_curvature_error_rad"],
+        format="0.[000000]", step=0.001, start=0.000001, end=10.0,
+    )
+
+    # Quadrature samples the phase while analytic facets integrate it, so a
+    # span suited to one mode is not carried into the other.
+    phase_span_by_mode = {po_integration_mode.value: po_phase_span.value}
+    solver_settings_state = {"restoring": False}
+
+    def on_po_integration_mode_change(_event=None):
+        if (_event is not None and _event.old != _event.new
+                and not solver_settings_state["restoring"]):
+            phase_span_by_mode[_event.old] = po_phase_span.value
+            po_phase_span.value = phase_span_by_mode.get(
+                _event.new,
+                default_phase_span_scale_rad(_event.new),
+            )
+        po_curvature.disabled = po_integration_mode.value != "parent_face_adaptive_analytic"
+        po_phase_span.disabled = po_integration_mode.value not in {
+            "parent_face_adaptive_analytic", "parent_face_quadrature",
+        }
+
+    po_integration_mode.param.watch(on_po_integration_mode_change, "value")
+    on_po_integration_mode_change()
     po_refinement_depth = pn.widgets.IntInput(
         label="PO maximum refinement depth",
         value=_SOLVER_SETTINGS_DEFAULTS[
@@ -4694,7 +5680,7 @@ def build_app(
         ],
         step=1,
         start=0,
-        end=8,
+        end=16,
     )
     po_subface_cap = pn.widgets.IntInput(
         label="PO subfaces per parent (0 = unlimited)",
@@ -4704,6 +5690,19 @@ def build_app(
         step=4,
         start=0,
         end=4096,
+    )
+    coupling_power_cutoff = pn.widgets.FloatInput(
+        label="Image-source power cutoff [dB relative to strongest]",
+        description=("Retain reflectors at or above this estimated power level toward the human motion volume. "
+                     "-20 dB means at least 1% of the strongest candidate's estimated power."),
+        value=_SOLVER_SETTINGS_DEFAULTS["coupling_power_threshold_db"],
+        step=5., start=-120., end=0.,
+    )
+    coupling_max_count = pn.widgets.IntInput(
+        label="Image-source maximum count",
+        description="Keep at most this many of the strongest reflectors passing the power cutoff (maximum 4).",
+        value=_SOLVER_SETTINGS_DEFAULTS["coupling_max_reflectors"],
+        step=1, start=1, end=4,
     )
     rt_samples = pn.widgets.IntInput(
         label="RT ray samples per source",
@@ -4730,15 +5729,27 @@ def build_app(
         end=10,
     )
     apply_solver_settings = pn.widgets.Button(
-        label="Apply and recompute",
-        icon="player-play",
+        label="Apply",
+        icon="check",
         color="primary",
+        width=120,
+        height=40,
+        sizing_mode="fixed",
+    )
+    cancel_solver_settings = pn.widgets.Button(
+        label="Cancel", color="light", width=110, height=40, sizing_mode="fixed",
+    )
+    rerun_after_apply = pn.widgets.Checkbox(
+        label="Apply & rerun this page", value=False, align="center",
     )
     solver_setting_widgets = {
         "po_integration_mode": po_integration_mode,
         "po_quadrature_phase_span_scale_rad": po_phase_span,
+        "po_curvature_error_rad": po_curvature,
         "po_quadrature_max_refinement_depth": po_refinement_depth,
         "po_quadrature_max_subfaces_per_parent": po_subface_cap,
+        "coupling_power_threshold_db": coupling_power_cutoff,
+        "coupling_max_reflectors": coupling_max_count,
         "rt_samples_per_source": rt_samples,
         "rt_max_paths_per_source": rt_path_cap,
         "rt_max_depth": rt_depth,
@@ -4747,47 +5758,203 @@ def build_app(
     def current_solver_settings_payload() -> dict[str, object]:
         return {
             "schema_version": _SOLVER_SETTINGS_SCHEMA_VERSION,
+            "po_defaults_version": _PO_DEFAULTS_VERSION,
+            "po_phase_span_by_mode": {
+                **phase_span_by_mode,
+                po_integration_mode.value: po_phase_span.value,
+            },
             "settings": {
                 name: widget.value
                 for name, widget in solver_setting_widgets.items()
             },
         }
 
+    def restore_solver_settings(payload):
+        restored = _validated_solver_settings_payload(payload)
+        spans = _validated_po_phase_span_by_mode(payload)
+        if not restored and not spans:
+            return restored, False
+        if payload.get("po_defaults_version") != _PO_DEFAULTS_VERSION:
+            phase_span_by_mode.clear()
+        mode = restored.get("po_integration_mode", po_integration_mode.value)
+        if "po_integration_mode" in restored or mode in spans:
+            restored.setdefault(
+                "po_quadrature_phase_span_scale_rad",
+                spans.get(mode, phase_span_by_mode.get(
+                    mode, default_phase_span_scale_rad(mode))),
+            )
+        changed = False
+        solver_settings_state["restoring"] = True
+        try:
+            for name, value in restored.items():
+                widget = solver_setting_widgets[name]
+                if widget.value != value:
+                    # Keep normal widget events so browser models update.
+                    widget.value = value
+                    changed = True
+        finally:
+            solver_settings_state["restoring"] = False
+        phase_span_by_mode.update(spans)
+        # The active scalar also restores profiles saved before the map existed.
+        phase_span_by_mode[po_integration_mode.value] = po_phase_span.value
+        return restored, changed
+
     solver_settings_storage = _solver_settings_storage_component(pn)
+    motion_axis_options = {
+        f"{sign}{axis.upper()}": f"{sign}{axis}"
+        for axis in "xyz"
+        for sign in ("+", "-")
+    }
+    motion_axes_mode = pn.widgets.Select(
+        label="Motion coordinate mapping",
+        css_classes=["hermes-settings-wide"],
+        options={
+            "Use file mapping / keep stored axes": "file",
+            "Specify source coordinate frame": "manual",
+        },
+        value="file",
+    )
+    motion_up_axis = pn.widgets.Select(
+        label="Source up axis",
+        options=motion_axis_options,
+        value="+z",
+    )
+    motion_forward_axis = pn.widgets.Select(
+        label="Source forward axis",
+        options=motion_axis_options,
+        value="+x",
+        description="Fixed reference direction, not the subject's changing heading.",
+    )
+    motion_handedness = pn.widgets.Select(
+        label="Source handedness",
+        options={"Right-handed": "right", "Left-handed": "left"},
+        value="right",
+    )
+    motion_length_unit = pn.widgets.Select(
+        label="Evaluated mesh units",
+        options={"Metres": "m", "Centimetres": "cm", "Millimetres": "mm"},
+        value="m",
+        description="SMPL-generated meshes normally use metres.",
+    )
+    motion_coordinate_summary = pn.pane.Markdown(css_classes=["hermes-callout"])
+    motion_coordinate_widgets = {
+        "motion_axes_mode": motion_axes_mode,
+        "motion_up_axis": motion_up_axis,
+        "motion_forward_axis": motion_forward_axis,
+        "motion_handedness": motion_handedness,
+        "motion_length_unit": motion_length_unit,
+    }
+    motion_coordinate_state = {"syncing": False}
+
+    def current_motion_coordinate_arguments():
+        if motion_axes_mode.value == "file":
+            return {}
+        return {
+            "motion_source_up_axis": motion_up_axis.value,
+            "motion_source_forward_axis": motion_forward_axis.value,
+            "motion_source_handedness": motion_handedness.value,
+            "motion_source_length_unit": motion_length_unit.value,
+        }
+
+    def sync_motion_coordinate_controls():
+        motion_coordinate_state["syncing"] = True
+        try:
+            motion_forward_axis.options = {
+                label: value
+                for label, value in motion_axis_options.items()
+                if value[-1] != motion_up_axis.value[-1]
+            }
+            manual = motion_axes_mode.value == "manual"
+            for widget in (
+                motion_up_axis, motion_forward_axis,
+                motion_handedness, motion_length_unit,
+            ):
+                widget.disabled = not manual
+            if not manual:
+                motion_coordinate_summary.object = (
+                    "File `output_axes` / `output_signs` are used when present. "
+                    "Otherwise axes and scale stay as stored; no frame is guessed."
+                )
+                return
+            transform = motion_source_to_radar_transform(
+                motion_up_axis.value,
+                motion_forward_axis.value,
+                handedness=motion_handedness.value,
+                length_unit=motion_length_unit.value,
+            )
+            axes = np.argmax(np.abs(transform), axis=1)
+            signs = np.sign(transform[np.arange(3), axes])
+            mapping = " · ".join(
+                f"GUI {target.upper()} ← {'+' if sign > 0 else '-'}{'XYZ'[axis]} source"
+                for target, axis, sign in zip("xyz", axes, signs)
+            )
+            motion_coordinate_summary.object = (
+                f"**{mapping}**  \n"
+                "Converted to metres, then human yaw and position are applied. "
+                "This selection overrides any file axis mapping."
+            )
+        finally:
+            motion_coordinate_state["syncing"] = False
+
+    sync_motion_coordinate_controls()
     solver_controls_panel = pn.Column(
-        pn.pane.Markdown(
+        _settings_note(
+            pn,
             "These values control the numerical PO integration and RT search. "
             "Adaptive PO subdivision is temporary and is coherently integrated "
-            "back onto each original facet.",
-            css_classes=["hermes-callout"],
+            "back onto each original facet. Solver values are saved in this "
+            "browser and restored on the next visit.",
         ),
-        pn.Row(
-            pn.Column(
-                pn.pane.Markdown("### Physical optics"),
+        _settings_section(
+            pn, "Physical optics", "Static Target · Dynamic Scenes",
+            _settings_grid(
+                pn,
                 po_integration_mode,
                 po_phase_span,
+                po_curvature,
                 po_refinement_depth,
                 po_subface_cap,
-                min_width=300,
+                columns=3,
             ),
-            pn.Column(
-                pn.pane.Markdown("### Ray tracing"),
-                rt_samples,
-                rt_path_cap,
-                rt_depth,
-                min_width=300,
-            ),
-            sizing_mode="stretch_width",
         ),
-        apply_solver_settings,
-        pn.pane.Markdown(
-            "Values are saved in this browser and restored on the next visit."
+        _settings_section(
+            pn, "Ray tracing", "Static Target · Dynamic Scenes",
+            _settings_grid(pn, rt_samples, rt_path_cap, rt_depth, columns=3),
+        ),
+        _settings_section(
+            pn, "Image-source reflectors", "Dynamic Scenes · Hybrid PO",
+            _settings_grid(pn, coupling_power_cutoff, coupling_max_count, columns=3),
         ),
         sizing_mode="stretch_width",
+        margin=0,
+    )
+    motion_controls_panel = pn.Column(
+        _settings_note(
+            pn,
+            "Map source coordinates to **+X forward, +Y left, +Z up**, in "
+            "metres. Apply updates the loaded motion preview. Motion "
+            "coordinates are kept with the current GUI session and recorded "
+            "in exported runs.",
+        ),
+        _settings_section(
+            pn, "Source coordinate frame", "Dynamic Scenes",
+            _settings_grid(pn, motion_axes_mode, columns=4),
+            _settings_grid(
+                pn,
+                motion_up_axis,
+                motion_forward_axis,
+                motion_handedness,
+                motion_length_unit,
+                columns=4,
+            ),
+            motion_coordinate_summary,
+        ),
+        sizing_mode="stretch_width",
+        margin=0,
     )
 
     target_type = pn.widgets.Select(
-        label="Static object",
+        label="Target type",
         options={
             "Plate": "plate",
             "Trihedral corner reflector": "trihedral",
@@ -4795,42 +5962,36 @@ def build_app(
         },
         value="plate",
     )
-    target_range = pn.widgets.FloatSlider(
-        label="Target x / range-forward [m]",
-        start=0.5,
-        end=5.0,
-        step=0.1,
-        value=2.0,
+    def compact_numeric(label, *, value, start, end, step, format="0.[0]", description=None):
+        return pn.widgets.FloatInput(
+            label=label, value=value, start=start, end=end, step=step,
+            format=format, description=description,
+            sizing_mode="stretch_width", min_width=0, margin=(5, 0),
+        )
+
+    def numeric_row(css_class, *widgets):
+        return pn.Row(
+            *widgets, sizing_mode="stretch_width", min_width=0,
+            margin=(0, 10), styles={"gap": "10px"}, css_classes=[css_class],
+        )
+
+    target_range = compact_numeric(
+        "X [m]", start=0.5, end=5.0, step=0.1, value=2.0,
+        format="0.00", description="Range-forward position.",
     )
-    target_y = pn.widgets.FloatSlider(
-        label="Target y / lateral-left [m]",
-        start=-2.0,
-        end=2.0,
-        step=0.05,
-        value=0.0,
+    target_y = compact_numeric(
+        "Y [m]", start=-2.0, end=2.0, step=0.05, value=0.0,
+        format="0.00", description="Lateral-left position.",
     )
-    target_z = pn.widgets.FloatSlider(
-        label="Target z / vertical-up [m]",
-        start=-1.5,
-        end=2.5,
-        step=0.05,
-        value=0.0,
+    target_z = compact_numeric(
+        "Z [m]", start=-1.5, end=2.5, step=0.05, value=0.0,
+        format="0.00", description="Vertical-up position.",
     )
-    plate_width = pn.widgets.FloatInput(
-        label="Plate width [m]",
-        value=0.30,
-        format="0.00",
-        step=0.01,
-        start=0.02,
-        end=3.0,
+    plate_width = compact_numeric(
+        "Width [m]", value=0.30, format="0.00", step=0.01, start=0.02, end=3.0,
     )
-    plate_height = pn.widgets.FloatInput(
-        label="Plate height [m]",
-        value=0.30,
-        format="0.00",
-        step=0.01,
-        start=0.02,
-        end=3.0,
+    plate_height = compact_numeric(
+        "Height [m]", value=0.30, format="0.00", step=0.01, start=0.02, end=3.0,
     )
     corner_edge = pn.widgets.FloatInput(
         label="Corner edge length [m]",
@@ -4841,33 +6002,15 @@ def build_app(
         end=2.0,
         visible=False,
     )
-    yaw = pn.widgets.FloatSlider(
-        label="Yaw / aspect [deg]", start=-75, end=75, step=1, value=0
-    )
-    pitch = pn.widgets.FloatSlider(
-        label="Pitch [deg]", start=-75, end=75, step=1, value=0
-    )
-    roll = pn.widgets.FloatSlider(
-        label="Roll [deg]", start=-180, end=180, step=1, value=0
-    )
-    radar_yaw = pn.widgets.FloatSlider(
-        label="Radar yaw [deg]", start=-180, end=180, step=1, value=0
-    )
-    radar_pitch = pn.widgets.FloatSlider(
-        label="Radar pitch [deg]", start=-90, end=90, step=1, value=0
-    )
-    radar_roll = pn.widgets.FloatSlider(
-        label="Radar roll [deg]", start=-180, end=180, step=1, value=0
-    )
-    dynamic_radar_yaw = pn.widgets.FloatSlider(
-        label="Radar yaw [deg]", start=-180, end=180, step=1, value=0
-    )
-    dynamic_radar_pitch = pn.widgets.FloatSlider(
-        label="Radar pitch [deg]", start=-90, end=90, step=1, value=0
-    )
-    dynamic_radar_roll = pn.widgets.FloatSlider(
-        label="Radar roll [deg]", start=-180, end=180, step=1, value=0
-    )
+    yaw = compact_numeric("Yaw [deg]", start=-75, end=75, step=1, value=0)
+    pitch = compact_numeric("Pitch [deg]", start=-75, end=75, step=1, value=0)
+    roll = compact_numeric("Roll [deg]", start=-180, end=180, step=1, value=0)
+    radar_yaw = compact_numeric("Yaw [deg]", start=-180, end=180, step=1, value=0)
+    radar_pitch = compact_numeric("Pitch [deg]", start=-90, end=90, step=1, value=0)
+    radar_roll = compact_numeric("Roll [deg]", start=-180, end=180, step=1, value=0)
+    dynamic_radar_yaw = compact_numeric("Yaw [deg]", start=-180, end=180, step=1, value=0)
+    dynamic_radar_pitch = compact_numeric("Pitch [deg]", start=-90, end=90, step=1, value=0)
+    dynamic_radar_roll = compact_numeric("Roll [deg]", start=-180, end=180, step=1, value=0)
     material = pn.widgets.Select(
         label="Material preset",
         options={
@@ -4904,6 +6047,7 @@ def build_app(
     human_upload = pn.widgets.FileInput(
         label="Human mesh (.obj or .npz)",
         accept=".obj,.npz",
+        stylesheets=[_file_input_stylesheet(plot_template, compact=False)],
         description="Browser uploads are limited to 64 MiB.",
         visible=False,
     )
@@ -4926,13 +6070,6 @@ def build_app(
             if default_human_mesh is not None
             else "**No default mesh is installed.** Upload an `.obj` or `.npz`."
         ),
-        visible=False,
-    )
-    human_notice = pn.pane.Markdown(
-        "**Export boundary:** the selected human mesh is embedded in the "
-        "downloaded bundle. Do not publish that bundle unless the mesh is "
-        "licensed for redistribution.",
-        css_classes=["hermes-callout"],
         visible=False,
     )
     board = pn.widgets.Select(
@@ -4979,7 +6116,7 @@ def build_app(
     carrier_frequency = pn.widgets.FloatInput(
         label="Carrier frequency [GHz]",
         value=_rounded_gui_float(board_spec.design_frequency_hz / 1e9),
-        format="0.000",
+        format="0.[000]",
         step=0.1,
         start=50.0,
         end=90.0,
@@ -5012,6 +6149,15 @@ def build_app(
         start=0.1,
         end=50.0,
     )
+    adc_sampling_mode = pn.widgets.Select(
+        label="ADC sampling mode", value="complex1x",
+        options={"Complex 1x (0–fs)": "complex1x",
+                 "Complex 2x (0–fs/2)": "complex2x", "Real (0–fs/2)": "real"},
+    )
+    adc_if_bandwidth = pn.widgets.FloatInput(
+        label="IF bandwidth cap [MHz] (0 = board default)", value=0.,
+        start=0., end=50., step=.1,
+    )
     num_adc_samples = pn.widgets.IntInput(
         label="ADC samples per chirp",
         value=225,
@@ -5035,10 +6181,10 @@ def build_app(
     )
     load_radar_defaults = pn.widgets.Button(
         label="Load default FMCW values",
-        icon="refresh",
         color="light",
+        icon="refresh",
     )
-    radar_summary = pn.pane.Markdown(css_classes=["hermes-callout"])
+    radar_summary = pn.pane.Markdown()
     ignored_radar_events: dict[int, int] = {}
 
     def update_antenna_pattern_controls():
@@ -5070,12 +6216,9 @@ def build_app(
         active_tx_indices = selected_tx
         active_tx = len(active_tx_indices)
         active_rx = len(selected_rx)
-        bandwidth_hz = (
-            float(chirp_slope.value)
-            * 1e12
-            * float(chirp_duration.value)
-            * 1e-6
-        )
+        bandwidth_hz = (float(chirp_slope.value) * 1e12
+                        * int(num_adc_samples.value)
+                        / (float(sampling_frequency.value) * 1e6))
         range_resolution_m = 299_792_458.0 / (2.0 * bandwidth_hz)
         pattern_summary = {
             "digitized": "digitized TI profile",
@@ -5085,13 +6228,21 @@ def build_app(
                 "3 dB width"
             ),
         }[antenna_pattern.value]
+        board_if = get_ti_board_spec(board.value).adc.get("if_bandwidth_hz")
+        requested_if = float(adc_if_bandwidth.value)*1e6 or board_if
+        effective_if = if_cutoff_hz(SimpleNamespace(
+            adc_mode=adc_sampling_mode.value,
+            sampling_frequency=float(sampling_frequency.value)*1e6,
+            if_bandwidth_hz=min(requested_if, board_if) if board_if else requested_if))
+        if_range_m = 299_792_458.*effective_if/(2.*abs(float(chirp_slope.value)*1e12))
         radar_summary.object = (
             f"**{active_tx} Tx × {active_rx} Rx · "
             f"{active_tx * active_rx} channels**  \n"
             f"Active `TX {[value + 1 for value in active_tx_indices]}` · "
             f"`RX {[value + 1 for value in selected_rx]}`  \n"
-            f"Bandwidth `{bandwidth_hz / 1e9:.3f} GHz` · nominal range "
+            f"Sampled bandwidth `{bandwidth_hz / 1e9:.3f} GHz` · range "
             f"resolution `{range_resolution_m * 100:.2f} cm`  \n"
+            f"Usable IF `{effective_if/1e6:.3f} MHz` · maximum range `{if_range_m:.2f} m`  \n"
             f"Antenna `{pattern_summary}`"
         )
 
@@ -5114,6 +6265,8 @@ def build_app(
             chirp_duration: 58.0,
             chirp_repetition: 65.0,
             sampling_frequency: 4.5,
+            adc_sampling_mode: "complex1x",
+            adc_if_bandwidth: 0.,
             num_adc_samples: 225,
             num_chirps: 16,
             frame_period: 50.0,
@@ -5156,7 +6309,7 @@ def build_app(
     )
     stop_physics = pn.widgets.Button(
         label="Stop",
-        color="danger",
+        color="light",
         icon="player-stop",
         width=105,
         height=40,
@@ -5185,6 +6338,8 @@ def build_app(
         chirp_duration_s=chirp_duration.value * 1e-6,
         chirp_repetition_time_s=chirp_repetition.value * 1e-6,
         sampling_frequency_hz=sampling_frequency.value * 1e6,
+        adc_mode=adc_sampling_mode.value,
+        if_bandwidth_hz=adc_if_bandwidth.value * 1e6 or None,
         num_adc_samples=num_adc_samples.value,
         num_chirps_per_frame=num_chirps.value,
         frame_period_s=frame_period.value * 1e-3,
@@ -5195,6 +6350,7 @@ def build_app(
         cosine_3db_beamwidth_deg=cosine_3db_beamwidth.value,
         po_integration_mode=po_integration_mode.value,
         po_quadrature_phase_span_scale_rad=po_phase_span.value,
+        po_curvature_error_rad=po_curvature.value,
         po_quadrature_max_refinement_depth=po_refinement_depth.value,
         po_quadrature_max_subfaces_per_parent=po_subface_cap.value,
         rt_samples_per_source=rt_samples.value,
@@ -5331,7 +6487,10 @@ def build_app(
         physics_state["result"] = None
         physics_state["refined"] = False
         gui_session_state["static_cacheable"] = False
-        physics_download.callback = lambda: BytesIO()
+        physics_download.callback = lambda: (
+            _physics_export(physics_state["result"])
+            if physics_state["result"] is not None else BytesIO()
+        )
         physics_download.disabled = True
         diagnostics_state["revision"] += 1
         diagnostics_state["result"] = None
@@ -5359,6 +6518,7 @@ def build_app(
         refined: bool,
         preserve_scene_frame: bool,
         geometry_already_previewed: bool,
+        result_settings=None,
     ):
         had_diagnostics_overlay = diagnostics_state["result"] is not None
         physics_state["result"] = result
@@ -5400,8 +6560,9 @@ def build_app(
             plot_template=plot_template,
         )
         update_angle_status(angle_products, angle_range_bins.value)
-        physics_download.callback = lambda: _physics_export(
-            physics_state["result"]
+        physics_download.callback = lambda: (
+            _physics_export(physics_state["result"])
+            if physics_state["result"] is not None else BytesIO()
         )
         physics_download.disabled = False
         show_rt_paths.disabled = False
@@ -5431,6 +6592,7 @@ def build_app(
             "RT path geometry is off. Enable it to inspect the current "
             "simulated state."
         )
+        remember_result_settings("static", result_settings)
         persist_gui_session()
 
     def current_physics_inputs() -> dict:
@@ -5480,6 +6642,8 @@ def build_app(
             "chirp_duration_s": chirp_duration.value * 1e-6,
             "chirp_repetition_time_s": chirp_repetition.value * 1e-6,
             "sampling_frequency_hz": sampling_frequency.value * 1e6,
+            "adc_mode": adc_sampling_mode.value,
+            "if_bandwidth_hz": adc_if_bandwidth.value * 1e6 or None,
             "num_adc_samples": num_adc_samples.value,
             "num_chirps_per_frame": num_chirps.value,
             "frame_period_s": frame_period.value * 1e-3,
@@ -5490,6 +6654,7 @@ def build_app(
             "cosine_3db_beamwidth_deg": cosine_3db_beamwidth.value,
             "po_integration_mode": po_integration_mode.value,
             "po_quadrature_phase_span_scale_rad": po_phase_span.value,
+            "po_curvature_error_rad": po_curvature.value,
             "po_quadrature_max_refinement_depth": po_refinement_depth.value,
             "po_quadrature_max_subfaces_per_parent": po_subface_cap.value,
             "rt_samples_per_source": rt_samples.value,
@@ -5502,7 +6667,18 @@ def build_app(
         fidelity: str,
         preserve_scene_frame: bool = False,
         geometry_already_previewed: bool = False,
+        force: bool = False,
     ):
+        if gui_session_state["restoring"]:
+            return
+        if not force and fidelity == "preview" and settings_match_result("static"):
+            physics_state["revision"] += 1
+            physics_state["pending_request"] = None
+            cancel_event = physics_state.get("cancel_event")
+            if cancel_event is not None:
+                cancel_event.set()
+            refresh_result_validity()
+            return
         physics_state["revision"] += 1
         revision = physics_state["revision"]
         request = {
@@ -5512,6 +6688,7 @@ def build_app(
             "preserve_scene_frame": bool(preserve_scene_frame),
             "geometry_already_previewed": bool(geometry_already_previewed),
             "inputs": current_physics_inputs(),
+            "settings": capture_result_settings("static"),
         }
         physics_state["pending_request"] = request
         invalidate_physics_result()
@@ -5543,6 +6720,7 @@ def build_app(
         set_gui_activity("static", True)
         refine_physics.disabled = True
         stop_physics.disabled = False
+        stop_physics.color = "danger"
         physics_scene.loading = True
         physics_profile.loading = True
         angle_map.loading = True
@@ -5589,6 +6767,8 @@ def build_app(
                 if (
                     active_request["revision"] == physics_state["revision"]
                     and physics_state["pending_request"] is None
+                    and active_request["settings"]["fingerprint"]
+                    == capture_result_settings("static")["fingerprint"]
                 ):
                     present_physics_result(
                         result,
@@ -5599,17 +6779,20 @@ def build_app(
                         geometry_already_previewed=active_request[
                             "geometry_already_previewed"
                         ],
+                        result_settings=active_request["settings"],
                     )
         finally:
             physics_state["running"] = False
             physics_state["cancel_event"] = None
             refine_physics.disabled = False
             stop_physics.disabled = True
+            stop_physics.color = "light"
             set_gui_activity("static", False)
             physics_download.disabled = physics_state["result"] is None
             physics_scene.loading = False
             physics_profile.loading = False
             angle_map.loading = False
+            refresh_result_validity()
 
     async def on_refine_physics(_event):
         await update_physics(fidelity="high_fidelity")
@@ -5650,6 +6833,7 @@ def build_app(
         show_rt_paths.disabled = True
         diagnostic_top_k.disabled = True
         stop_physics.disabled = False
+        stop_physics.color = "danger"
         physics_scene.loading = True
         diagnostics_depth.loading = True
         diagnostics_status.object = (
@@ -5718,6 +6902,7 @@ def build_app(
                 show_rt_paths.disabled = not has_result
                 diagnostic_top_k.disabled = not has_result
                 stop_physics.disabled = not physics_state["running"]
+                stop_physics.color = "danger" if physics_state["running"] else "light"
                 physics_scene.loading = False
                 diagnostics_depth.loading = False
             set_gui_activity("static", bool(physics_state["running"]))
@@ -5765,8 +6950,17 @@ def build_app(
         if show_rt_paths.value:
             await compute_rt_path_overlay()
 
+    ignored_physics_events: dict[int, int] = {}
+
     async def on_physics_control_change(event):
         changed_widget = getattr(event, "obj", None)
+        ignored_count = ignored_physics_events.get(id(changed_widget), 0)
+        if ignored_count:
+            if ignored_count == 1:
+                ignored_physics_events.pop(id(changed_widget), None)
+            else:
+                ignored_physics_events[id(changed_widget)] = ignored_count - 1
+            return
         if changed_widget in (plate_width, plate_height, corner_edge):
             normalized = _rounded_target_size(changed_widget.value)
             if normalized != changed_widget.value:
@@ -5796,12 +6990,14 @@ def build_app(
         pitch_delta = abs(new_pitch - float(pitch.value))
         if yaw_delta < 0.05 and pitch_delta < 0.05:
             return
-        # Emit normal ``value`` events so Panel synchronizes the visible
-        # controls after release. Solver callbacks watch ``value_throttled``,
-        # which a server-side ``value`` assignment does not change, so the
-        # gesture still owns exactly one simulation request.
-        yaw.value = round(new_yaw, 1)
-        pitch.value = round(new_pitch, 1)
+        # Synchronize visible numeric fields while the gesture owns one solve.
+        # Count the value events so delayed async watchers also skip this solve.
+        for widget, value in ((yaw, round(new_yaw, 1)), (pitch, round(new_pitch, 1))):
+            if widget.value != value:
+                ignored_physics_events[id(widget)] = (
+                    ignored_physics_events.get(id(widget), 0) + 1
+                )
+                widget.value = value
         await update_physics(
             fidelity="preview",
             preserve_scene_frame=True,
@@ -5845,20 +7041,24 @@ def build_app(
         human_upload.visible = is_human
         human_diffuse.visible = is_human
         human_source.visible = is_human
-        human_notice.visible = is_human
         await update_physics(fidelity="preview")
 
     def on_board_selection_change(_event):
+        if gui_session_state["restoring"]:
+            return
         set_radar_defaults()
 
     async def on_board_change(_event):
-        await update_physics(fidelity="preview")
+        if gui_session_state["restoring"] or settings_dialog_state["editing"]:
+            return
+        refresh_result_validity()
 
     async def on_load_radar_defaults(_event):
         set_radar_defaults()
-        await update_physics(fidelity="preview")
 
     async def on_radar_control_change(event):
+        if gui_session_state["restoring"]:
+            return
         changed_widget = getattr(event, "obj", None)
         ignored_count = ignored_radar_events.get(id(changed_widget), 0)
         if ignored_count:
@@ -5886,7 +7086,8 @@ def build_app(
                 with param.parameterized.discard_events(changed_widget):
                     changed_widget.value = normalized
         update_radar_summary()
-        await update_physics(fidelity="preview")
+        if not settings_dialog_state["editing"]:
+            refresh_result_validity()
 
     async def on_material_change(event):
         update_material_details()
@@ -5904,7 +7105,7 @@ def build_app(
     target_type.param.watch(on_target_type_change, "value")
     scene_interaction.param.watch(on_target_gesture, "target_gesture")
     angle_range_bins.param.watch(on_angle_range_change, "value_throttled")
-    for slider in (
+    for numeric in (
         target_range,
         target_y,
         target_z,
@@ -5914,11 +7115,10 @@ def build_app(
         radar_yaw,
         radar_pitch,
         radar_roll,
-        human_diffuse,
+        plate_width, plate_height, corner_edge,
     ):
-        slider.param.watch(on_physics_control_change, "value_throttled")
-    for numeric in (plate_width, plate_height, corner_edge):
         numeric.param.watch(on_physics_control_change, "value")
+    human_diffuse.param.watch(on_physics_control_change, "value_throttled")
     material.param.watch(on_material_change, "value")
     human_upload.param.watch(on_physics_control_change, "value")
     board.param.watch(on_board_selection_change, "value")
@@ -5934,160 +7134,230 @@ def build_app(
         chirp_duration,
         chirp_repetition,
         sampling_frequency,
+        adc_sampling_mode,
+        adc_if_bandwidth,
         num_adc_samples,
         num_chirps,
         frame_period,
     ):
         numeric.param.watch(on_radar_control_change, "value")
 
-    simulation_controls = pn.Column(
-        pn.pane.Markdown(
-            "Controls rerun **both RT and PO** when committed. The higher-"
-            "fidelity action increases mesh and ray budgets. Curves and maps "
-            "share an absolute dB scale in native simulator power units; no "
-            "RT↔PO amplitude calibration is applied.",
-            css_classes=["hermes-callout"],
-        ),
-        pn.pane.Markdown("## Target"),
-        target_type,
-        pn.pane.Markdown("### Target position"),
-        target_range,
-        target_y,
-        target_z,
-        pn.pane.Markdown("### Size and geometry"),
-        plate_width,
-        plate_height,
-        corner_edge,
-        pn.pane.Markdown("### Target orientation"),
-        yaw,
-        pitch,
-        roll,
-        pn.pane.Markdown("### Material and surface"),
-        material,
-        material_details,
-        human_upload,
-        human_diffuse,
-        human_source,
-        human_notice,
-        pn.layout.Divider(),
-        pn.pane.Markdown("## Radar orientation"),
-        pn.pane.Markdown(
-            "The radar phase center is fixed at **(0, 0, 0)** for this run."
-        ),
-        radar_yaw,
-        radar_pitch,
-        radar_roll,
-        physics_download,
-        physics_status,
-        sizing_mode="stretch_width",
-    )
-    radar_controls = pn.Column(
-        pn.pane.Markdown(
-            "Hardware, antenna, and waveform settings apply to subsequent "
-            "static and dynamic runs. Each workflow keeps its own radar "
-            "orientation.",
-            css_classes=["hermes-callout"],
-        ),
-        pn.Row(
-            pn.Column(
-                pn.pane.Markdown("### Hardware and antenna"),
-                board,
-                tdm_enabled,
-                tx_antennas,
-                rx_antennas,
-                antenna_pattern,
-                cosine_3db_beamwidth,
-                antenna_pattern_note,
-                radar_summary,
-                min_width=300,
+    radar_used_by = "Static Target · Dynamic Scenes"
+    radar_controls = pn.Row(
+        pn.Column(
+            _settings_note(
+                pn,
+                "Hardware, antenna, and waveform settings apply to subsequent "
+                "static and dynamic runs. Each workflow keeps its own radar "
+                "orientation.",
             ),
-            pn.Column(
-                pn.pane.Markdown("### FMCW waveform"),
-                carrier_frequency,
-                chirp_slope,
-                chirp_duration,
-                chirp_repetition,
-                sampling_frequency,
-                num_adc_samples,
-                num_chirps,
-                frame_period,
-                load_radar_defaults,
-                min_width=300,
+            _settings_section(
+                pn, "Hardware and antennas", radar_used_by,
+                _settings_grid(
+                    pn,
+                    board,
+                    tx_antennas,
+                    rx_antennas,
+                    antenna_pattern,
+                    cosine_3db_beamwidth,
+                    tdm_enabled,
+                    columns=3,
+                ),
+                antenna_pattern_note,
+            ),
+            _settings_section(
+                pn, "Chirp", radar_used_by,
+                _settings_grid(
+                    pn,
+                    carrier_frequency,
+                    chirp_slope,
+                    chirp_duration,
+                    chirp_repetition,
+                ),
+            ),
+            _settings_section(
+                pn, "Sampling", radar_used_by,
+                _settings_grid(
+                    pn,
+                    sampling_frequency,
+                    adc_sampling_mode,
+                    adc_if_bandwidth,
+                    num_adc_samples,
+                ),
+            ),
+            _settings_section(
+                pn, "Frame", radar_used_by,
+                _settings_grid(pn, num_chirps, frame_period),
             ),
             sizing_mode="stretch_width",
+            min_width=0,
+            margin=0,
+        ),
+        # The derived values stay in view while the waveform is edited.
+        pn.Column(
+            pn.pane.HTML(
+                '<div class="hermes-group-title" role="heading" '
+                'aria-level="3">Derived</div>',
+                sizing_mode="stretch_width",
+                margin=(0, 10),
+            ),
+            radar_summary,
+            load_radar_defaults,
+            sizing_mode="stretch_width",
+            min_width=260,
+            max_width=260,
+            margin=0,
+            css_classes=["hermes-settings-readout"],
         ),
         sizing_mode="stretch_width",
+        margin=0,
+        css_classes=["hermes-settings-split"],
     )
     settings_modal = pn.Column(
-        pn.pane.Markdown("## Settings"),
+        pn.pane.HTML(
+            '<div class="hermes-settings-title" role="heading" aria-level="2">'
+            "Settings</div>"
+            '<p class="hermes-settings-sub">Edits take effect together when '
+            "you Apply. Bundle Comparison uses the radar and solver settings "
+            "stored in its primary bundle.</p>",
+            sizing_mode="stretch_width",
+            margin=(0, 10),
+        ),
         pn.Tabs(
             ("Radar configuration", radar_controls),
             ("Solver settings", solver_controls_panel),
+            ("Motion coordinates", motion_controls_panel),
             dynamic=False,
             sizing_mode="stretch_width",
         ),
-        min_width=680,
+        pn.Row(
+            rerun_after_apply,
+            pn.Spacer(sizing_mode="stretch_width"),
+            cancel_solver_settings,
+            apply_solver_settings,
+            sizing_mode="stretch_width",
+            margin=0,
+            css_classes=["hermes-settings-footer"],
+        ),
+        min_width=0,
         max_width=980,
         sizing_mode="stretch_width",
-        css_classes=[theme_scope_class],
+        css_classes=[theme_scope_class, "hermes-settings"],
     )
-    physics_controls = pn.Card(
-        simulation_controls,
-        title="Static target controls",
-        collapsed=False,
-        max_width=440,
-        min_width=400,
-        sizing_mode="stretch_width",
-        css_classes=["hermes-control-card"],
-    )
-    physics_tab = pn.Column(
-        pn.pane.Markdown(
-            "## Static Target\n"
-            "Compare ray tracing and physical optics for a plate, a trihedral "
-            "corner reflector, or an uploaded human mesh. Hardware, waveform, "
-            "and antenna settings come from Settings; radar orientation is "
-            "configured independently for this run.",
-            css_classes=["hermes-hero"],
+    static_result_banner = pn.Column(visible=False, name="Static result settings")
+    physics_controls = pn.Column(
+        _rail_nav_component(pn, (
+            ("target", "Target"),
+            ("orientation", "Orientation"),
+            ("material", "Material"),
+            ("radar", "Radar"),
+        )),
+        _rail_group(
+            pn, "target", "Target",
+            target_type,
+            numeric_row("hermes-static-position", target_range, target_y, target_z),
+            numeric_row("hermes-static-size", plate_width, plate_height),
+            corner_edge,
         ),
-        pn.Row(
-            physics_controls,
-            pn.Column(
-                pn.Row(
-                    pn.Spacer(sizing_mode="stretch_width"),
-                    stop_physics,
-                    refine_physics,
-                    sizing_mode="stretch_width",
-                ),
-                pn.pane.Markdown(
-                    "**Mouse:** orbit camera · **Shift + drag:** rotate "
-                    "target yaw/pitch · **Wheel:** zoom · **Roll:** use "
-                    "the slider. Shift-drag previews geometry only; one "
-                    "RT/PO simulation runs when the mouse is released. "
-                    "**Scene frame:** +x is initial range-forward, +y "
-                    "is left, and +z is up. Green shows radar boresight; "
-                    "blue shows radar local +z.",
-                    css_classes=["hermes-callout", "hermes-compact-hint"],
-                ),
-                pn.Row(
-                    diagnostic_top_k,
-                    show_rt_paths,
-                    sizing_mode="stretch_width",
-                ),
-                diagnostics_status,
-                scene_interaction,
-                physics_profile,
-                pn.pane.Markdown("### Solver summary"),
-                diagnostics_summary,
-                diagnostics_depth,
-                pn.pane.Markdown("### 2D angle map"),
-                angle_range_bins,
-                angle_status,
-                angle_map,
+        _rail_group(
+            pn, "orientation", "Target orientation",
+            numeric_row("hermes-static-orientation", yaw, pitch, roll),
+        ),
+        _rail_group(
+            pn, "material", "Material and surface",
+            material,
+            material_details,
+            human_upload,
+            human_diffuse,
+            human_source,
+        ),
+        _rail_group(
+            pn, "radar", "Radar orientation",
+            numeric_row("hermes-static-radar-orientation", radar_yaw, radar_pitch, radar_roll),
+        ),
+        _rail_group(pn, "export", "Export", physics_download),
+        sizing_mode="stretch_width",
+        min_width=380,
+        max_width=380,
+        margin=0,
+        css_classes=["hermes-rail", "hermes-scene-controls", "hermes-static-controls"],
+    )
+    physics_workspace = pn.Column(
+        pn.Column(
+            pn.Row(
+                diagnostic_top_k,
+                show_rt_paths,
                 sizing_mode="stretch_width",
             ),
+            diagnostics_status,
+            scene_interaction,
+            pn.pane.Markdown(
+                "**Mouse:** orbit camera · **Shift + drag:** rotate "
+                "target yaw/pitch · **Wheel:** zoom · **Roll:** use "
+                "the numeric field. Shift-drag previews geometry only; one "
+                "RT/PO simulation runs when the mouse is released.",
+                css_classes=["hermes-compact-hint"],
+            ),
             sizing_mode="stretch_width",
-            styles={"gap": "20px", "align-items": "flex-start"},
+            css_classes=["hermes-card"],
         ),
+        pn.Column(
+            physics_profile,
+            sizing_mode="stretch_width",
+            css_classes=["hermes-card"],
+        ),
+        pn.Column(
+            angle_range_bins,
+            angle_status,
+            angle_map,
+            sizing_mode="stretch_width",
+            css_classes=["hermes-card"],
+        ),
+        pn.Column(
+            pn.pane.HTML(
+                '<div class="hermes-card-title" role="heading" aria-level="3">'
+                "Solver summary</div>",
+                sizing_mode="stretch_width",
+                margin=(0, 10),
+            ),
+            diagnostics_summary,
+            diagnostics_depth,
+            sizing_mode="stretch_width",
+            css_classes=["hermes-card"],
+        ),
+        sizing_mode="stretch_width",
+        margin=0,
+        styles={"gap": "16px"},
+        css_classes=["hermes-workspace"],
+    )
+    physics_tab = pn.Row(
+        physics_controls,
+        pn.Column(
+            _run_bar(
+                pn,
+                title="Static Target",
+                subtitle="RT and PO for a plate, corner reflector or human mesh.",
+                help_text=(
+                    "Compare ray tracing and physical optics for one static "
+                    "object. Radar hardware, waveform, antennas and solver "
+                    "settings come from Settings (gear icon); the radar "
+                    "orientation is set in the control rail. Scene frame: +x "
+                    "is initial range-forward, +y is left, and +z is up. Green "
+                    "shows radar boresight; blue shows radar local +z."
+                ),
+                status=physics_status,
+                actions=(stop_physics, refine_physics),
+                banner=static_result_banner,
+            ),
+            physics_workspace,
+            sizing_mode="stretch_width",
+            min_width=0,
+            margin=0,
+            styles={"gap": "16px"},
+            css_classes=["hermes-work"],
+        ),
+        sizing_mode="stretch_width",
+        css_classes=["hermes-page"],
     )
 
     human_room_preset = pn.widgets.Select(
@@ -6098,6 +7368,7 @@ def build_app(
     human_room_scene_upload = pn.widgets.FileInput(
         label="Static environment scene (.xml, optional)",
         accept=".xml",
+        stylesheets=[_file_input_stylesheet(plot_template, compact=False)],
         description=(
             "Disabled for remotely bound sessions because scene XML can "
             "reference server-side assets. Local uploads are limited to 2 MiB."
@@ -6107,9 +7378,10 @@ def build_app(
     default_amass_motion = _default_amass_motion_path()
     default_model_dir = _default_smpl_model_dir()
     human_room_upload_help = (
-        "Upload a pickle-free AMASS-like pose archive with poses, trans, "
-        "betas, and timing. The configured SMPL model evaluates its mesh. "
-        "Browser uploads are limited to 64 MiB."
+        "Upload a pickle-free motion archive with vertices, faces, and times, "
+        "or AMASS-like poses, trans, betas, and timing. Supplied meshes are "
+        "used directly; pose-only archives need the configured SMPL model. "
+        f"Browser uploads are limited to {_MAX_MOTION_UPLOAD_BYTES // _MIB} MiB."
     )
     human_room_upload = pn.widgets.FileInput(
         label="AMASS-like human motion (.npz)",
@@ -6124,10 +7396,16 @@ def build_app(
         pn.pane.Markdown(
             "**AMASS-like human motion (.npz)**",
             margin=0,
+            styles={"white-space": "nowrap", "width": "max-content", "flex": "0 0 auto"},
+            stylesheets=[
+                ":host {width:max-content !important; padding:0 !important;} "
+                "p {margin:0 !important;}"
+            ],
         ),
-        pn.widgets.TooltipIcon(value=human_room_upload_help),
+        pn.widgets.TooltipIcon(value=human_room_upload_help, margin=0),
         sizing_mode="stretch_width",
-        styles={"align-items": "center", "gap": "4px"},
+        styles={"align-items": "center", "justify-content": "flex-start", "gap": "4px"},
+        margin=(5, 16),
     )
     human_room_upload_filename = pn.widgets.StaticText(
         value=(
@@ -6168,40 +7446,29 @@ def build_app(
         ),
         disabled=remote_access,
     )
-    human_room_x = pn.widgets.FloatSlider(
-        label="Human x / range-forward [m]",
-        start=0.5,
-        end=2.8,
-        step=0.05,
-        value=1.6,
+    load_motion_preview = pn.widgets.Button(
+        label="Load default motion", color="light",
+        visible=default_amass_motion is not None,
+        description="Load the bundled motion. Uploaded motion previews automatically.",
     )
-    human_room_y = pn.widgets.FloatSlider(
-        label="Human y / lateral-left [m]",
-        start=-2.0,
-        end=2.0,
-        step=0.05,
-        value=0.0,
+    human_room_x = compact_numeric(
+        "X [m]", start=0.5, end=2.8, step=0.01, format="0.00", value=1.6,
+        description="Range-forward position.",
     )
-    human_room_z = pn.widgets.FloatSlider(
-        label="Human z / relative height [m]",
-        start=-0.8,
-        end=1.5,
-        step=0.05,
-        value=0.0,
+    human_room_y = compact_numeric(
+        "Y [m]", start=-2.0, end=2.0, step=0.01, format="0.00", value=0.0,
+        description="Lateral-left position.",
     )
-    human_room_yaw = pn.widgets.FloatSlider(
-        label="Human yaw [deg]",
-        start=-180,
-        end=180,
-        step=1,
-        value=0,
+    human_room_z = compact_numeric(
+        "Z [m]", start=-0.8, end=1.5, step=0.01, format="0.00", value=0.0,
+        description="Height relative to the loaded motion.",
     )
-    human_room_diffuse = pn.widgets.FloatSlider(
-        label="Human diffuse reflection coefficient (RT)",
-        start=0.0,
-        end=1.0,
-        step=0.05,
-        value=0.35,
+    human_room_yaw = compact_numeric(
+        "Yaw [deg]", start=-180, end=180, step=1, value=0,
+    )
+    human_room_diffuse = compact_numeric(
+        "Diffuse (RT)", start=0.0, end=1.0, step=0.05, value=0.35, format="0.00",
+        description="Human diffuse reflection coefficient for ray tracing.",
     )
     human_room_frame = pn.widgets.IntInput(
         label="Displayed frame (max 0)",
@@ -6228,26 +7495,26 @@ def build_app(
     )
     human_room_previous_frame = pn.widgets.Button(
         label="Prev",
-        icon="chevron-left",
+        icon="player-skip-back",
         color="light",
         disabled=True,
-        width=78,
+        width=40,
         height=38,
     )
     human_room_reverse = pn.widgets.Button(
         label="Reverse",
-        icon="player-skip-back-filled",
+        icon="player-play",
         color="light",
         disabled=True,
-        width=108,
+        width=40,
         height=38,
     )
     human_room_fast_reverse = pn.widgets.Button(
         label="Fast reverse",
-        icon="player-track-prev-filled",
+        icon="player-track-prev",
         color="light",
         disabled=True,
-        width=155,
+        width=40,
         height=38,
     )
     human_room_play_pause = pn.widgets.Button(
@@ -6255,36 +7522,46 @@ def build_app(
         icon="player-play",
         color="light",
         disabled=True,
-        width=92,
+        width=40,
         height=38,
     )
     human_room_fast_forward = pn.widgets.Button(
         label="Fast forward",
-        icon="player-track-next-filled",
+        icon="player-track-next",
         color="light",
         disabled=True,
-        width=155,
+        width=40,
         height=38,
     )
     human_room_next_frame = pn.widgets.Button(
         label="Next",
-        icon="chevron-right",
+        icon="player-skip-forward",
         color="light",
         disabled=True,
-        width=82,
+        width=40,
         height=38,
     )
     human_room_transport_buttons = (
         human_room_previous_frame,
-        human_room_reverse,
         human_room_fast_reverse,
+        human_room_reverse,
         human_room_play_pause,
         human_room_fast_forward,
         human_room_next_frame,
     )
+    for button in human_room_transport_buttons:
+        button.description = button.label
+        button.margin = 0
+        button.stylesheets = [
+            ".bk-btn {font-size:0 !important;} "
+            ".bk-TablerIcon {font-size:18px !important; width:18px; height:18px;}"
+        ]
+    human_room_reverse.stylesheets += [".bk-TablerIcon {transform:rotate(180deg);}"]
+    human_room_frame_counter = pn.widgets.StaticText(value="Frame — / —", width=140)
     human_room_playback_controls = pn.Row(
         pn.Spacer(sizing_mode="stretch_width"),
         *human_room_transport_buttons,
+        human_room_frame_counter,
         pn.Spacer(sizing_mode="stretch_width"),
         sizing_mode="stretch_width",
         styles={"align-items": "center", "gap": "6px"},
@@ -6309,32 +7586,43 @@ def build_app(
         mode: pn.widgets.Checkbox(
             label=_HUMAN_ROOM_MODE_LABELS[mode],
             value=mode == "hybrid_po",
+            margin=0,
+            styles={"width": "max-content", "flex": "0 0 auto"},
         )
         for mode in HUMAN_ROOM_SIMULATION_MODES
     }
-    human_room_mode_rows = [
+    human_room_mode_options = [
         pn.Row(
             human_room_mode_checkboxes[mode],
-            pn.widgets.TooltipIcon(value=_HUMAN_ROOM_MODE_HELP[mode]),
+            pn.widgets.TooltipIcon(value=_HUMAN_ROOM_MODE_HELP[mode], margin=0),
+            sizing_mode="stretch_width", min_width=0, margin=0,
+            styles={"align-items": "center", "justify-content": "flex-start", "gap": "4px"},
         )
         for mode in HUMAN_ROOM_SIMULATION_MODES
     ]
     human_room_mode_controls = pn.Column(
-        pn.pane.Markdown("### Simulation modes"),
-        *human_room_mode_rows,
+        *(pn.Row(*human_room_mode_options[index:index + 2],
+                 sizing_mode="stretch_width", margin=(5, 10), styles={"gap": "12px"})
+          for index in range(0, len(human_room_mode_options), 2)),
         sizing_mode="stretch_width",
+        margin=0,
     )
     run_human_room = pn.widgets.Button(
         label="Start",
         icon="player-play",
         color="primary",
-        height=42,
+        width=120,
+        height=40,
+        sizing_mode="fixed",
+        disabled=True,
     )
     stop_human_room = pn.widgets.Button(
         label="Stop",
         icon="player-stop",
-        color="danger",
-        height=42,
+        color="light",
+        width=105,
+        height=40,
+        sizing_mode="fixed",
         disabled=True,
     )
     human_room_download = pn.widgets.FileDownload(
@@ -6345,7 +7633,7 @@ def build_app(
         disabled=True,
     )
     human_room_status = pn.pane.Markdown(
-        "Load AMASS-like motion, verify its placement, then start the "
+        "Load human motion, verify its placement, then start the "
         "selected simulation modes.",
         css_classes=["hermes-status"],
     )
@@ -6396,6 +7684,7 @@ def build_app(
 
     def show_human_room_playing_state(playing: bool):
         human_room_play_pause.label = "Pause" if playing else "Play"
+        human_room_play_pause.description = human_room_play_pause.label
         human_room_play_pause.icon = (
             "player-pause" if playing else "player-play"
         )
@@ -6414,6 +7703,10 @@ def build_app(
             human_room_frame.end = int(last_frame)
             human_room_frame.label = f"Displayed frame (max {int(last_frame)})"
             human_room_frame.value = int(selected_frame)
+            human_room_frame_counter.value = (
+                f"Frame {int(selected_frame)} / {int(last_frame)}"
+                if human_room_state["preview"] is not None else "Frame — / —"
+            )
             human_room_frame.disabled = bool(disabled)
             human_room_player.direction = 0
             human_room_player.end = int(last_frame)
@@ -6463,7 +7756,7 @@ def build_app(
         if human_room_upload.value:
             payload = _validated_upload_payload(
                 human_room_upload.value,
-                label="AMASS-like motion",
+                label="human motion",
                 max_bytes=_MAX_MOTION_UPLOAD_BYTES,
             )
             _preflight_gui_motion_npz(payload)
@@ -6505,7 +7798,7 @@ def build_app(
 
     def current_room_boxes_override():
         scene_source, _scene_filename = current_human_room_scene()
-        return () if scene_source is not None else None
+        return _scene_xml_boxes(scene_source) if scene_source is not None else None
 
     def current_motion_cache_key(source, filename):
         if isinstance(source, (bytes, bytearray)):
@@ -6548,8 +7841,11 @@ def build_app(
         )
 
     def mark_human_room_stale(message: str):
-        if human_room_state["result"] is not None:
-            human_room_status.object = f"**STALE:** {message}"
+        if gui_session_state["restoring"] or gui_session_state["restoring_uploads"]:
+            return
+        if settings_match_result("dynamic"):
+            refresh_result_validity()
+            return
         human_room_state["result"] = None
         human_room_state["results"] = {}
         human_room_state["diagnostics"] = None
@@ -6564,10 +7860,13 @@ def build_app(
         human_room_diagnostics_status.object = (
             "Run a simulation to enable one-frame solver overlays."
         )
-        human_room_results.objects = [pn.pane.Markdown(message)]
+        if result_records["dynamic"] is None:
+            human_room_results.objects = [pn.pane.Markdown(message)]
         persist_gui_session()
 
     async def refresh_human_room_preview(*, mark_stale: bool = True):
+        if mark_stale and gui_session_state["restoring"]:
+            return
         human_room_state["preview_revision"] += 1
         preview_revision = human_room_state["preview_revision"]
         source, filename = current_human_room_source()
@@ -6585,6 +7884,7 @@ def build_app(
             human_room_state["preview"] = None
             human_room_state["loaded_motion"] = None
             human_room_state["motion_cache_key"] = None
+            run_human_room.disabled = True
             configure_human_room_frame_controls(
                 last_frame=0,
                 selected_frame=0,
@@ -6612,15 +7912,15 @@ def build_app(
                     "run the simulation again."
                 )
             human_room_status.object = (
-                "**AMASS-like motion required.** Upload a pickle-free `.npz` "
-                "and configure the licensed SMPL model directory."
+                "**Human motion required.** Upload a pickle-free `.npz`. "
+                "Pose-only archives also need a licensed SMPL model directory."
             )
             return
         cache_key = current_motion_cache_key(source, filename)
         motion_changed = cache_key != human_room_state["motion_cache_key"]
         if motion_changed:
             human_room_status.object = (
-                "Loading AMASS parameters and SMPL model for "
+                "Loading human motion from "
                 f"{_safe_markdown_code(filename)}..."
             )
             loaded_motion = await asyncio.to_thread(
@@ -6645,10 +7945,12 @@ def build_app(
             scene_xml_filename=scene_filename,
             human_position_m=current_human_position(),
             human_yaw_deg=float(human_room_yaw.value),
+            **current_motion_coordinate_arguments(),
         )
         if preview_revision != human_room_state["preview_revision"]:
             return
         human_room_state["preview"] = preview
+        run_human_room.disabled = False
         frame_count = len(preview.mesh_sequence.times)
         last_frame = max(frame_count - 1, 0)
         selected_frame = min(
@@ -6689,11 +7991,12 @@ def build_app(
             human_room_status.object = (
                 f"**READY TO RUN** · "
                 f"{_safe_markdown_code(preview.source_name)} · "
-                f"{frame_count:,} AMASS pose frame(s) · "
+                f"{frame_count:,} motion frame(s) · "
                 f"{preview.mesh_sequence.vertex_count:,} vertices · "
                 f"{preview.mesh_sequence.face_count:,} facets · scene "
                 f"{_safe_markdown_code(preview.scene_source_name)}"
             )
+        refresh_result_validity()
 
     initial_human_preview = None
     human_room_scene = pn.pane.Plotly(
@@ -6712,6 +8015,23 @@ def build_app(
             "modeBarButtonsToRemove": ["resetCameraDefault3d"],
         },
     )
+    human_room_floor_status = pn.pane.Markdown(
+        "Load human motion to check floor placement.",
+        css_classes=["hermes-status"],
+    )
+
+    def update_human_room_floor_status(_event=None):
+        human_room_floor_status.object = next(
+            (
+                trace.meta["floor_status"]
+                for trace in human_room_scene.object.data
+                if trace.name == "Below-floor vertices"
+            ),
+            "Load human motion to check floor placement.",
+        )
+
+    human_room_scene.param.watch(update_human_room_floor_status, "object")
+    update_human_room_floor_status()
     human_room_scene_interaction = _dynamic_scene_interaction_component(
         pn,
         human_room_scene,
@@ -6761,6 +8081,14 @@ def build_app(
             )
             pn.state.notifications.error(str(exc), duration=8000)
 
+    async def on_motion_coordinate_change(event):
+        if motion_coordinate_state["syncing"]:
+            return
+        sync_motion_coordinate_controls()
+        if gui_session_state["restoring"] or settings_dialog_state["editing"]:
+            return
+        await on_human_room_controls(event)
+
     def diagnostics_for_source_frame(frame_index: int):
         diagnostics = human_room_state.get("diagnostics")
         if (
@@ -6771,6 +8099,7 @@ def build_app(
         return None
 
     def display_human_room_frame(frame_index: int):
+        human_room_frame_counter.value = f"Frame {int(frame_index)} / {int(human_room_frame.end)}"
         preview = human_room_state["preview"]
         frame_diagnostics = diagnostics_for_source_frame(frame_index)
         updated_in_place = frame_diagnostics is None and (
@@ -6791,6 +8120,7 @@ def build_app(
                 diagnostics=frame_diagnostics,
                 plot_template=plot_template,
             )
+        update_human_room_floor_status()
         diagnostics = human_room_state.get("diagnostics")
         if (
             diagnostics is not None
@@ -6933,6 +8263,8 @@ def build_app(
         step_human_room_frame(1)
 
     def on_dynamic_radar_preview_change(_event):
+        if gui_session_state["restoring"] or settings_dialog_state["editing"]:
+            return
         preview = human_room_state["preview"]
         human_room_scene.object = _human_room_scene_figure(
             preview,
@@ -6971,6 +8303,7 @@ def build_app(
         settings_button,
         apply_solver_settings,
         *solver_setting_widgets.values(),
+        *motion_coordinate_widgets.values(),
         board,
         tdm_enabled,
         tx_antennas,
@@ -6982,6 +8315,8 @@ def build_app(
         chirp_duration,
         chirp_repetition,
         sampling_frequency,
+        adc_sampling_mode,
+        adc_if_bandwidth,
         num_adc_samples,
         num_chirps,
         frame_period,
@@ -7003,12 +8338,12 @@ def build_app(
     )
 
     async def on_run_human_room(_event):
-        if human_room_state["running"]:
+        if human_room_state["running"] or gui_activity_state["dynamic"]:
             return
         source, filename = current_human_room_source()
         if source is None:
             human_room_status.object = (
-                "**AMASS-like motion required.** Upload an `.npz` first."
+                "**Human motion required.** Upload an `.npz` first."
             )
             return
         selected_modes = tuple(
@@ -7022,6 +8357,7 @@ def build_app(
             )
             return
         scene_source, scene_filename = current_human_room_scene()
+        run_settings = capture_result_settings("dynamic")
         human_room_state["revision"] += 1
         revision = human_room_state["revision"]
         mark_human_room_stale(
@@ -7037,6 +8373,7 @@ def build_app(
         )
         run_human_room.disabled = True
         stop_human_room.disabled = False
+        stop_human_room.color = "danger"
         set_gui_activity("dynamic", True)
         human_room_scene.loading = True
         human_room_results.loading = True
@@ -7049,7 +8386,10 @@ def build_app(
         )
 
         def publish_progress(event):
-            progress_events.put(dict(event))
+            # Facet callbacks remain available to the experiment diagnostics;
+            # the running display advances only with solver/frame/chirp events.
+            if "stage" not in event:
+                progress_events.put(dict(event))
 
         def refresh_progress_status():
             latest = None
@@ -7060,17 +8400,9 @@ def build_app(
                     break
             if latest is None:
                 return
-            mode = latest.get("simulation_mode")
-            mode_label = _HUMAN_ROOM_MODE_LABELS.get(
-                mode,
-                str(mode).replace("_", " ").title(),
-            )
-            frame_index = max(int(latest.get("frame_index", 0)), 0)
-            num_frames = max(int(latest.get("num_frames", 1)), 1)
-            human_room_status.object = (
-                f"**RUNNING** · {mode_label} · "
-                f"frame {min(frame_index + 1, num_frames)}/{num_frames}"
-            )
+            status = _human_room_running_status(latest)
+            if human_room_status.object != status:
+                human_room_status.object = status
 
         human_room_status.object = (
             "Running "
@@ -7107,6 +8439,7 @@ def build_app(
                 scene_xml_filename=scene_filename,
                 human_position_m=current_human_position(),
                 human_yaw_deg=float(human_room_yaw.value),
+                **current_motion_coordinate_arguments(),
                 radar_orientation_deg=current_dynamic_radar_orientation(),
                 board_model=board.value,
                 carrier_frequency_hz=float(carrier_frequency.value) * 1e9,
@@ -7114,6 +8447,8 @@ def build_app(
                 chirp_duration_s=float(chirp_duration.value) * 1e-6,
                 chirp_repetition_time_s=float(chirp_repetition.value) * 1e-6,
                 sampling_frequency_hz=float(sampling_frequency.value) * 1e6,
+                adc_mode=adc_sampling_mode.value,
+                if_bandwidth_hz=adc_if_bandwidth.value * 1e6 or None,
                 num_adc_samples=int(num_adc_samples.value),
                 num_chirps_per_frame=int(num_chirps.value),
                 frame_period_s=float(frame_period.value) * 1e-3,
@@ -7130,7 +8465,8 @@ def build_app(
                 begin_frame_index=int(human_room_begin_frame.value),
                 end_frame_index=int(human_room_end_frame.value),
                 coupling_enabled=True,
-                coupling_max_reflectors=0,
+                coupling_power_threshold_db=float(coupling_power_cutoff.value),
+                coupling_max_reflectors=int(coupling_max_count.value),
                 rt_samples_per_source=int(rt_samples.value),
                 rt_max_paths_per_source=int(rt_path_cap.value),
                 rt_max_depth=int(rt_depth.value),
@@ -7139,13 +8475,14 @@ def build_app(
                 po_quadrature_phase_span_scale_rad=float(
                     po_phase_span.value
                 ),
+                po_curvature_error_rad=float(po_curvature.value),
                 po_quadrature_max_refinement_depth=int(
                     po_refinement_depth.value
                 ),
                 po_quadrature_max_subfaces_per_parent=int(
                     po_subface_cap.value
                 ),
-                compute_backend="numpy",
+                compute_backend="auto",
                 cancel_check=cancel_event.is_set,
                 progress_callback=publish_progress,
             )
@@ -7202,10 +8539,11 @@ def build_app(
                     f"**SIMULATION READY** · {len(results)} mode(s) · "
                     f"ADC `{tuple(result.adc.shape)}` · {runtime_summary}"
                 )
+                remember_result_settings("dynamic", run_settings)
                 human_room_download.callback = lambda: _human_room_export(
                     human_room_state["result"],
                     mode_results=human_room_state["results"],
-                )
+                ) if human_room_state["result"] is not None else BytesIO()
                 human_room_download.disabled = False
                 run_human_room_diagnostics_button.disabled = False
                 human_room_diagnostics_status.object = (
@@ -7235,7 +8573,7 @@ def build_app(
                     human_room_download.callback = lambda: _human_room_export(
                         human_room_state["result"],
                         mode_results=human_room_state["results"],
-                    )
+                    ) if human_room_state["result"] is not None else BytesIO()
                     human_room_download.disabled = False
                     run_human_room_diagnostics_button.disabled = False
                     human_room_diagnostics_status.object = (
@@ -7248,10 +8586,17 @@ def build_app(
                     )
                 else:
                     retained = ""
+                    if result_records["dynamic"] is None:
+                        human_room_results.objects = [pn.pane.Markdown(
+                            "The simulation was stopped before any mode "
+                            "completed. Start again to generate results."
+                        )]
                 human_room_status.object = (
                     "**STOPPED** · The current simulation was terminated at "
                     f"the next safe solver boundary.{retained}"
                 )
+                if completed_results:
+                    remember_result_settings("dynamic", run_settings)
                 persist_gui_session()
         except Exception as exc:  # pylint: disable=broad-exception-caught
             if revision == human_room_state["revision"]:
@@ -7260,16 +8605,20 @@ def build_app(
                     f"{_safe_markdown_code(f'{type(exc).__name__}: {exc}')}"
                 )
                 pn.state.notifications.error(str(exc), duration=8000)
+                if result_records["dynamic"] is None:
+                    human_room_results.objects = [pn.pane.Markdown("The simulation failed. Correct the settings and start again.")]
         finally:
             _restore_widget_disabled_states(run_input_states)
             if revision == human_room_state["revision"]:
-                run_human_room.disabled = False
+                run_human_room.disabled = human_room_state["loaded_motion"] is None
                 stop_human_room.disabled = True
+                stop_human_room.color = "light"
                 human_room_state["running"] = False
                 set_gui_activity("dynamic", False)
                 human_room_state["cancel_event"] = None
                 human_room_scene.loading = False
                 human_room_results.loading = False
+                refresh_result_validity()
 
     def on_stop_human_room(_event):
         cancel_event = human_room_state.get("cancel_event")
@@ -7287,6 +8636,8 @@ def build_app(
         )
 
     async def on_run_human_room_diagnostics(_event):
+        if human_room_state["running"] or gui_activity_state["dynamic"]:
+            return
         results = human_room_state.get("results", {})
         if not results:
             human_room_diagnostics_status.object = (
@@ -7426,6 +8777,7 @@ def build_app(
     human_room_play_pause.on_click(on_human_room_play_pause)
     human_room_fast_forward.on_click(on_human_room_fast_forward)
     human_room_next_frame.on_click(on_human_room_next_frame)
+    load_motion_preview.on_click(on_human_room_controls)
     human_room_upload.param.watch(on_human_room_controls, "value")
     human_room_upload.param.watch(
         on_human_room_upload_filename,
@@ -7434,14 +8786,16 @@ def build_app(
     human_room_scene_upload.param.watch(on_human_room_controls, "value")
     human_room_smpl_model_dir.param.watch(on_human_room_controls, "value")
     human_room_preset.param.watch(on_human_room_controls, "value")
-    for slider in (
+    for widget in motion_coordinate_widgets.values():
+        widget.param.watch(on_motion_coordinate_change, "value")
+    for numeric in (
         human_room_x,
         human_room_y,
         human_room_z,
         human_room_yaw,
         human_room_diffuse,
     ):
-        slider.param.watch(on_human_room_controls, "value_throttled")
+        numeric.param.watch(on_human_room_controls, "value")
     human_room_frame.param.watch(on_human_room_frame, "value")
     human_room_player.param.watch(on_human_room_player, "value")
     human_room_player.param.watch(
@@ -7459,9 +8813,9 @@ def build_app(
     for mode_checkbox in human_room_mode_checkboxes.values():
         mode_checkbox.param.watch(on_human_run_option_change, "value")
     for widget, parameter in (
-        (dynamic_radar_yaw, "value_throttled"),
-        (dynamic_radar_pitch, "value_throttled"),
-        (dynamic_radar_roll, "value_throttled"),
+        (dynamic_radar_yaw, "value"),
+        (dynamic_radar_pitch, "value"),
+        (dynamic_radar_roll, "value"),
         (board, "value"),
         (tdm_enabled, "value"),
         (tx_antennas, "value"),
@@ -7473,56 +8827,58 @@ def build_app(
         (chirp_duration, "value"),
         (chirp_repetition, "value"),
         (sampling_frequency, "value"),
+        (adc_sampling_mode, "value"),
+        (adc_if_bandwidth, "value"),
         (num_adc_samples, "value"),
         (num_chirps, "value"),
         (frame_period, "value"),
     ):
         widget.param.watch(on_dynamic_radar_preview_change, parameter)
 
-    human_room_controls = pn.Card(
-        human_room_mode_controls,
-        pn.Row(
-            human_room_begin_frame,
-            human_room_end_frame,
-            sizing_mode="stretch_width",
+    human_room_controls = pn.Column(
+        _rail_nav_component(pn, (
+            ("motion", "Motion"),
+            ("modes", "Modes"),
+            ("human", "Human"),
+            ("radar", "Radar"),
+        )),
+        _rail_group(
+            pn, "motion", "Motion and scene",
+            human_room_upload_control,
+            load_motion_preview,
+            human_room_preset,
+            human_room_scene_upload,
+            human_room_smpl_model_dir,
         ),
-        pn.Row(run_human_room, stop_human_room),
-        human_room_download,
-        human_room_status,
-        pn.layout.Divider(),
-        human_room_preset,
-        human_room_scene_upload,
-        human_room_upload_control,
-        human_room_smpl_model_dir,
-        pn.pane.Markdown("### Human placement"),
-        human_room_x,
-        human_room_y,
-        human_room_z,
-        human_room_yaw,
-        human_room_diffuse,
-        pn.layout.Divider(),
-        pn.pane.Markdown("### Radar orientation"),
-        dynamic_radar_yaw,
-        dynamic_radar_pitch,
-        dynamic_radar_roll,
-        title="Dynamic scene controls",
-        collapsed=False,
-        max_width=440,
-        min_width=400,
+        _rail_group(
+            pn, "modes", "Simulation modes",
+            human_room_mode_controls,
+            pn.Row(
+                human_room_begin_frame,
+                human_room_end_frame,
+                sizing_mode="stretch_width",
+            ),
+        ),
+        _rail_group(
+            pn, "human", "Human placement",
+            numeric_row("hermes-dynamic-position", human_room_x, human_room_y, human_room_z),
+            numeric_row("hermes-dynamic-orientation", human_room_yaw, human_room_diffuse),
+        ),
+        _rail_group(
+            pn, "radar", "Radar orientation",
+            numeric_row("hermes-dynamic-radar-orientation", dynamic_radar_yaw, dynamic_radar_pitch, dynamic_radar_roll),
+        ),
+        _rail_group(pn, "export", "Export", human_room_download),
         sizing_mode="stretch_width",
-        css_classes=["hermes-control-card"],
+        min_width=380,
+        max_width=380,
+        margin=0,
+        css_classes=["hermes-rail", "hermes-scene-controls", "hermes-dynamic-controls"],
     )
     human_room_view_tabs = pn.Tabs(
         (
             "Scene and motion",
             pn.Column(
-                pn.pane.Markdown(
-                    "**Radar is fixed at (0, 0, 0).** Orbit the camera "
-                    "to inspect the prepared-room preview. For uploaded "
-                    "XML, this view shows the radar and human placement; "
-                    "the solver still uses the complete XML scene.",
-                    css_classes=["hermes-callout"],
-                ),
                 pn.Row(
                     human_room_frame,
                     human_room_diagnostic_top_k,
@@ -7530,6 +8886,7 @@ def build_app(
                     sizing_mode="stretch_width",
                 ),
                 human_room_diagnostics_status,
+                human_room_floor_status,
                 human_room_scene_interaction,
                 human_room_player,
                 human_room_playback_controls,
@@ -7544,23 +8901,45 @@ def build_app(
         # lazy mounting can otherwise leave the browser attached to the old
         # placeholder even though the server has replaced the result column.
         dynamic=False,
+        active=0,
         sizing_mode="stretch_width",
     )
-    human_room_tab = pn.Column(
-        pn.pane.Markdown(
-            "## Dynamic Scenes\n"
-            "Run a prepared or uploaded XML scene with static-environment ray "
-            "tracing and AMASS-driven dynamic-human physical optics. Hardware, waveform, "
-            "and antenna settings come from Settings; radar orientation is "
-            "configured independently for this run.",
-            css_classes=["hermes-hero"],
-        ),
-        pn.Row(
-            human_room_controls,
-            human_room_view_tabs,
+    dynamic_result_banner = pn.Column(visible=False, name="Dynamic result settings")
+    human_room_tab = pn.Row(
+        human_room_controls,
+        pn.Column(
+            _run_bar(
+                pn,
+                title="Dynamic Scenes",
+                subtitle="Moving human in a prepared or uploaded room.",
+                help_text=(
+                    "Ray tracing models the static room and physical optics "
+                    "models the moving human. Load motion, check its floor "
+                    "placement in the scene, choose simulation modes and a "
+                    "frame window, then Start. The radar is fixed at (0, 0, 0). "
+                    "Orbit the camera to inspect the floor and human placement. "
+                    "Axis-aligned cubes from uploaded XML are shown in the "
+                    "scene; the solver uses the complete XML scene. Red markers "
+                    "show human vertices below the floor surface."
+                ),
+                status=human_room_status,
+                actions=(run_human_room, stop_human_room),
+                banner=dynamic_result_banner,
+            ),
+            pn.Column(
+                human_room_view_tabs,
+                sizing_mode="stretch_width",
+                margin=0,
+                css_classes=["hermes-workspace"],
+            ),
             sizing_mode="stretch_width",
-            styles={"gap": "20px", "align-items": "flex-start"},
+            min_width=0,
+            margin=0,
+            styles={"gap": "16px"},
+            css_classes=["hermes-work"],
         ),
+        sizing_mode="stretch_width",
+        css_classes=["hermes-page"],
     )
 
     fixture_options = _source_fixture_options()
@@ -7632,7 +9011,7 @@ def build_app(
     measurement_status = pn.pane.Markdown(
         "",
         min_height=76,
-        margin=(2, 0),
+        margin=(2, 10),
         css_classes=["hermes-status", "hermes-bundle-status"],
     )
     bundle_step_one_marker = pn.pane.HTML(
@@ -7650,65 +9029,49 @@ def build_app(
         margin=0,
     )
     bundle_step_one_label = pn.pane.HTML(
-        "<strong>Load and validate</strong>",
+        "<strong>Step 1 · Load and validate</strong>",
         height=30,
         margin=0,
     )
     bundle_step_two_label = pn.pane.HTML(
-        "<strong>Configure and compare</strong>",
+        "<strong>Step 2 · Configure and compare</strong>",
         height=30,
         margin=0,
     )
-    bundle_step_line = pn.Spacer(
-        height=2,
-        min_width=50,
-        sizing_mode="stretch_width",
-        margin=(14, 12),
-    )
-    bundle_step_rail = pn.Row(
-        pn.Row(
-            bundle_step_one_marker,
-            bundle_step_one_label,
-            width=205,
-            height=30,
-            sizing_mode="fixed",
+
+    def bundle_step_heading(marker, label):
+        return pn.Row(
+            marker,
+            label,
+            sizing_mode="stretch_width",
+            margin=(0, 10),
             styles={"align-items": "center", "gap": "8px"},
-        ),
-        bundle_step_line,
-        pn.Row(
-            bundle_step_two_marker,
-            bundle_step_two_label,
-            width=250,
-            height=30,
-            sizing_mode="fixed",
-            styles={"align-items": "center", "gap": "8px"},
-        ),
-        sizing_mode="stretch_width",
-        styles={
-            "align-items": "center",
-            "background": "rgba(79, 163, 216, 0.055)",
-            "border": "1px solid var(--hermes-border)",
-            "border-radius": "10px",
-            "padding": "12px 16px",
-        },
-    )
+        )
     bundle_scene_status = pn.pane.Markdown(
         "Load the primary bundle to visualize its declared scene."
     )
-    bundle_scene_plot = pn.pane.Plotly(height=570)
+    bundle_scene_plot = pn.pane.Plotly(_empty_figure(go, plot_template), height=570)
     primary_adc_plot = pn.pane.Plotly(
+        _empty_figure(go, plot_template),
         height=330,
         sizing_mode="stretch_width",
     )
+    adc_selectors = {
+        name: pn.widgets.IntInput(label=f"ADC {name}", value=0, start=0, end=0,
+                                  disabled=True, width=130)
+        for name in ("frame", "chirp", "channel")
+    }
     candidate_adc_results = pn.Column(
         sizing_mode="stretch_width",
         visible=False,
     )
     range_profile_plot = pn.pane.Plotly(
+        _empty_figure(go, plot_template),
         height=350,
         sizing_mode="stretch_width",
     )
     primary_range_time_plot = pn.pane.Plotly(
+        _empty_figure(go, plot_template),
         height=380,
         sizing_mode="stretch_width",
     )
@@ -7717,6 +9080,7 @@ def build_app(
         visible=False,
     )
     primary_range_doppler_plot = pn.pane.Plotly(
+        _empty_figure(go, plot_template),
         height=380,
         sizing_mode="stretch_width",
     )
@@ -7770,7 +9134,7 @@ def build_app(
     )
     compare_button = pn.widgets.Button(
         label="Compare ADC products",
-        color="success",
+        color="primary",
         icon="chart-histogram",
         disabled=True,
         height=46,
@@ -7789,6 +9153,7 @@ def build_app(
         sizing_mode="fixed",
         margin=0,
         disabled=True,
+        css_classes=["hermes-icon-download"],
     )
     comparison_dependency_hint = pn.pane.Markdown(
         "🔒 **Load and validate a primary bundle to enable this step.**",
@@ -7816,6 +9181,9 @@ def build_app(
     measurement_state = {
         "bundle": None,
         "comparisons": {},
+        "adc_primary_products": None,
+        "adc_candidates": [],
+        "configuring_adc": False,
         "comparison_kind": None,
         "comparison_cache_key": None,
         "comparison_signature": None,
@@ -7834,6 +9202,41 @@ def build_app(
         "drop_tokens": {"measurement": 0, "simulated": 0},
     }
     bundle_palette = _plot_theme_tokens(plot_template)
+
+    def refresh_adc_selection(_event=None):
+        products = measurement_state["adc_primary_products"]
+        if products is None or measurement_state["configuring_adc"]:
+            return
+        loaded = measurement_state["bundle"]
+        selection = {f"{name}_index": int(widget.value) for name, widget in adc_selectors.items()}
+        suffix = " / ".join(f"{name} {widget.value}" for name, widget in adc_selectors.items())
+        primary_adc_plot.object = _adc_trace_figure(
+            products, go, title=f"{_bundle_primary_label(loaded)} ADC · {suffix}",
+            plot_template=plot_template, **selection,
+        )
+        candidate_adc_results.objects = [
+            pn.pane.Plotly(_adc_trace_figure(
+                candidate, go, title=f"{label} ADC · {suffix}",
+                plot_template=plot_template, **selection,
+            ), height=330, sizing_mode="stretch_width")
+            for label, candidate in measurement_state["adc_candidates"]
+        ]
+
+    def configure_adc_selection(products):
+        measurement_state["adc_primary_products"] = products
+        measurement_state["configuring_adc"] = True
+        try:
+            shape = products.adc.shape
+            for widget, limit in zip(adc_selectors.values(), (shape[0], shape[1], shape[3])):
+                widget.end = max(int(limit) - 1, 0)
+                widget.value = min(int(widget.value), widget.end)
+                widget.disabled = False
+        finally:
+            measurement_state["configuring_adc"] = False
+        refresh_adc_selection()
+
+    for selector in adc_selectors.values():
+        selector.param.watch(refresh_adc_selection, "value")
 
     def current_comparison_signature() -> tuple[object, ...]:
         loaded = measurement_state.get("bundle")
@@ -7903,10 +9306,6 @@ def build_app(
             "display": "flex",
             "height": "30px",
         }
-        bundle_step_line.styles = {
-            "background": "#3ecf8e" if stage >= 1 else bundle_palette["axis"],
-            "border-radius": "2px",
-        }
 
     def set_measurement_status(kind: str, title: str, detail: str) -> None:
         colors = {
@@ -7967,11 +9366,13 @@ def build_app(
     )
 
     def clear_candidate_products():
+        result_records["comparison"] = None
         measurement_state["comparisons"] = {}
         measurement_state["comparison_kind"] = None
         measurement_state["comparison_cache_key"] = None
         measurement_state["comparison_signature"] = None
         measurement_state["simulated_adcs"] = {}
+        measurement_state["adc_candidates"] = []
         metrics_pane.object = {"status": "No comparison."}
         for results in candidate_product_results:
             results.objects = []
@@ -7984,9 +9385,12 @@ def build_app(
         )
 
     def clear_primary_products():
+        measurement_state["adc_primary_products"] = None
+        for selector in adc_selectors.values():
+            selector.disabled = True
         for pane in primary_product_plots:
-            pane.object = None
-        bundle_scene_plot.object = None
+            pane.object = _empty_figure(go, plot_template)
+        bundle_scene_plot.object = _empty_figure(go, plot_template)
         bundle_scene_status.object = (
             "Load the primary bundle to visualize its declared scene."
         )
@@ -8243,6 +9647,7 @@ def build_app(
                 title=f"{primary_label} ADC · frame 0 / chirp 0 / channel 0",
                 plot_template=plot_template,
             )
+            configure_adc_selection(products)
             range_profile_plot.object = _bundle_range_profile_comparison_figure(
                 primary_label,
                 products,
@@ -8356,6 +9761,7 @@ def build_app(
         *,
         comparison_kind: str,
         configuration_signature: tuple[object, ...] | None = None,
+        result_settings=None,
     ):
         loaded = measurement_state["bundle"]
         if loaded is None or not results:
@@ -8386,6 +9792,11 @@ def build_app(
             title=f"{primary_label} ADC · frame 0 / chirp 0 / channel 0",
             plot_template=plot_template,
         )
+        measurement_state["adc_candidates"] = [
+            (f"{heading} {detail}", comparison.candidate)
+            for _key, _label, heading, detail, _adc, comparison in results
+        ]
+        configure_adc_selection(primary_products)
         range_profile_plot.object = _bundle_range_profile_comparison_figure(
             primary_label,
             primary_products,
@@ -8415,22 +9826,6 @@ def build_app(
             title=f"{primary_label} range Doppler",
             plot_template=plot_template,
         )
-        candidate_adc_results.objects = [
-            pn.pane.Plotly(
-                _adc_trace_figure(
-                    comparison.candidate,
-                    go,
-                    title=(
-                        f"{heading} ADC · {detail} · "
-                        "frame 0 / chirp 0 / channel 0"
-                    ),
-                    plot_template=plot_template,
-                ),
-                height=330,
-                sizing_mode="stretch_width",
-            )
-            for _key, _label, heading, detail, _adc, comparison in results
-        ]
         candidate_range_time_results.objects = [
             pn.pane.Plotly(
                 _range_time_figure(
@@ -8479,6 +9874,7 @@ def build_app(
             f"Primary bundle vs {_safe_markdown_text(candidate_labels)}.",
         )
         update_bundle_step_rail(2)
+        remember_result_settings("comparison", result_settings)
 
     async def on_compare(_event):
         if measurement_state["running"]:
@@ -8514,6 +9910,7 @@ def build_app(
         measurement_state["comparison_revision"] += 1
         comparison_revision = measurement_state["comparison_revision"]
         configuration_signature = current_comparison_signature()
+        run_settings = capture_result_settings("comparison")
         background_value = bool(background.value)
         clutter_value = str(clutter.value)
         channel_zero_value = bool(comparison_channel_zero.value)
@@ -8706,6 +10103,7 @@ def build_app(
                 results,
                 comparison_kind=comparison_kind,
                 configuration_signature=configuration_signature,
+                result_settings=run_settings,
             )
             channel_indices = (
                 (0,) if run_simulation and channel_zero_value else None
@@ -8718,6 +10116,7 @@ def build_app(
                 clutter_removal=clutter_value,
                 channel_indices=channel_indices,
                 configuration_signature=configuration_signature,
+                result_settings=run_settings,
             )
         except InterruptedError:
             set_comparison_status(
@@ -8767,7 +10166,7 @@ def build_app(
             compare_button.icon = "player-stop"
             compare_button.color = "danger"
             return
-        compare_button.color = "success"
+        compare_button.color = "primary"
         if run_simulation:
             compare_button.label = "Run simulation"
             compare_button.icon = "player-play"
@@ -8831,10 +10230,9 @@ def build_app(
         cancel_event = measurement_state.get("cancel_event")
         if cancel_event is not None:
             cancel_event.set()
-        clear_candidate_products()
-        if getattr(event, "obj", None) in (background, clutter):
-            for pane in primary_product_plots:
-                pane.object = None
+        if result_records["comparison"] is None:
+            clear_candidate_products()
+        refresh_result_validity()
         if measurement_state["bundle"] is not None:
             set_comparison_status(
                 "info",
@@ -8855,18 +10253,15 @@ def build_app(
             "value",
         )
     update_comparison_source_visibility()
-    measurement_controls = pn.Card(
+    measurement_controls = _rail_group(
+        pn, "load", "Step 1 · Primary bundle",
         fixture,
+        pn.Column(bundle_path, visible=False),
         measurement_dropper,
         pn.Row(background, clutter),
         load_bundle_button,
         measurement_status,
-        title="Step 1 · Primary bundle",
-        collapsed=False,
-        min_width=390,
-        sizing_mode="stretch_width",
-        styles={"flex": "1 1 500px"},
-        css_classes=["hermes-control-card"],
+        heading=bundle_step_heading(bundle_step_one_marker, bundle_step_one_label),
     )
     channel_download_row = pn.Row(
         comparison_channel_zero,
@@ -8882,20 +10277,17 @@ def build_app(
         comparison_dependency_hint,
         compare_button,
         sizing_mode="stretch_width",
-        margin=(2, 0),
+        margin=(2, 10),
     )
-    comparison_controls = pn.Card(
+    comparison_controls = _rail_group(
+        pn, "compare", "Step 2 · Bundle comparison",
         comparison_source,
         comparison_simulation_modes,
+        pn.Column(simulated_path, visible=False),
         simulated_dropper,
         comparison_actions,
-        comparison_status,
-        title="Step 2 · Bundle comparison",
-        collapsed=False,
-        min_width=390,
-        sizing_mode="stretch_width",
-        styles={"flex": "1 1 500px"},
-        css_classes=["hermes-control-card"],
+        pn.pane.Markdown("Radar and solver settings: **primary bundle**. The Settings dialog is used by Static Target and Dynamic Scenes."),
+        heading=bundle_step_heading(bundle_step_two_marker, bundle_step_two_label),
     )
     measurement_view_tabs = pn.Tabs(
         (
@@ -8905,7 +10297,11 @@ def build_app(
                 bundle_scene_plot,
             ),
         ),
-        ("ADC", pn.Row(primary_adc_plot, candidate_adc_results)),
+        ("ADC", pn.Column(
+            pn.Row(*adc_selectors.values()),
+            pn.pane.Markdown("Frame, chirp and channel indices start at 0."),
+            pn.Row(primary_adc_plot, candidate_adc_results),
+        )),
         (
             "Range profile",
             range_profile_plot,
@@ -8935,27 +10331,56 @@ def build_app(
         dynamic=False,
         sizing_mode="stretch_width",
     )
-    measurement_tab = pn.Column(
-        pn.pane.Markdown(
-            "## Bundle Comparison\n"
-            "Load a dataset-neutral HERMES directory or GUI-exported ZIP, "
-            "inspect its primary raw ADC, then run a bundle-configured "
-            "simulation or compare previously saved ADC.",
-            css_classes=["hermes-hero", "hermes-hero-no-rule"],
-        ),
-        bundle_step_rail,
-        pn.FlexBox(
-            measurement_controls,
-            comparison_controls,
-            flex_direction="row",
-            flex_wrap="wrap",
-            align_items="flex-start",
-            gap="20px",
+    comparison_result_banner = pn.Column(
+        visible=False, name="Comparison result settings",
+    )
+    measurement_rail = pn.Column(
+        _rail_nav_component(pn, (
+            ("load", "Step 1 · Load"),
+            ("compare", "Step 2 · Compare"),
+        )),
+        measurement_controls,
+        comparison_controls,
+        sizing_mode="stretch_width",
+        min_width=380,
+        max_width=380,
+        margin=0,
+        css_classes=["hermes-rail", "hermes-bundle-panels"],
+    )
+    measurement_tab = pn.Row(
+        measurement_rail,
+        pn.Column(
+            _run_bar(
+                pn,
+                title="Bundle Comparison",
+                subtitle="Measured radar ADC against a bundle-configured simulation.",
+                help_text=(
+                    "Load a dataset-neutral HERMES directory or GUI-exported "
+                    "ZIP, inspect its primary raw ADC, then run a "
+                    "bundle-configured simulation or compare previously "
+                    "saved ADC. Radar and solver settings come from the "
+                    "primary bundle; the Settings dialog applies to Static "
+                    "Target and Dynamic Scenes."
+                ),
+                status=comparison_status,
+                banner=comparison_result_banner,
+            ),
+            pn.Column(
+                measurement_view_tabs,
+                sizing_mode="stretch_width",
+                margin=0,
+                css_classes=["hermes-workspace"],
+            ),
+            # Outside the isolated workspace so its backdrop covers the run bar.
+            stop_simulation_confirmation,
             sizing_mode="stretch_width",
-            css_classes=["hermes-bundle-panels"],
+            min_width=0,
+            margin=0,
+            styles={"gap": "16px"},
+            css_classes=["hermes-work"],
         ),
-        measurement_view_tabs,
-        stop_simulation_confirmation,
+        sizing_mode="stretch_width",
+        css_classes=["hermes-page"],
     )
 
     tabs = pn.Tabs(
@@ -8990,7 +10415,7 @@ if (restored != null && typeof restored === "object") {
     0, Math.min(upper, Number.isFinite(Number(value)) ? Number(value) : 0)
   )
   workflow_tabs.active = boundedIndex(restored.top_tab, 2)
-  dynamic_tabs.active = boundedIndex(restored.dynamic_tab, 1)
+  dynamic_tabs.active = 0
   measurement_tabs.active = boundedIndex(restored.measurement_tab, 5)
   const modes = restored.dynamic_modes
   if (modes != null && typeof modes === "object") {
@@ -9029,6 +10454,7 @@ if (restored != null && typeof restored === "object") {
             "comparison_modes_selector": comparison_simulation_modes,
             "channel_zero_toggle": comparison_channel_zero,
             "simulated_path_input": simulated_path,
+            **{f"adc_{name}_selector": widget for name, widget in adc_selectors.items()},
         },
         clicks=f"""
 try {{
@@ -9046,6 +10472,11 @@ try {{
     top_tab: workflow_tabs.active,
     dynamic_tab: dynamic_tabs.active,
     measurement_tab: measurement_tabs.active,
+    adc_selection: {{
+      frame: adc_frame_selector.value,
+      chirp: adc_chirp_selector.value,
+      channel: adc_channel_selector.value,
+    }},
     dynamic_modes: {{
       full_rt: dynamic_full_rt.active,
       coherent_rt: dynamic_coherent_rt.active,
@@ -9062,7 +10493,9 @@ try {{
     background_subtraction: background_toggle.active,
     clutter_removal: clutter_selector.value,
     comparison_source: comparison_source_selector.value,
-    comparison_simulation_modes: comparison_modes_selector.value,
+    comparison_simulation_modes: comparison_modes_selector.value.map(
+      value => ({json.dumps(comparison_mode_options)})[value] ?? value
+    ),
     comparison_channel_zero: channel_zero_toggle.active,
     simulated_path: simulated_path_input.value,
     save_sequence: Date.now(),
@@ -9093,6 +10526,7 @@ window.location.assign(url.toString())
             pn.Row(
                 solver_settings_storage,
                 gui_session_storage,
+                _modal_events_component(pn),
                 pn.Spacer(sizing_mode="stretch_width"),
                 settings_button,
                 theme_button,
@@ -9105,7 +10539,6 @@ window.location.assign(url.toString())
         main_max_width="1600px",
         main_layout=None,
     )
-    settings_button.on_click(lambda _event: template.open_modal())
 
     static_session_widgets = {
         "target_type": target_type,
@@ -9139,11 +10572,14 @@ window.location.assign(url.toString())
         "chirp_duration": chirp_duration,
         "chirp_repetition": chirp_repetition,
         "sampling_frequency": sampling_frequency,
+        "adc_mode": adc_sampling_mode,
+        "if_bandwidth": adc_if_bandwidth,
         "num_adc_samples": num_adc_samples,
         "num_chirps": num_chirps,
         "frame_period": frame_period,
     }
     dynamic_session_widgets = {
+        **motion_coordinate_widgets,
         "room_preset": human_room_preset,
         "smpl_model_dir": human_room_smpl_model_dir,
         "human_x": human_room_x,
@@ -9201,8 +10637,6 @@ window.location.assign(url.toString())
     def restore_widget_values(widgets, values):
         if not isinstance(values, dict):
             return
-        import param
-
         for name, widget in widgets.items():
             if name not in values:
                 continue
@@ -9212,10 +10646,296 @@ window.location.assign(url.toString())
                     continue
                 value = tuple(int(item) for item in value)
             try:
-                with param.parameterized.discard_events(widget):
-                    widget.value = value
+                # Normal events synchronize the new browser models. Solver
+                # handlers ignore restoration, including queued async events.
+                widget.value = value
             except (TypeError, ValueError):
                 continue
+
+    # Keep the settings behind the last completed products even after edits.
+    # These records live in the bounded server cache. Only their opaque cache
+    # key is saved in browser session state.
+    result_widgets = {
+        "static": {
+            **{f"target.{key}": widget
+               for key, widget in static_solver_session_widgets.items()},
+            **{f"radar.{key}": widget
+               for key, widget in radar_session_widgets.items()},
+            **{f"solver.{key}": widget
+               for key, widget in solver_setting_widgets.items()
+               if not key.startswith("coupling_")},
+            "upload.human_mesh": human_upload,
+        },
+        "dynamic": {
+            **{f"scene.{key}": widget
+               for key, widget in dynamic_solver_session_widgets.items()},
+            **{f"radar.{key}": widget
+               for key, widget in radar_session_widgets.items()},
+            **{f"solver.{key}": widget
+               for key, widget in solver_setting_widgets.items()},
+            **{f"mode.{key}": widget
+               for key, widget in human_room_mode_checkboxes.items()},
+            "window.begin": human_room_begin_frame,
+            "window.end": human_room_end_frame,
+            "upload.motion": human_room_upload,
+            **({"upload.scene": human_room_scene_upload} if not remote_access else {}),
+        },
+        "comparison": {
+            "comparison.source": comparison_source,
+            "comparison.modes": comparison_simulation_modes,
+            "comparison.channel_zero": comparison_channel_zero,
+            "comparison.background": background,
+            "comparison.clutter": clutter,
+            "comparison.saved_path": simulated_path,
+        },
+    }
+    upload_identities = {}
+
+    def capture_result_settings(page):
+        values = {}
+        uploads = {}
+        for key, widget in result_widgets[page].items():
+            if isinstance(widget, pn.widgets.FileInput):
+                payload = widget.value or b""
+                previous = upload_identities.get(widget)
+                if previous is None or previous[0] is not payload:
+                    previous = (payload, hashlib.sha256(payload).hexdigest())
+                    upload_identities[widget] = previous
+                values[key] = [str(widget.filename or ""), previous[1]]
+                uploads[key] = (widget.filename, widget.value)
+            else:
+                value = settings_dialog_state["values"].get(widget, widget.value) \
+                    if settings_dialog_state["editing"] else widget.value
+                values[key] = session_value(value)
+        if page == "comparison":
+            loaded = measurement_state.get("bundle")
+            values["bundle"] = getattr(loaded, "fingerprint", None)
+        return {
+            "fingerprint": _result_settings_fingerprint(values),
+            "values": values,
+            "uploads": uploads,
+        }
+
+    result_records = {
+        "static": {
+            "settings": capture_result_settings("static"),
+            "result": initial_result,
+            "refined": False,
+            "status": str(physics_status.object or ""),
+        },
+        "dynamic": None,
+        "comparison": None,
+    }
+    result_banners = {
+        "static": static_result_banner,
+        "dynamic": dynamic_result_banner,
+        "comparison": comparison_result_banner,
+    }
+    result_banner_text = {}
+    result_rerun_buttons = {}
+    result_revert_buttons = {}
+    for page, banner in result_banners.items():
+        result_banner_text[page] = pn.pane.Markdown(
+            "", css_classes=["hermes-banner-text"],
+        )
+        result_rerun_buttons[page] = pn.widgets.Button(
+            label="Rerun", color="primary", width=100,
+            description="Run this page with the current settings.",
+        )
+        result_revert_buttons[page] = pn.widgets.Button(
+            label="Revert", color="light", width=100,
+            description="Restore the settings used for the displayed results.",
+        )
+        banner.objects = [
+            result_banner_text[page],
+            pn.Row(
+                result_rerun_buttons[page], result_revert_buttons[page],
+                css_classes=["hermes-banner-actions"],
+            ),
+        ]
+        banner.css_classes = ["hermes-runbar-banner"]
+        # Shown inside the run bar, whose left edge also turns amber.
+        banner.styles = {
+            "background": "rgba(214, 158, 46, 0.10)",
+            "border-radius": "8px",
+            "padding": "2px 6px 6px",
+        }
+        banner.margin = (2, 4, 4, 4)
+
+    def settings_match_result(page):
+        record = result_records[page]
+        return bool(
+            record and record["settings"]["fingerprint"]
+            == capture_result_settings(page)["fingerprint"]
+        )
+
+    def refresh_result_validity():
+        load_motion_preview.visible = (
+            default_amass_motion is not None
+            and not human_room_upload.value
+            and human_room_state["loaded_motion"] is None
+        )
+        run_human_room.disabled = (
+            human_room_state["loaded_motion"] is None
+            or human_room_state["running"]
+            or gui_activity_state["dynamic"]
+        )
+        for index, (page, title) in enumerate((
+            ("static", "Static Target"),
+            ("dynamic", "Dynamic Scenes"),
+            ("comparison", "Bundle Comparison"),
+        )):
+            record = result_records[page]
+            was_stale = result_banners[page].visible
+            current = capture_result_settings(page)
+            stale = bool(
+                record and record["settings"]["fingerprint"] != current["fingerprint"]
+            )
+            if stale:
+                previous_values = record["settings"]["values"]
+                changed = [
+                    key for key, value in current["values"].items()
+                    if previous_values.get(key) != value
+                ]
+                labels = [
+                    str(result_widgets[page][key].label or key)
+                    if key in result_widgets[page] else "Primary bundle"
+                    for key in changed
+                ]
+                result_banner_text[page].object = (
+                    "**Results need a rerun.** Changed: "
+                    + ", ".join(_safe_markdown_code(label) for label in labels)
+                    + ". The plots show the last completed run."
+                )
+                if (page == "static" and not gui_activity_state["static"]
+                        and (not was_stale or str(physics_status.object).startswith(
+                            ("**LIVE", "**HIGHER FIDELITY")))):
+                    physics_status.object = (
+                        "**LAST RUN (out of date)** · The displayed plots use previous settings."
+                    )
+                elif (page == "dynamic" and not gui_activity_state["dynamic"]
+                        and (not was_stale or str(human_room_status.object).startswith(
+                            ("**SIMULATION READY", "**READY TO RUN")))):
+                    human_room_status.object = (
+                        "**LAST RUN (out of date)** · The displayed plots use previous settings."
+                    )
+            result_banners[page].visible = stale
+            if was_stale and not stale and record and not any(gui_activity_state.values()):
+                if page == "static":
+                    physics_status.object = record.get("status", physics_status.object)
+                elif page == "dynamic":
+                    human_room_status.object = record.get("status", human_room_status.object)
+            tab_title = title + (" •" if stale else "")
+            if tabs._names[index] != tab_title:  # pylint: disable=protected-access
+                tabs._names[index] = tab_title  # pylint: disable=protected-access
+                # Panel reuses unchanged TabPanels without updating titles.
+                # Keep the mounted workflow models and update only the title.
+                for model, _parent in tabs._models.values():  # pylint: disable=protected-access
+                    def update_title(model=model, index=index, title=tab_title):
+                        from bokeh.models import CustomJS
+
+                        panel = model.tabs[index]
+                        if not panel.js_property_callbacks.get("change:title"):
+                            panel.js_on_change("title", CustomJS(
+                                args={"workflow_tabs": model},
+                                code="workflow_tabs.properties.tabs.change.emit()",
+                            ))
+                        panel.title = title
+
+                    document = model.document
+                    if document is not None and document.session_context is not None:
+                        document.add_next_tick_callback(update_title)
+                    else:
+                        update_title()
+            if page == "static" and record:
+                physics_state["result"] = None if stale else record["result"]
+                physics_state["refined"] = record["refined"]
+                gui_session_state["static_cacheable"] = not stale
+                physics_download.disabled = stale or physics_state["running"]
+                diagnostic_busy = diagnostics_state.get("cancel_event") is not None
+                show_rt_paths.disabled = stale or physics_state["running"] or diagnostic_busy
+                diagnostic_top_k.disabled = stale or physics_state["running"] or diagnostic_busy
+            elif page == "dynamic" and record:
+                human_room_state["results"] = {} if stale else record["results"]
+                human_room_state["result"] = None if stale else record["result"]
+                gui_session_state["dynamic_cacheable"] = not stale
+                human_room_download.disabled = stale or human_room_state["running"]
+                run_human_room_diagnostics_button.disabled = (
+                    stale or human_room_state["running"]
+                    or human_room_state.get("diagnostic_cancel_event") is not None
+                )
+            elif page == "comparison" and record:
+                simulated_adc_download.disabled = stale or not measurement_state["simulated_adcs"]
+            running = any(gui_activity_state.values())
+            result_rerun_buttons[page].disabled = running
+            result_revert_buttons[page].disabled = running
+
+    def remember_result_settings(page, settings=None):
+        settings = settings or capture_result_settings(page)
+        if page == "static":
+            result_records[page] = {
+                "settings": settings,
+                "result": physics_state["result"],
+                "refined": physics_state["refined"],
+                "status": str(physics_status.object or ""),
+            }
+        elif page == "dynamic":
+            result_records[page] = {
+                "settings": settings,
+                "result": human_room_state["result"],
+                "results": dict(human_room_state["results"]),
+                "status": str(human_room_status.object or ""),
+            }
+        else:
+            result_records[page] = {"settings": settings}
+
+    async def rerun_page(page):
+        if page == "static":
+            record = result_records[page]
+            fidelity = "high_fidelity" if record and record["refined"] else "preview"
+            await update_physics(fidelity=fidelity, force=True)
+        elif page == "dynamic":
+            await on_run_human_room(None)
+        else:
+            await on_compare(None)
+
+    async def revert_page_settings(page):
+        record = result_records[page]
+        if record is None:
+            return
+        gui_session_state["restoring"] = True
+        try:
+            settings = record["settings"]
+            # Board options must exist before restoring its antenna indices.
+            if page in {"static", "dynamic"}:
+                board.value = settings["values"]["radar.board"]
+                spec = get_ti_board_spec(board.value)
+                tx_antennas.options = {f"TX{i + 1}": i for i in range(spec.num_tx)}
+                rx_antennas.options = {f"RX{i + 1}": i for i in range(spec.num_rx)}
+            for key, widget in result_widgets[page].items():
+                if key in settings["uploads"]:
+                    widget.filename, widget.value = settings["uploads"][key]
+                else:
+                    widget.value = settings["values"][key]
+            update_radar_summary()
+        finally:
+            gui_session_state["restoring"] = False
+        if page == "dynamic":
+            await refresh_human_room_preview(mark_stale=False)
+            human_room_status.object = record.get("status", human_room_status.object)
+        persist_solver_settings()
+        persist_gui_uploads()
+        persist_gui_session()
+
+    for page in result_banners:
+        async def rerun(_event, page=page):
+            await rerun_page(page)
+
+        async def revert(_event, page=page):
+            await revert_page_settings(page)
+
+        result_rerun_buttons[page].on_click(rerun)
+        result_revert_buttons[page].on_click(revert)
 
     def dynamic_result_view_state():
         result_tabs = next(
@@ -9237,24 +10957,18 @@ window.location.assign(url.toString())
         )
         return {
             "product_tab": int(result_tabs.active) if result_tabs else 0,
-            "range_doppler_frame": (
+            "range_doppler_frame_index": (
                 int(range_doppler_slider.value)
                 if range_doppler_slider is not None
-                else 1
+                else 0
             ),
         }
 
     def cache_current_gui_results() -> str:
-        static_result = (
-            physics_state.get("result")
-            if gui_session_state["static_cacheable"]
-            else None
-        )
-        dynamic_results = (
-            dict(human_room_state.get("results", {}))
-            if gui_session_state["dynamic_cacheable"]
-            else {}
-        )
+        static_record = result_records["static"]
+        dynamic_record = result_records["dynamic"]
+        static_result = static_record["result"] if static_record else None
+        dynamic_results = dict(dynamic_record["results"]) if dynamic_record else {}
         signature = (
             id(static_result),
             bool(physics_state.get("refined")),
@@ -9265,13 +10979,16 @@ window.location.assign(url.toString())
             id(human_room_state.get("loaded_motion")),
             tuple((mode, id(result)) for mode, result in dynamic_results.items()),
             id(human_room_state.get("diagnostics")),
+            static_record["settings"]["fingerprint"] if static_record else None,
+            dynamic_record["settings"]["fingerprint"] if dynamic_record else None,
         )
         if signature == gui_session_state["result_signature"]:
             return str(gui_session_state["result_cache_key"])
         cache_key = _cache_theme_gui_results(
             static_result=static_result,
+            static_settings=static_record["settings"] if static_record else None,
             static_refined=bool(physics_state.get("refined")),
-            static_status=str(physics_status.object or ""),
+            static_status=static_record.get("status", "") if static_record else "",
             static_diagnostics=diagnostics_state.get("result"),
             static_diagnostics_status=str(diagnostics_status.object or ""),
             static_show_rt_paths=bool(show_rt_paths.value),
@@ -9280,8 +10997,9 @@ window.location.assign(url.toString())
             dynamic_loaded_motion=human_room_state.get("loaded_motion"),
             dynamic_motion_cache_key=human_room_state.get("motion_cache_key"),
             dynamic_results=dynamic_results,
+            dynamic_settings=dynamic_record["settings"] if dynamic_record else None,
             dynamic_diagnostics=human_room_state.get("diagnostics"),
-            dynamic_status=str(human_room_status.object or ""),
+            dynamic_status=dynamic_record.get("status", "") if dynamic_record else "",
             dynamic_diagnostics_status=str(
                 human_room_diagnostics_status.object or ""
             ),
@@ -9291,22 +11009,10 @@ window.location.assign(url.toString())
         return cache_key
 
     def persist_gui_session(_event=None):
-        if gui_session_state["restoring"]:
+        if (gui_session_state["restoring"] or solver_settings_state["restoring"]
+                or settings_dialog_state["editing"]):
             return
-        changed_widget = getattr(_event, "obj", None)
-        if changed_widget in {
-            *static_solver_session_widgets.values(),
-            *radar_session_widgets.values(),
-        }:
-            gui_session_state["static_cacheable"] = False
-        if changed_widget in {
-            *radar_session_widgets.values(),
-            *dynamic_solver_session_widgets.values(),
-            human_room_begin_frame,
-            human_room_end_frame,
-            *human_room_mode_checkboxes.values(),
-        }:
-            gui_session_state["dynamic_cacheable"] = False
+        refresh_result_validity()
         gui_session_state["save_sequence"] += 1
         uploads_present = bool(
             human_upload.value
@@ -9315,9 +11021,15 @@ window.location.assign(url.toString())
         )
         gui_session_storage.saved_state = {
             "schema_version": 2,
+            "po_defaults_version": _PO_DEFAULTS_VERSION,
+            "image_source_selection_version": _IMAGE_SOURCE_SELECTION_VERSION,
+            "po_phase_span_by_mode": current_solver_settings_payload()[
+                "po_phase_span_by_mode"
+            ],
             "top_tab": int(tabs.active),
             "dynamic_tab": int(human_room_view_tabs.active),
             "measurement_tab": int(measurement_view_tabs.active),
+            "adc_selection": {name: int(widget.value) for name, widget in adc_selectors.items()},
             "static_controls": widget_values(static_session_widgets),
             "radar_controls": widget_values(radar_session_widgets),
             "dynamic_controls": widget_values(dynamic_session_widgets),
@@ -9369,7 +11081,7 @@ window.location.assign(url.toString())
         }
 
     def persist_gui_uploads(*_events):
-        if gui_session_state["restoring_uploads"]:
+        if gui_session_state["restoring_uploads"] or gui_session_state["restoring"]:
             return
         changed_widgets = {
             getattr(event, "obj", None) for event in _events
@@ -9475,7 +11187,8 @@ window.location.assign(url.toString())
         if range_doppler_slider is not None:
             frame = int(
                 np.clip(
-                    int(view_state.get("range_doppler_frame", 1)),
+                    int(view_state.get("range_doppler_frame_index",
+                                       int(view_state.get("range_doppler_frame", 1)) - 1)),
                     int(range_doppler_slider.start),
                     int(range_doppler_slider.end),
                 )
@@ -9495,10 +11208,12 @@ window.location.assign(url.toString())
                 refined=bool(cached.get("static_refined")),
                 preserve_scene_frame=False,
                 geometry_already_previewed=False,
+                result_settings=cached.get("static_settings"),
             )
             physics_status.object = str(
                 cached.get("static_status") or physics_status.object
             )
+            result_records["static"]["status"] = physics_status.object
             static_diagnostics = cached.get("static_diagnostics")
             if static_diagnostics is not None:
                 diagnostics_state["result"] = static_diagnostics
@@ -9537,6 +11252,11 @@ window.location.assign(url.toString())
             )
             apply_pending_dynamic_frame_state(restored)
         dynamic_results = dict(cached.get("dynamic_results") or {})
+        selection_changed = (
+            restored.get("image_source_selection_version") != _IMAGE_SOURCE_SELECTION_VERSION
+        )
+        if selection_changed:
+            dynamic_results.pop("hybrid_po", None)
         if dynamic_results:
             gui_session_state["dynamic_cacheable"] = True
             primary_mode = (
@@ -9546,8 +11266,9 @@ window.location.assign(url.toString())
             )
             human_room_state["result"] = dynamic_results[primary_mode]
             human_room_state["results"] = dynamic_results
-            human_room_state["diagnostics"] = cached.get(
-                "dynamic_diagnostics"
+            remember_result_settings("dynamic", cached.get("dynamic_settings"))
+            human_room_state["diagnostics"] = (
+                None if selection_changed else cached.get("dynamic_diagnostics")
             )
             human_room_results.objects = [
                 _human_room_results_view(
@@ -9560,10 +11281,11 @@ window.location.assign(url.toString())
             human_room_status.object = str(
                 cached.get("dynamic_status") or "**SIMULATION READY**"
             )
+            result_records["dynamic"]["status"] = human_room_status.object
             human_room_download.callback = lambda: _human_room_export(
                 human_room_state["result"],
                 mode_results=human_room_state["results"],
-            )
+            ) if human_room_state["result"] is not None else BytesIO()
             human_room_download.disabled = False
             run_human_room_diagnostics_button.disabled = False
             human_room_diagnostics_status.object = str(
@@ -9575,7 +11297,18 @@ window.location.assign(url.toString())
             restore_dynamic_result_view(restored)
         gui_session_state["result_cache_key"] = cache_key
 
-    def restore_gui_session(event):
+    def restore_gui_session(event, *, page_ready=False):
+        # After a theme reload the browser reports its saved state before
+        # its document_ready event. Until then Panel leaves held layout
+        # updates unsent while their new models are already in the document;
+        # a browser message arriving in between makes Bokeh treat those
+        # models as known, so restored result views would reach the browser
+        # without their definitions. Restore once the page is connected.
+        # (Panel reports ``loaded`` only after its onload callbacks finish,
+        # so the deferred call says it is ready instead of asking again.)
+        if not page_ready and not pn.state.loaded:
+            pn.state.onload(lambda: restore_gui_session(event, page_ready=True))
+            return
         restored = getattr(event, "new", None)
         if not isinstance(restored, dict) or restored.get("schema_version") not in {
             1,
@@ -9589,7 +11322,8 @@ window.location.assign(url.toString())
 
             for navigation, value, upper in (
                 (tabs, restored.get("top_tab", 0), 2),
-                (human_room_view_tabs, restored.get("dynamic_tab", 0), 1),
+                # Always land on the scene; cached results remain in their tab.
+                (human_room_view_tabs, 0, 1),
                 (measurement_view_tabs, restored.get("measurement_tab", 0), 5),
             ):
                 # These changes must emit Param events so Panel updates the
@@ -9603,8 +11337,7 @@ window.location.assign(url.toString())
             if isinstance(radar_values, dict) and "board" in radar_values:
                 restored_board = str(radar_values["board"])
                 if restored_board in board.options:
-                    with param.parameterized.discard_events(board):
-                        board.value = restored_board
+                    board.value = restored_board
                     selected_spec = get_ti_board_spec(board.value)
                     tx_antennas.options = {
                         f"TX{index + 1}": index
@@ -9619,27 +11352,29 @@ window.location.assign(url.toString())
                 static_session_widgets,
                 restored.get("static_controls", {}),
             )
+            motion_forward_axis.options = motion_axis_options
             restore_widget_values(
                 dynamic_session_widgets,
                 restored.get("dynamic_controls", {}),
             )
-            restored_solver_settings = _validated_solver_settings_payload(
+            sync_motion_coordinate_controls()
+            restored_solver_settings, _ = restore_solver_settings(
                 {
                     "schema_version": _SOLVER_SETTINGS_SCHEMA_VERSION,
+                    "po_defaults_version": restored.get("po_defaults_version"),
+                    "po_phase_span_by_mode": restored.get("po_phase_span_by_mode"),
                     "settings": restored.get("solver_settings", {}),
                 }
             )
-            solver_settings_state["restoring"] = True
-            try:
-                for name, value in restored_solver_settings.items():
-                    widget = solver_setting_widgets[name]
-                    if widget.value != value:
-                        # Emit the normal widget event so the newly themed
-                        # browser receives the restored value.  The dedicated
-                        # guard prevents intermediate local-storage writes.
-                        widget.value = value
-            finally:
-                solver_settings_state["restoring"] = False
+            previous_solver_settings = restored.get("solver_settings", {})
+            po_defaults_changed = (
+                isinstance(previous_solver_settings, dict)
+                and any(
+                    name.startswith("po_")
+                    and previous_solver_settings.get(name) != value
+                    for name, value in restored_solver_settings.items()
+                )
+            )
             restored_dynamic_modes = restored.get("dynamic_modes", {})
             if isinstance(restored_dynamic_modes, dict):
                 for mode, checkbox in human_room_mode_checkboxes.items():
@@ -9661,11 +11396,11 @@ window.location.assign(url.toString())
             human_upload.visible = is_human
             human_diffuse.visible = is_human
             human_source.visible = is_human
-            human_notice.visible = is_human
             update_material_details()
             update_antenna_pattern_controls()
             update_radar_summary()
-            restore_cached_gui_results(restored)
+            if not po_defaults_changed:
+                restore_cached_gui_results(restored)
 
             has_bundle_state = any(
                 key in restored
@@ -9741,7 +11476,22 @@ window.location.assign(url.toString())
         except (TypeError, ValueError):
             return
         finally:
-            gui_session_state["restoring"] = False
+            def finish_restoration():
+                gui_session_state["restoring"] = False
+                refresh_result_validity()
+                persist_gui_session()
+
+            document = pn.state.curdoc
+            if document is not None and document.session_context is not None:
+                document.add_next_tick_callback(finish_restoration)
+            else:
+                try:
+                    loop = asyncio.get_running_loop()
+                except RuntimeError:
+                    finish_restoration()
+                else:
+                    # Queued widget watchers must see the restoration guard.
+                    loop.call_soon(finish_restoration)
 
         if restored.get("has_uploads") or restored.get("has_motion"):
             pass
@@ -9765,6 +11515,9 @@ window.location.assign(url.toString())
             await on_load_bundle(None)
             if measurement_state["bundle"] is None:
                 return
+            for name, widget in adc_selectors.items():
+                value = restored.get("adc_selection", {}).get(name, 0)
+                widget.value = int(np.clip(int(value), 0, widget.end))
             restored_source = str(restored.get("comparison_source", "run"))
             if restored_source in comparison_source.options.values():
                 comparison_source.value = restored_source
@@ -9776,14 +11529,6 @@ window.location.assign(url.toString())
                 comparison_cache_key,
                 bundle_fingerprint=measurement_state["bundle"].fingerprint,
             )
-            if (
-                cached_comparison is not None
-                and cached_comparison.get("configuration_signature")
-                is not None
-                and tuple(cached_comparison["configuration_signature"])
-                != current_comparison_signature()
-            ):
-                cached_comparison = None
             if bool(restored.get("comparison_completed")) and cached_comparison:
                 set_comparison_status(
                     "info",
@@ -9809,7 +11554,8 @@ window.location.assign(url.toString())
                 render_comparison_results(
                     cached_results,
                     comparison_kind=str(cached_comparison["comparison_kind"]),
-                    configuration_signature=current_comparison_signature(),
+                    configuration_signature=cached_comparison.get("configuration_signature"),
+                    result_settings=cached_comparison.get("result_settings"),
                 )
                 persist_gui_session()
                 return
@@ -9854,7 +11600,11 @@ window.location.assign(url.toString())
             return None
         return (filename, payload) if payload else None
 
-    def restore_gui_uploads(event):
+    def restore_gui_uploads(event, *, page_ready=False):
+        # Same ordering as restore_gui_session: wait for the connected page.
+        if not page_ready and not pn.state.loaded:
+            pn.state.onload(lambda: restore_gui_uploads(event, page_ready=True))
+            return
         restored = getattr(event, "new", None)
         if not isinstance(restored, dict):
             return
@@ -9903,6 +11653,8 @@ window.location.assign(url.toString())
         finally:
             gui_session_state["restoring_uploads"] = False
 
+        refresh_result_validity()
+
         if human_room_state.get("preview") is not None:
             persist_gui_session()
             return
@@ -9942,6 +11694,7 @@ window.location.assign(url.toString())
         human_room_begin_frame,
         human_room_end_frame,
         *human_room_mode_checkboxes.values(),
+        *adc_selectors.values(),
     ):
         widget.param.watch(persist_gui_session, "value")
     for comparison_widget, parameter_name in (
@@ -9967,51 +11720,97 @@ window.location.assign(url.toString())
     persist_gui_uploads()
     persist_gui_session()
 
-    solver_settings_state = {"restoring": False}
-
     def persist_solver_settings(_event=None):
-        if solver_settings_state["restoring"]:
+        if solver_settings_state["restoring"] or settings_dialog_state["editing"]:
             return
         solver_settings_storage.saved_settings = (
             current_solver_settings_payload()
         )
+        persist_gui_session(_event)
 
     async def on_solver_settings_loaded(event):
-        restored = _validated_solver_settings_payload(
-            getattr(event, "new", None)
-        )
-        changed = False
-        solver_settings_state["restoring"] = True
-        try:
-            for name, value in restored.items():
-                widget = solver_setting_widgets[name]
-                if widget.value != value:
-                    widget.value = value
-                    changed = True
-        finally:
-            solver_settings_state["restoring"] = False
+        if gui_session_state["restoring"]:
+            return
+        # The session snapshot owns settings on a theme reload. A later
+        # localStorage bridge event must not replace that restored snapshot.
+        if gui_session_state["restored_state"]:
+            persist_solver_settings()
+            refresh_result_validity()
+            return
+        restore_solver_settings(getattr(event, "new", None))
 
         # Rewrite partial or outdated payloads in the current complete schema.
         persist_solver_settings()
-        if changed:
-            await update_physics(
-                fidelity="preview",
-                preserve_scene_frame=True,
-            )
-            mark_human_room_stale(
-                "Shared solver settings changed; run the simulation again."
-            )
+        # A storage restore is not an edit or a request to run a solver.
+        refresh_result_validity()
 
     async def on_apply_solver_settings(_event):
+        motion_changed = settings_dialog_state["editing"] and any(
+            widget.value != settings_dialog_state["values"][widget]
+            for widget in motion_coordinate_widgets.values()
+        )
+        settings_dialog_state["editing"] = False
+        ignored_radar_events.clear()
         persist_solver_settings()
         template.close_modal()
-        await update_physics(
-            fidelity="preview",
-            preserve_scene_frame=True,
-        )
-        mark_human_room_stale(
-            "Shared solver settings changed; run the simulation again."
-        )
+        theme_button.disabled = any(gui_activity_state.values())
+        if motion_changed and human_room_state["loaded_motion"] is not None:
+            await on_human_room_controls(None)
+        if rerun_after_apply.value:
+            await rerun_page(("static", "dynamic", "comparison")[tabs.active])
+
+    def on_open_settings(_event):
+        settings_dialog_state["values"] = {
+            widget: session_value(widget.value)
+            for widget in (*radar_session_widgets.values(), *solver_setting_widgets.values(),
+                           *motion_coordinate_widgets.values())
+        }
+        settings_dialog_state["phase_spans"] = dict(phase_span_by_mode)
+        settings_dialog_state["editing"] = True
+        rerun_after_apply.value = False
+        theme_button.disabled = True
+        template.open_modal()
+
+    async def on_cancel_settings(_event):
+        if not settings_dialog_state["editing"]:
+            return
+        gui_session_state["restoring"] = True
+        solver_settings_state["restoring"] = True
+        try:
+            saved = settings_dialog_state["values"]
+            board.value = saved[board]
+            spec = get_ti_board_spec(board.value)
+            tx_antennas.options = {f"TX{i + 1}": i for i in range(spec.num_tx)}
+            rx_antennas.options = {f"RX{i + 1}": i for i in range(spec.num_rx)}
+            for widget, value in saved.items():
+                widget.value = value
+            phase_span_by_mode.clear()
+            phase_span_by_mode.update(settings_dialog_state["phase_spans"])
+            update_antenna_pattern_controls()
+            sync_motion_coordinate_controls()
+            update_radar_summary()
+            await asyncio.sleep(0)
+        finally:
+            solver_settings_state["restoring"] = False
+            gui_session_state["restoring"] = False
+            settings_dialog_state["editing"] = False
+            ignored_radar_events.clear()
+        template.close_modal()
+        theme_button.disabled = any(gui_activity_state.values())
+        persist_gui_session()
+
+    settings_button.on_click(on_open_settings)
+    cancel_solver_settings.on_click(on_cancel_settings)
+    modal_events = next(c for c in template.header[0].select(pn.reactive.ReactiveHTML)
+                        if "dismissed" in c.param)
+    modal_events.param.watch(on_cancel_settings, "dismissed")
+
+    for key, widget in {**radar_session_widgets, **solver_setting_widgets, **motion_coordinate_widgets}.items():
+        used_by = ("Dynamic Scenes" if key in motion_coordinate_widgets
+                   else "Dynamic Scenes (Hybrid PO)" if key.startswith("coupling_")
+                   else "Static Target, Dynamic Scenes")
+        if "description" in widget.param:
+            widget.description = (widget.description or "") + f" Used by: {used_by}."
 
     solver_settings_storage.param.watch(
         on_solver_settings_loaded,
@@ -10020,6 +11819,22 @@ window.location.assign(url.toString())
     for solver_widget in solver_setting_widgets.values():
         solver_widget.param.watch(persist_solver_settings, "value")
     apply_solver_settings.on_click(on_apply_solver_settings)
+
+    for workflow in (physics_tab, human_room_tab):
+        for pane in workflow.select(pn.pane.Markdown):
+            if "hermes-status" in pane.css_classes:
+                pane.styles = {**pane.styles, "min-height": "0"}
+                pane.margin = (3, 10)
+    for controls in (
+        physics_controls, human_room_controls, measurement_rail, settings_modal,
+    ):
+        _compact_controls(controls, pn)
+    _readable_markdown(tabs, pn, plot_template)
+    _readable_markdown(settings_modal, pn, plot_template)
+    _style_secondary_buttons(tabs, pn, plot_template)
+    _style_secondary_buttons(settings_modal, pn, plot_template)
+    for tab_group in (*tabs.select(pn.Tabs), *settings_modal.select(pn.Tabs)):
+        _fit_active_tab_height(tab_group)
 
     def cancel_session_work(_session_context) -> None:
         physics_state["revision"] += 1
