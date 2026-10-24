@@ -68,7 +68,33 @@ comparisons. Review the [0.2.0 validation report](docs/releases/0.2.0.md) and
 Detailed settings and runtime behavior are in the [user guide](docs/user_guide.md).
 See also [API and bundle stability](docs/stability.md),
 [contributing](CONTRIBUTING.md), and [issue reporting](https://github.com/wisermaclab/hermes/issues).
-Citation metadata is available in [CITATION.cff](CITATION.cff).
+
+## Citation
+
+If you use HERMES in your research, please cite our demo paper:
+
+Rong Zheng and Mihail Georgiev. 2026.
+[Demo: HERMES: Human-Environment Radar ModEling and Simulation for mmWave FMCW radars](https://dl.acm.org/doi/10.1145/3795866.3848430).
+In *Proceedings of the 32nd Annual International Conference on Mobile Computing
+and Networking (MobiCom '26)*, 1867–1869. ACM.
+
+```bibtex
+@inproceedings{zheng2026hermes,
+  author    = {Zheng, Rong and Georgiev, Mihail},
+  title     = {{Demo: HERMES: Human-Environment Radar ModEling and Simulation
+                for mmWave FMCW radars}},
+  booktitle = {Proceedings of the 32nd Annual International Conference
+               on Mobile Computing and Networking},
+  series    = {MobiCom '26},
+  year      = {2026},
+  pages     = {1867--1869},
+  publisher = {ACM},
+  doi       = {10.1145/3795866.3848430},
+  url       = {https://dl.acm.org/doi/10.1145/3795866.3848430}
+}
+```
+
+For the software version used in your work, see [CITATION.cff](CITATION.cff).
 
 ## License
 
