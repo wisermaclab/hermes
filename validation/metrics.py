@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+from mmWaveRadar.dsp.profiles import mean_range_profile
 from dataclasses import asdict, dataclass
 
 import numpy as np
@@ -22,8 +23,7 @@ class MeshRangeSummary:
         """Converts NumPy range arrays into JSON-compatible lists."""
 
         return {
-            key: np.asarray(value, dtype=float).tolist()
-            for key, value in asdict(self).items()
+            key: np.asarray(value, dtype=float).tolist() for key, value in asdict(self).items()
         }
 
 
@@ -42,9 +42,7 @@ class DSPMapMetrics:
         return {
             "normalized_correlation": float(self.normalized_correlation),
             "peak_range_error_m": float(self.peak_range_error_m),
-            "reference_gate_energy_ratio": float(
-                self.reference_gate_energy_ratio
-            ),
+            "reference_gate_energy_ratio": float(self.reference_gate_energy_ratio),
             "estimate_gate_energy_ratio": float(self.estimate_gate_energy_ratio),
         }
 
@@ -81,9 +79,7 @@ def _broadcast_background(background_adc: np.ndarray, adc_shape: tuple[int, ...]
         return background[None, ...]
     if background.shape == (1, *adc_shape[1:]):
         return background
-    raise ValueError(
-        "background_adc must have shape [F,M,N,C], [M,N,C], or [1,M,N,C]"
-    )
+    raise ValueError("background_adc must have shape [F,M,N,C], [M,N,C], or [1,M,N,C]")
 
 
 def suppress_zero_doppler(power_map: np.ndarray, *, width_bins: int = 1) -> np.ndarray:
@@ -166,7 +162,16 @@ def range_gate_mask(
     ranges = np.asarray(ranges_m, dtype=float)
     lo = float(np.min(summary.min_m))
     hi = float(np.max(summary.max_m))
-    return (ranges >= lo) & (ranges <= hi)
+    gate = (ranges >= lo) & (ranges <= hi)
+    if not np.any(gate) and ranges.size > 1 and np.all(np.diff(ranges) > 0):
+        # A thin static target can fall between bin centres. In that case use
+        # the cells overlapping its extent, rather than reporting empty-gate
+        # NaNs. Targets beyond the sampled range still produce an empty gate.
+        midpoints = (ranges[:-1] + ranges[1:]) / 2
+        left = np.r_[ranges[0] - (ranges[1] - ranges[0]) / 2, midpoints]
+        right = np.r_[midpoints, ranges[-1] + (ranges[-1] - ranges[-2]) / 2]
+        gate = (right >= lo) & (left <= hi)
+    return gate
 
 
 def energy_ratio_in_range_gate(
@@ -208,11 +213,7 @@ def peak_range_error_m(
     return float(abs(est_range - ref_range))
 
 
-def _range_profile(power_map: np.ndarray) -> np.ndarray:
-    power = np.asarray(power_map, dtype=float)
-    if power.ndim == 1:
-        return power
-    return np.mean(power, axis=tuple(range(power.ndim - 1)))
+_range_profile = mean_range_profile
 
 
 def dsp_map_metrics(

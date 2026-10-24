@@ -10,7 +10,6 @@ from typing import Iterable
 
 import numpy as np
 
-
 _INVALID_INDEX = np.uint32(0xFFFFFFFF)
 
 
@@ -26,6 +25,8 @@ def _valid_by_path(paths) -> np.ndarray:
     """Reduces Sionna path validity over all non-path axes."""
 
     valid = np.asarray(paths.valid.numpy(), dtype=bool)
+    if valid.ndim == 0 or valid.size == 0:
+        return np.zeros(valid.shape[-1] if valid.ndim else 0, dtype=bool)
     return np.any(valid.reshape(-1, valid.shape[-1]), axis=0)
 
 
@@ -37,6 +38,8 @@ def _path_hits_object(paths, object_ids: Iterable[int]) -> np.ndarray:
     valid = np.asarray(paths.valid.numpy(), dtype=bool)
     num_paths = valid.shape[-1]
     hits = np.zeros((num_paths,), dtype=bool)
+    if num_paths == 0:
+        return hits
     for object_id in ids:
         object_hits = objects == object_id
         object_hits = object_hits.reshape(-1, num_paths)
@@ -44,9 +47,13 @@ def _path_hits_object(paths, object_ids: Iterable[int]) -> np.ndarray:
     return hits
 
 
-def top_path_indices(paths, k: int = 8, *,
-                     required_object_ids: Iterable[int] = (),
-                     excluded_object_ids: Iterable[int] = ()) -> TopPathSelection:
+def top_path_indices(
+    paths,
+    k: int = 8,
+    *,
+    required_object_ids: Iterable[int] = (),
+    excluded_object_ids: Iterable[int] = (),
+) -> TopPathSelection:
     """
     Selects the strongest path indices based on aggregate CIR magnitude.
 
@@ -57,15 +64,15 @@ def top_path_indices(paths, k: int = 8, *,
         raise ValueError("k must be non-negative")
     if k == 0:
         return TopPathSelection(
-            indices=np.empty((0,), dtype=int),
-            magnitudes=np.empty((0,), dtype=float))
+            indices=np.empty((0,), dtype=int), magnitudes=np.empty((0,), dtype=float)
+        )
 
     a, _ = paths.cir(normalize_delays=False, out_type="numpy")
     a = np.asarray(a)
     if a.ndim < 2:
         return TopPathSelection(
-            indices=np.empty((0,), dtype=int),
-            magnitudes=np.empty((0,), dtype=float))
+            indices=np.empty((0,), dtype=int), magnitudes=np.empty((0,), dtype=float)
+        )
 
     path_axis = a.ndim - 2
     reduce_axes = tuple(i for i in range(a.ndim) if i != path_axis)
@@ -86,13 +93,12 @@ def top_path_indices(paths, k: int = 8, *,
     finite = np.isfinite(magnitudes)
     if not np.any(finite):
         return TopPathSelection(
-            indices=np.empty((0,), dtype=int),
-            magnitudes=np.empty((0,), dtype=float))
+            indices=np.empty((0,), dtype=int), magnitudes=np.empty((0,), dtype=float)
+        )
 
     order = np.argsort(magnitudes)[::-1]
     order = order[finite[order]][:k]
-    return TopPathSelection(indices=order.astype(int),
-                            magnitudes=magnitudes[order].astype(float))
+    return TopPathSelection(indices=order.astype(int), magnitudes=magnitudes[order].astype(float))
 
 
 def path_lengths_m(paths, selection: TopPathSelection) -> np.ndarray:
@@ -111,8 +117,7 @@ def path_lengths_m(paths, selection: TopPathSelection) -> np.ndarray:
         if path_index >= num_paths:
             lengths.append(np.nan)
             continue
-        mask = valid[:, path_index] & np.isfinite(tau[:, path_index]) \
-            & (tau[:, path_index] >= 0.0)
+        mask = valid[:, path_index] & np.isfinite(tau[:, path_index]) & (tau[:, path_index] >= 0.0)
         if not np.any(mask):
             lengths.append(np.nan)
             continue
@@ -125,7 +130,8 @@ def _synthetic_path_components(paths):
 
     if not paths.synthetic_array:
         raise NotImplementedError(
-            "Top-path mesh highlighting currently expects synthetic_array=True")
+            "Top-path mesh highlighting currently expects synthetic_array=True"
+        )
     return (
         np.asarray(paths.vertices.numpy(), dtype=float),
         np.asarray(paths.valid.numpy(), dtype=bool),
@@ -135,8 +141,7 @@ def _synthetic_path_components(paths):
     )
 
 
-def top_path_segments(paths, selection: TopPathSelection, *,
-                      line_color=None):
+def top_path_segments(paths, selection: TopPathSelection, *, line_color=None):
     """
     Returns line segments for the selected top paths.
 
@@ -149,8 +154,7 @@ def top_path_segments(paths, selection: TopPathSelection, *,
     src_positions = np.asarray(paths.sources.numpy()).T
     tgt_positions = np.asarray(paths.targets.numpy()).T
 
-    line_color = (None if line_color is None
-                  else np.asarray(line_color, dtype=float))
+    line_color = None if line_color is None else np.asarray(line_color, dtype=float)
     starts, ends, colors = [], [], []
     selected = set(int(i) for i in selection.indices)
     for rx in range(valid.shape[0]):
@@ -169,8 +173,7 @@ def top_path_segments(paths, selection: TopPathSelection, *,
                     ends.append(end)
                     colors.append(color if line_color is None else line_color)
                     start = end
-                    color = INTERACTION_TYPE_TO_COLOR.get(int(interaction),
-                                                          color)
+                    color = INTERACTION_TYPE_TO_COLOR.get(int(interaction), color)
                 starts.append(start)
                 ends.append(tgt_positions[rx])
                 colors.append(color if line_color is None else line_color)
@@ -179,9 +182,11 @@ def top_path_segments(paths, selection: TopPathSelection, *,
         empty = np.empty((0, 3), dtype=float)
         return empty, empty, empty
 
-    return (np.vstack(starts).astype(float),
-            np.vstack(ends).astype(float),
-            np.vstack(colors).astype(float))
+    return (
+        np.vstack(starts).astype(float),
+        np.vstack(ends).astype(float),
+        np.vstack(colors).astype(float),
+    )
 
 
 def mesh_face_hits(paths, targets: Iterable, selection: TopPathSelection):
@@ -198,8 +203,7 @@ def mesh_face_hits(paths, targets: Iterable, selection: TopPathSelection):
             for rx in range(valid.shape[0]):
                 for tx in range(valid.shape[1]):
                     for path_index in selected:
-                        if (path_index >= valid.shape[2]
-                                or not valid[rx, tx, path_index]):
+                        if path_index >= valid.shape[2] or not valid[rx, tx, path_index]:
                             continue
                         if int(objects[depth, rx, tx, path_index]) != object_id:
                             continue
@@ -219,15 +223,22 @@ def target_object_ids(targets: Iterable) -> list[int]:
     ]
 
 
-def preview_top_paths(scene, paths, targets: Iterable = (), *,
-                      top_k: int = 8, clip_at: float | None = None,
-                      resolution=(900, 650), line_width: float = 4.0,
-                      face_color=(1.0, 0.35, 0.05),
-                      target_path_color=None,
-                      environment_top_k: int = 0,
-                      environment_path_color=(0.05, 0.45, 1.0),
-                      mesh_time: float | None = None,
-                      require_target_hit: bool = False):
+def preview_top_paths(
+    scene,
+    paths,
+    targets: Iterable = (),
+    *,
+    top_k: int = 8,
+    clip_at: float | None = None,
+    resolution=(900, 650),
+    line_width: float = 4.0,
+    face_color=(1.0, 0.35, 0.05),
+    target_path_color=None,
+    environment_top_k: int = 0,
+    environment_path_color=(0.05, 0.45, 1.0),
+    mesh_time: float | None = None,
+    require_target_hit: bool = False,
+):
     """
     Shows the scene with Sionna's preview widget and overlays top-K paths.
 
@@ -237,29 +248,29 @@ def preview_top_paths(scene, paths, targets: Iterable = (), *,
     targets = list(targets)
     target_ids = target_object_ids(targets)
     required_ids = target_ids if require_target_hit else ()
-    selection = top_path_indices(paths, top_k,
-                                 required_object_ids=required_ids)
-    environment_selection = top_path_indices(
-        paths,
-        environment_top_k,
-        excluded_object_ids=target_ids,
-    ) if environment_top_k > 0 else TopPathSelection(
-        indices=np.empty((0,), dtype=int),
-        magnitudes=np.empty((0,), dtype=float))
-    scene.preview(clip_at=clip_at, paths=None, resolution=resolution,
-                  show_devices=True, point_picker=True)
+    selection = top_path_indices(paths, top_k, required_object_ids=required_ids)
+    environment_selection = (
+        top_path_indices(
+            paths,
+            environment_top_k,
+            excluded_object_ids=target_ids,
+        )
+        if environment_top_k > 0
+        else TopPathSelection(
+            indices=np.empty((0,), dtype=int), magnitudes=np.empty((0,), dtype=float)
+        )
+    )
+    scene.preview(
+        clip_at=clip_at, paths=None, resolution=resolution, show_devices=True, point_picker=True
+    )
 
     widget = scene._preview_widget  # pylint: disable=protected-access
-    starts, ends, colors = top_path_segments(
-        paths,
-        selection,
-        line_color=target_path_color)
+    starts, ends, colors = top_path_segments(paths, selection, line_color=target_path_color)
     if starts.size:
         widget._plot_lines(starts, ends, colors, line_width)  # pylint: disable=protected-access
     starts, ends, colors = top_path_segments(
-        paths,
-        environment_selection,
-        line_color=environment_path_color)
+        paths, environment_selection, line_color=environment_path_color
+    )
     if starts.size:
         widget._plot_lines(starts, ends, colors, line_width)  # pylint: disable=protected-access
 
@@ -268,47 +279,56 @@ def preview_top_paths(scene, paths, targets: Iterable = (), *,
         face_indices = hits.get(target.name, np.empty((0,), dtype=int))
         if face_indices.size == 0:
             continue
-        time = (float(target.mesh_sequence.times[0]) if mesh_time is None
-                else float(mesh_time))
+        time = float(target.mesh_sequence.times[0]) if mesh_time is None else float(mesh_time)
         vertices = np.asarray(target.update_to_time(time))
         faces = np.asarray(target.mesh_sequence.faces[face_indices], dtype=np.uint32)
-        widget._plot_mesh(vertices, faces, persist=False,  # pylint: disable=protected-access
-                          colors=np.asarray(face_color, dtype=np.float32))
+        widget._plot_mesh(
+            vertices,
+            faces,
+            persist=False,  # pylint: disable=protected-access
+            colors=np.asarray(face_color, dtype=np.float32),
+        )
 
     return selection, hits
 
 
-def plot_top_paths_with_mesh_hits(paths, targets: Iterable, *,
-                                  top_k: int = 8, ax=None,
-                                  mesh_time: float | None = None,
-                                  target_path_color=(1.0, 0.35, 0.05),
-                                  environment_top_k: int = 0,
-                                  environment_path_color=(0.05, 0.45, 1.0),
-                                  require_target_hit: bool = False):
+def plot_top_paths_with_mesh_hits(
+    paths,
+    targets: Iterable,
+    *,
+    top_k: int = 8,
+    ax=None,
+    mesh_time: float | None = None,
+    target_path_color=(1.0, 0.35, 0.05),
+    environment_top_k: int = 0,
+    environment_path_color=(0.05, 0.45, 1.0),
+    require_target_hit: bool = False,
+):
     """Creates a static Matplotlib 3D plot of top-K paths and mesh face hits."""
     import matplotlib.pyplot as plt  # pylint: disable=import-outside-toplevel
-    from mpl_toolkits.mplot3d.art3d import Poly3DCollection  # pylint: disable=import-outside-toplevel
+    from mpl_toolkits.mplot3d.art3d import (
+        Poly3DCollection,
+    )  # pylint: disable=import-outside-toplevel
 
     targets = list(targets)
     target_ids = target_object_ids(targets)
     required_ids = target_ids if require_target_hit else ()
-    selection = top_path_indices(paths, top_k,
-                                 required_object_ids=required_ids)
-    environment_selection = top_path_indices(
-        paths,
-        environment_top_k,
-        excluded_object_ids=target_ids,
-    ) if environment_top_k > 0 else TopPathSelection(
-        indices=np.empty((0,), dtype=int),
-        magnitudes=np.empty((0,), dtype=float))
-    starts, ends, colors = top_path_segments(
-        paths,
-        selection,
-        line_color=target_path_color)
+    selection = top_path_indices(paths, top_k, required_object_ids=required_ids)
+    environment_selection = (
+        top_path_indices(
+            paths,
+            environment_top_k,
+            excluded_object_ids=target_ids,
+        )
+        if environment_top_k > 0
+        else TopPathSelection(
+            indices=np.empty((0,), dtype=int), magnitudes=np.empty((0,), dtype=float)
+        )
+    )
+    starts, ends, colors = top_path_segments(paths, selection, line_color=target_path_color)
     env_starts, env_ends, env_colors = top_path_segments(
-        paths,
-        environment_selection,
-        line_color=environment_path_color)
+        paths, environment_selection, line_color=environment_path_color
+    )
     hits = mesh_face_hits(paths, targets, selection)
 
     if ax is None:
@@ -319,31 +339,37 @@ def plot_top_paths_with_mesh_hits(paths, targets: Iterable, *,
 
     all_points = []
     for target in targets:
-        time = (float(target.mesh_sequence.times[0]) if mesh_time is None
-                else float(mesh_time))
-        vertices = np.asarray(target.mesh_sequence.vertices_at(
-            time))
+        time = float(target.mesh_sequence.times[0]) if mesh_time is None else float(mesh_time)
+        vertices = np.asarray(target.mesh_sequence.vertices_at(time))
         faces = np.asarray(target.mesh_sequence.faces)
         hit_faces = hits.get(target.name, np.empty((0,), dtype=int))
 
-        ax.scatter(vertices[:, 0], vertices[:, 1], vertices[:, 2],
-                   s=3, color="#9a9a9a", alpha=0.18)
+        ax.scatter(
+            vertices[:, 0], vertices[:, 1], vertices[:, 2], s=3, color="#9a9a9a", alpha=0.18
+        )
         all_points.append(vertices)
         if hit_faces.size:
             polys = vertices[faces[hit_faces]]
-            coll = Poly3DCollection(polys, facecolor="#ff6f3c",
-                                    edgecolor="#6b1d12", alpha=0.75)
+            coll = Poly3DCollection(polys, facecolor="#ff6f3c", edgecolor="#6b1d12", alpha=0.75)
             ax.add_collection3d(coll)
 
     for start, end, color in zip(starts, ends, colors):
         segment = np.vstack([start, end])
-        ax.plot(segment[:, 0], segment[:, 1], segment[:, 2],
-                color=color, linewidth=2.4, alpha=0.95)
+        ax.plot(
+            segment[:, 0], segment[:, 1], segment[:, 2], color=color, linewidth=2.4, alpha=0.95
+        )
         all_points.append(segment)
     for start, end, color in zip(env_starts, env_ends, env_colors):
         segment = np.vstack([start, end])
-        ax.plot(segment[:, 0], segment[:, 1], segment[:, 2],
-                color=color, linewidth=2.0, alpha=0.75, linestyle="--")
+        ax.plot(
+            segment[:, 0],
+            segment[:, 1],
+            segment[:, 2],
+            color=color,
+            linewidth=2.0,
+            alpha=0.75,
+            linestyle="--",
+        )
         all_points.append(segment)
 
     if all_points:

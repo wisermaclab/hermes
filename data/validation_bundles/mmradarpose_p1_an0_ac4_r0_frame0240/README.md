@@ -24,5 +24,11 @@ neutral; those release-time substitutions are not participant-specific shape.
 No SMPL model, baked body mesh, skeleton, or point cloud is included. Mesh
 generation therefore requires a separately licensed neutral SMPL model.
 
+The 60 GHz carrier is a nominal first-sample approximation. The source waveform
+description does not provide the ADC start delay needed to establish the exact
+first-sample frequency. `sensor.json` records this assumption in
+`fmcw.carrier_frequency_status`; this fixture does not establish absolute phase
+or gain fidelity.
+
 See `NOTICE.md` for the CC BY-SA 4.0 terms and attribution that apply to this
 fixture.

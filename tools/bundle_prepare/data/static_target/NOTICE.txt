@@ -1,0 +1,3 @@
+Synthetic HERMES static-target example. No measured radar, participant data, or SMPL files.
+ADC is an analytic point return at world (2, 0.5, 0.3) m, with exact TX-target-RX delays and board phase signs. The mesh is a 0.1 m square centred there with its normal facing the radar; PO/RT amplitudes need not match the point reference.
+Original project data under LICENSE-DOCS-DATA; no separate body-model licence is needed.

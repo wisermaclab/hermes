@@ -9,16 +9,16 @@ import argparse
 from importlib import metadata
 import hmac
 import ipaddress
-import os
 from pathlib import Path
 import re
 import secrets
 import sys
 
-
 _MAX_HTTP_HEADER_BYTES = 16 * 1024
 _MAX_HTTP_BODY_BYTES = 64 * 1024
 _WEBSOCKET_PROTOCOL_OVERHEAD_BYTES = 1024 * 1024
+
+from mmWaveRadar.defaults import default_smpl_model_dir as _default_smpl_model_dir
 
 
 def _websocket_message_limit(max_upload_bytes: int) -> int:
@@ -33,16 +33,6 @@ def _version(name: str) -> str | None:
         return metadata.version(name)
     except metadata.PackageNotFoundError:
         return None
-
-
-def _default_smpl_model_dir() -> Path:
-    """Resolve the GUI's licensed-model convention for a source checkout."""
-
-    configured = os.environ.get("MMWAVE_SMPL_MODEL_DIR")
-    if configured:
-        return Path(configured).expanduser()
-    public_root = Path(__file__).resolve().parents[3]
-    return public_root / "models" / "smpl_models"
 
 
 def _is_loopback_address(address: str) -> bool:
@@ -102,9 +92,7 @@ def _normalize_websocket_origin(value: str, *, default_port: int) -> str:
         or "://" in candidate
         or any(character in candidate for character in "/?#@")
     ):
-        raise ValueError(
-            "websocket origin must use HOST[:PORT] without a scheme or path"
-        )
+        raise ValueError("websocket origin must use HOST[:PORT] without a scheme or path")
 
     port = int(default_port)
     if candidate.startswith("["):
@@ -158,6 +146,8 @@ def _build_launch_auth_provider(password: str):
     from bokeh.server.auth_provider import AuthProvider
     from tornado.web import RequestHandler
 
+    from .login import render_login_page
+
     cookie_name = "hermes_gui_user"
     expected_cookie = b"hermes"
 
@@ -167,31 +157,21 @@ def _build_launch_auth_provider(password: str):
 
         def get(self) -> None:
             self.set_header("Content-Type", "text/html; charset=UTF-8")
-            self.write(
-                "<!doctype html><html><head><title>HERMES access</title></head>"
-                "<body><main><h1>HERMES</h1><p>Enter the per-launch password "
-                "printed by the server.</p><form method='post' "
-                "action='/__hermes_login'><label>Password "
-                "<input name='password' type='password' required "
-                "autocomplete='current-password'></label> "
-                "<button type='submit'>Open HERMES</button></form></main>"
-                "</body></html>"
-            )
+            self.write(render_login_page())
 
         def post(self) -> None:
             # Fetch Metadata is checked before accepting a credential so a
             # hostile origin cannot drive the login endpoint. Current GUI
             # browsers send this header; missing metadata is fail-closed.
-            if self.request.headers.get("Sec-Fetch-Site", "").casefold() != (
-                "same-origin"
-            ):
+            if self.request.headers.get("Sec-Fetch-Site", "").casefold() != ("same-origin"):
                 self.set_status(403)
                 self.write("Cross-site login requests are not permitted.")
                 return
             supplied = self.get_body_argument("password", default="")
             if not hmac.compare_digest(supplied, password):
                 self.set_status(403)
-                self.write("Invalid HERMES launch password.")
+                self.set_header("Content-Type", "text/html; charset=UTF-8")
+                self.write(render_login_page("Incorrect launch password."))
                 return
             self.set_secure_cookie(
                 cookie_name,
@@ -211,7 +191,18 @@ def _build_launch_auth_provider(password: str):
                     "Sec-Fetch-Site",
                     "",
                 ).casefold()
-                if fetch_site not in {"none", "same-origin"}:
+                headers = request_handler.request.headers
+                websocket_upgrade = headers.get(
+                    "Upgrade", ""
+                ).casefold() == "websocket" and "upgrade" in {
+                    token.strip().casefold() for token in headers.get("Connection", "").split(",")
+                }
+                # Chrome omits Fetch Metadata on WebSocket handshakes. The
+                # signed cookie and Bokeh's Origin allowlist still protect
+                # these requests; explicit cross-site metadata stays denied.
+                if fetch_site not in {"none", "same-origin"} and not (
+                    not fetch_site and websocket_upgrade
+                ):
                     return None
                 user = request_handler.get_secure_cookie(
                     cookie_name,
@@ -253,9 +244,7 @@ def self_check() -> int:
     public_root = Path(__file__).resolve().parents[3]
     fixture_root = public_root / "data" / "validation_bundles"
     print(f"  source fixtures: {'available' if fixture_root.is_dir() else 'not installed'}")
-    amass_fixture = (
-        public_root / "data" / "AMASS" / "walking_poses_cmu_105_02.npz"
-    )
+    amass_fixture = public_root / "data" / "AMASS" / "walking_poses_cmu_105_02.npz"
     model_dir = _default_smpl_model_dir()
     print(
         "  dynamic-scene AMASS fixture: "
@@ -266,10 +255,7 @@ def self_check() -> int:
         f"{model_dir if model_dir.is_dir() else 'not configured'}"
     )
     if any(version is None for version in required.values()):
-        print(
-            "Install the GUI with: "
-            'python -m pip install "hermes-radar-sim[gui]"'
-        )
+        print('Install the GUI with: python -m pip install "hermes-radar-sim[gui]"')
         return 1
     return 0
 
@@ -364,7 +350,7 @@ def main(argv: list[str] | None = None) -> int:
         import panel as pn
     except ImportError:
         print(
-            'HERMES GUI dependencies are missing. Install with '
+            "HERMES GUI dependencies are missing. Install with "
             '`python -m pip install "hermes-radar-sim[gui]"`.',
             file=sys.stderr,
         )

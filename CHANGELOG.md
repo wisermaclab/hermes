@@ -2,10 +2,190 @@
 
 All notable changes to HERMES will be recorded in this file.
 
+## 0.2.0 - 2026-10-23
+
+- Add immutable release-reference comparisons, analytic PEC plate/sphere mesh
+  studies, plate/corner RT ray-density diagnostics, per-seed uncertainty and
+  per-fixture release reports, including relative copper-plate angular response.
+- Preserve software, execution and input-hash provenance in native cubes,
+  profiling archives, prepared bundles, validation caches and reports.
+- Add citation metadata, scientific limitations, API/schema stability and a
+  scientific-validation CI workflow. Generated references remain outside Git.
+- Expand the simulation tutorial with scene selection, measurement bundle
+  preparation and a TI copper-plate sensor example; improve navigation,
+  dark-mode styling and layout on narrow screens.
+- Declare typed dependencies for each GUI workflow and reject undeclared
+  context fields during assembly; check the workflow contracts with mypy in CI.
+- Share benchmark summaries, adapter publication/destinations, tensor conversion
+  and endpoint mesh windows. Fold adjacent same-line string literals and retain
+  all-NaN TDM diagnostics without missing-data warnings.
+- Lead the Python tutorial and README with grouped experiment settings APIs.
+- Add grouped settings APIs for human-room and static-target experiments,
+  calibrated hybrid pipelines and PO channels. Existing keyword functions
+  forward every option through compatibility adapters.
+- Split GUI assembly and results/export construction into ordered stages;
+  separate browser scripts from Python constructors. Extract per-run RT,
+  PO, incremental-PO and coupling stages without changing their equations.
+- Pin and configure pylint, run it in CI, and clean stale imports/type annotations.
+- Consolidate portable path and archive checks, mesh-sequence views, adapter
+  validation, radar construction, placement/default helpers and scalar/DSP
+  operations while retaining their distinct timing and axis policies.
+- Split validation into configuration, channels, simulation, cache and DSP-map
+  modules. Move GUI callbacks into explicit session workflow classes and share
+  scene-interaction JavaScript. Retain existing runner imports and keyword APIs.
+- Extract RT scheduling/tracing/matching and PO calibration stages; group PO
+  channel settings for the exact and incremental paths.
+- Pin Black with a 99-character line length and check formatting in CI.
+- Resolve legacy carrier references from source waveform fields, retaining
+  conversion provenance; ambiguous carriers warn and disable re-simulation.
+  New writers reject unverified carriers and incomplete motion, and motion
+  preparation requires explicit frame timing. Check ADC sampling-mode/dtype
+  consistency and document mmRadPose's nominal carrier approximation.
+- Reuse simulation caches across ZIP extractions using relative resource names
+  and content hashes. Reject omitted or reordered TDM slots in the core simulator
+  with guidance to use the slot-aware validation runner.
+- Keep GUI range profiles on a shared plot showing channel-mean power, with
+  frame selection. Average chirps within each frame and hide values below
+  −80 dB without drawing a clipped floor. Bundle views retain relative levels
+  between frames. Add a per-channel plot for each simulated mode, with Hybrid
+  PO's channels immediately below its averaged components.
+- Fixed empty Dynamic Scenes content at launch when restoring the selected tab,
+  including resizing the scene preview when it becomes visible. Preview pose
+  controls now use seconds and interpolate between source poses.
+- Made an empty tutorial room the GUI default, with a metal floor and
+  plasterboard wall materials with the radar at the origin, 1035 mm above the
+  floor. Motion loading now preserves file positions by default in the GUI,
+  with manual placement available and X/Y/Z limits derived from scene dimensions.
+- Added `mmwave-prepare-bundle` with direct ADC/sensor/scene/target arguments
+  or `--config`, and the public GUI-independent
+  `BundleWriter`, including portable scene assets and checked directory/ZIP
+  publication. GUI exporters and reference adapters share the writer.
+- Accept bundle ZIPs directly in `mmwave-validation-benchmark --clip` for
+  simulation and measurement comparison, with checked temporary extraction,
+  cleanup after the run, and source-archive provenance in the metrics.
+- Added version 2 feature gates for explicit arrays, channel maps and physical
+  TDM slot order while retaining version 1 read compatibility. Documented IQ,
+  phase-sign, coordinate, amplitude and sampled-carrier conventions.
+- Report full-acquisition motion coverage during loading, retaining playback
+  while disabling re-simulation for incomplete motion. Checked scene
+  aliases, removed the sensor-metadata scene fallback, and added structured
+  `--all-errors` output plus warning-only `--diagnose` plots.
+- Corrected TI CLI and RT-Pose carrier import to reference the first ADC sample
+  (`start_frequency + slope * adc_start_time`), matching synthesis and wideband
+  PO. This changes wavelength/phase/Doppler results from prior imports.
+- Preserve acquisition-loop timing for stored TX subsets and for ignored TDM
+  slot offsets. Preserve waveform provenance during writing and pre-existing
+  empty destinations after failed publication. Accept epoch-valued and jittered
+  timestamps in both bundle versions, with a declared absolute tolerance.
+- Unified angle-map phase-sign removal and corrected GUI evaluated-motion
+  exports to retain interpolation knots and the final physical chirp. Environment
+  exports keep targets separate to prevent duplicate geometry on re-simulation.
+  Thin static-target range gates retain overlapping FFT cells.
+- Packaged an original synthetic static-target example and measurement/adapter
+  tutorials; a redistributable measured static-target conformance capture
+  remains a stated release milestone.
+
+- Documented Sionna RT run-to-run variation on multithreaded CPUs in
+  `docs/rt_reproducibility.md`: thread-order-dependent diffuse-then-specular
+  paths, a one-thread workaround, and path-cap saturation when raising
+  `rt_samples_per_source`.
+- Reused physical Rx/Tx reflection-feasibility checks in active-set coupling
+  projection before expanding to virtual channels. Finite-wall masks, phase,
+  spreading, delays, and channel ordering retain their existing behavior.
+- Fixed MPS backend selection on Torch builds missing the native complex
+  cross-product kernel. Complex PO cross products now use equivalent
+  elementwise operations on MPS, allowing supported float32 runs to select
+  the accelerator instead of falling back to NumPy.
+- Added Torch exact wideband PO integration for quadrature and analytic modes,
+  including clipped-simplex IF responses. Analytic node integrals and
+  leaf-to-parent reductions stay on the selected device; retained geometry and
+  persistent response storage preserve incremental reuse. Integration follows
+  `compute_backend`/`compute_precision`, with NumPy as the reference/fallback.
+- Accelerated wideband PO synthesis by uploading and mixing only contributing
+  parent-path columns, preserving original path IDs for partial IF clipping.
+  Analytic integration now prepares triangle geometry once per chunk and batches
+  frequency nodes. Coupling reflection geometry and cosine antenna patterns
+  are evaluated per physical antenna; channel-specific patterns retain their
+  individual curves and virtual-channel mapping.
+- Matched PO response-grid Chebyshev tail tolerances to `compute_precision`:
+  1e-8 for float32, 1e-14 for float64. Float32 results can change slightly as
+  fewer frequency nodes are integrated; float64 keeps the existing tolerance.
+- Unified RT baseline and solver execution, including human-bounce filtering,
+  moving-body visibility refreshes, and fades. Removed the duplicate baseline
+  loops and skipped unused cross-frame crossfade updates.
+- Added last-exact area and normal guards to incremental PO, retained adequate
+  wideband frequency grids across small mesh changes, and limited coupling
+  acceleration-structure refits to human-visibility refreshes.
+- Shared subarray execution and array restoration across Hybrid PO entry
+  points, with one full-array reflector selection per run. Calibrated Hybrid
+  PO now rejects groups without subarray mode, uses consistent PO defaults,
+  and honors explicit visibility sample overrides. Cached coupling requires
+  an explicit HybridPOConfig; legacy rt_baseline caches load as RT.
+- Made coherent RT updates and transition matching honor `compute_precision`
+  instead of forcing float64, allowing capability-checked float32 MPS execution.
+  Coherent-bank tensors are cached separately for each device and precision.
+- Centralized array backend/device selection, complex capability probes, and
+  dtypes in `simulation/compute.py`. ADC, PO, wideband PO, and coherent RT honor
+  the same device override; explicit Torch can use CPU, CUDA indices are
+  preserved, and invalid settings fail early. Runtime summaries report the
+  resolved `auto` backend and device for each precision.
+- Made wideband PO and Hybrid PO ADC synthesis honor `compute_backend`, using
+  PyTorch on an available accelerator in `auto` mode and retaining the NumPy
+  CPU fallback, coherent IF-edge clipping, and bounded working buffers.
+- Added `po_refresh_on_phase_error_rad` (default 0.1 rad) alongside configurable
+  last-exact area and normal guards, `po_refresh_on_area_fraction` (default
+  0.30, or 30%) and `po_refresh_on_normal_deg` (default 20 degrees). Direct-human
+  PO and image-source coupling share these triggers, exposed in Python, CLI,
+  JSON, and GUI settings. Removed the centroid-displacement trigger.
+- Enabled adaptive PO visibility sampling by default in `POConfig` and
+  `po_channel`, with grazing cosine margin 0.15. Multi-sample visibility results
+  and benchmark numbers may change; set `po_adaptive_visibility_sampling=False`
+  for uniform sampling. The benchmark suite compares both modes.
+- Removed `human_multi_touch` as a calibration reference. Existing callers
+  selecting it now receive a validation error; RT multi-touch diagnostics remain.
+- Fixed human-room PO diagnostics to read adaptive visibility settings from
+  the run manifest, with configuration defaults for older manifests.
+- Made RT displacement-triggered retraces additive to the frame cadence.
+  `rt_refresh_on_displacement` now uses metres, rather than wavelength
+  fractions; inactive triggers omit the threshold from event metadata.
+- Kept one-frame RT/PO refresh defaults and documented the cadence errors
+  measured on the tutorial walk: PO within 0.4% at four frames, specular RT
+  12–26% per frame at one frame and up to 100% at four.
+- Antenna indices are now zero-based in every front end. The scene CLI's
+  one-based `--tx`/`--rx` became `--tx-indices`/`--rx-indices`, validation's
+  `--subarray-tx`/`--subarray-rx` became `--tx-indices`/`--rx-indices`,
+  `BenchmarkRunConfig.subarray_*_indices` became `selected_*_indices`, and the
+  GUI lists `TX0`, `TX1`, .... The removed flags stop with an error naming the
+  replacement. Validation metrics and `subarray_adc.npz` report zero-based
+  `selected_*_indices` and `channel_*_indices`; the simulated-ADC cache schema
+  is now 7.
+- Fixed independent coupling visibility cadence and GUI result fingerprints
+  for Bundle Comparison and Hybrid-only settings.
+- Added `array_model="subarray"`, which replaces the reserved `element` model.
+  `array_tx_groups` and `array_rx_groups` split the active antennas into
+  zero-based groups; each Tx-group/Rx-group pair is solved at its own centers
+  by every solver and front end (Python, JSON/CLI `--array-tx-groups`/
+  `--array-rx-groups`, GUI MIMO array settings), and the channels are merged
+  back into one cube. Calibrated PO parts share one gain across the pairs.
+  `PhaseCenterApproximationWarning` now suggests group counts.
+- RT now traces from the Tx- and Rx-array centers instead of the board
+  origin, matching PO, the RT path bank, and the documented phase-center
+  model. Specular RT results move slightly (0.2% on the tutorial IWR6843AOP
+  run); with diffuse scattering, the sampled rays change as with a new seed.
+  Radar traces no longer include the direct Tx-to-Rx path, which appears once
+  the two centers differ.
+- Fixed RT path diagnostics failing on scenes with no RT paths.
+
 ## 0.1.0 - 2026-08-17
 
 ### Added
 
+- Added the headless Dynamic Scenes runner (`hermes-human-room` or
+  `tools/run_human_room.py`) with current GUI radar/solver defaults, full
+  simulation-setting overrides, JSON configuration save/load, custom XML scenes,
+  human placement, zero-based frame windows, multiple modes, and protected,
+  GUI-loadable bundle export. The source script reads the complete
+  `configs/human_room.json` setup by default, including output and logging options.
 - Added the local HERMES web GUI with reactive plate, trihedral-corner, and
   uploaded-human controls; RT/PO range-profile overlays; deterministic
   manifests; bundle-based comparison; separate simulation and radar-
@@ -82,7 +262,7 @@ All notable changes to HERMES will be recorded in this file.
   share one artifact-driven loader; GUI exports include raw RT/PO ADC,
   transformed target geometry, motion inputs, and scene XML.
 - Added validation `--ignore-tdm-timing` support for one simultaneous selected-
-  subarray simulation per mobility mode while retaining the full-cycle Doppler
+  subarray simulation per solver while retaining the full-cycle Doppler
   PRI.
 - Enabled first-pose RT-reference calibration by default for validation
   `hybrid_static_env_po` runs, with an explicit calibration-policy option and
@@ -126,6 +306,68 @@ All notable changes to HERMES will be recorded in this file.
   back to the mmRadPose radar axes, and never reads camera imagery.
 
 ### Fixed
+
+- Fixed authenticated Chrome WebSocket connections when Fetch Metadata is
+  omitted on an upgrade, while retaining signed-cookie and Origin checks.
+- Fixed the theme button's unmounted path references and restoration callbacks
+  that could invalidate cached products. Completed workflow results now retain
+  settings fingerprints, remain visible after edits, and show named changes
+  with Rerun/Revert actions and a stale marker on the workflow tab.
+- Staged radar and solver edits behind one Apply/Cancel action, added an optional
+  active-page rerun, and kept human motion coordinates in Settings with the same
+  Apply/Cancel behavior. Dynamic simulation modes appear in two rows. Bundle
+  Comparison now explicitly identifies its bundle-owned solver settings and
+  retains selected simulation modes across theme reloads.
+- Corrected the radar summary to use sampled bandwidth, disabled Start until
+  motion is loaded, made idle Stop controls neutral, and cleared progress panes
+  on failures without double-escaping error messages.
+- Kept Start disabled during dynamic solver overlays and rejected overlapping
+  dynamic work. Stopping before the first mode completes now replaces the
+  progress pane with a stopped message while preserving any previous products.
+- Saved ADC frame, chirp, and channel selections immediately and captured their
+  current browser values before a theme reload.
+- Made Scene and motion the Dynamic Scenes landing tab on page loads and theme
+  reloads, while retaining completed products in Simulation results.
+- Restored the original workflow layout, control widths, directly visible tips
+  and overlay controls, and expanded, stacked Bundle Comparison sections. Sized tabs to
+  active content. Improved both themes,
+  section headings, 3-D axis labels, numeric precision and icon accessibility;
+  styled the launcher login page to match the GUI.
+- Redesigned the launch screen with an animated radar-scene illustration,
+  responsive HERMES branding, keyboard-friendly sign-in, and inline password
+  errors. The illustration respects reduced-motion preferences.
+- Added ordered playback controls with a frame counter, ADC frame/chirp/channel
+  selectors, readable run summaries with advanced JSON, and actionable refinement
+  warnings.
+- Fixed Tabler playback icon sizing and Reverse orientation, redrew stale tab
+  headers, labelled stale results as LAST RUN (out of date), and standardized
+  frame selectors and counters on zero-based indices. Added dark secondary
+  buttons, a secondary motion-preview action, sorted stage timings, and a sticky
+  Static Target scene.
+- Grouped position and orientation into compact numeric rows on both scene
+  pages, tightened upload and mode help spacing, and inset mode checkboxes.
+  Reverse now matches the outline Play icon. Uploaded motion previews
+  automatically; the default-motion action disappears once motion is loaded.
+- Put all three workflows on one layout. A control rail with its own scroll
+  keeps every control visible in headed groups, with a jump bar to each group.
+  Beside it, a sticky run bar shows the page title and help, the run status,
+  the Start/Stop or higher-fidelity actions, and the stale-result banner with
+  Rerun/Revert above the plots. Bundle Comparison steps moved into the rail, so
+  its plots start at the top. Narrow windows stack the rail above the run bar
+  and plots.
+- Reorganized the Settings dialog into Radar configuration, Solver settings,
+  and Motion coordinates tabs. Settings are grouped into headed sections laid
+  out in columns, each noting the workflows it affects. A Derived card keeps the
+  channel count, bandwidth, range resolution, and maximum range beside the
+  radar form. Apply, Cancel, and Apply & rerun stay pinned to the bottom of the
+  dialog. The dialog keeps one size on every tab, so switching tabs no longer
+  moves it, and a taller tab scrolls inside it.
+- Fixed an intermittent theme-switch failure that dropped restored Dynamic
+  Scenes result tabs and stale-result banners with a browser "reference isn't
+  known" error. The browser reports its saved session before the page is ready.
+  Panel then holds the restored result views unsent, and a browser message in
+  that window made Bokeh treat them as already delivered. Saved sessions and
+  uploads are now restored once the page is ready.
 
 - Added an explicit, default-off TDM acquisition policy. Simultaneous mode now
   retains every selected Tx/Rx channel at one-chirp slow-time spacing, while
@@ -188,6 +430,78 @@ All notable changes to HERMES will be recorded in this file.
 
 ### Changed
 
+- Dynamic Scenes, the headless runner, and `run_human_room_experiment()` now
+  select motion by time. `motion_start_s` aligns radar frame 0 with a motion
+  time, the motion plays in real time, and the run covers every radar frame
+  whose chirps finish by `motion_end_s` (or `num_frames` radar frames). The
+  former pose-index window mapped one motion frame onto each radar frame, which
+  slowed motion and Doppler by the ratio of the frame period to the motion
+  frame interval (six times for 120 fps motion at 50 ms). The GUI shows
+  **Start [s]** and **End [s]** with the resulting radar frame count; the CLI
+  replaces `--frame`, `--begin-frame`, and `--end-frame` with `--start-s` and
+  `--end-s`, and `--num-frames` now counts radar frames. JSON configurations
+  move to `schema_version` 2, and version-1 files are rejected with conversion
+  instructions. Manifests record `motion_start_s`, `motion_end_s`,
+  `motion_pose_count`, and `motion_duration_s`; exported bundles record
+  `motion.time_window`, and each `frames.json` entry gives the radar frame's
+  start on the motion's own timeline.
+
+- Unified solver and setting names across the GUI, headless runner and JSON,
+  Python API, validation, benchmarks, notebooks, and bundles
+  (`mmWaveRadar.naming`). The solvers are `po`, `rt`, and `hybrid_po`, which
+  replace `human_only_po`/`target_po`, `full_rt`/`coherent_rt`/`rt_retrace`/
+  `rt_coherent_bank`, and `hybrid_static_env_po`. Unprefixed settings apply to
+  every solver (`array_model`, `tx_schedule`); `rt_*` settings apply wherever RT
+  runs, `po_*` wherever PO runs, and `hybrid_*` only to Hybrid PO. Removed
+  names raise an error naming their replacement, including the old CLI flags.
+- Temporal cadences are counted in radar frames and applied at frame starts:
+  `rt_refresh_frames` (replaces the RT mobility modes and retrace-period
+  options; `0` retraces every chirp), `po_refresh_frames` (replaces
+  `incremental_update` and `incremental_full_refresh_chirps`), and
+  `po_visibility_refresh_frames`/`po_visibility_fade_frames`. Hybrid PO coupling
+  follows the PO cadence. The RT path-freezing mode was removed: between
+  retraces, paths are always phase-updated on the moving mesh.
+- Added RT path-visibility refresh between retraces
+  (`rt_visibility_refresh_frames`, `rt_visibility_fade_frames`). Hybrid PO body
+  blocking of room paths is always on and follows the same cadence.
+- `tx_schedule` (`simultaneous` or `tdm`) replaces the `tdm_enabled` flag.
+  Bundles now write `tx_schedule`; readers still accept `tdm_enabled` and the
+  legacy TDM markers.
+- Added `array_model` (`phase_center`; `element` is reserved and raises
+  `NotImplementedError`). Phase-center runs emit
+  `PhaseCenterApproximationWarning` when the RT curvature or PO facet phase
+  error for the aperture exceeds its limit.
+- `rt_human_bounces` (`single` or `any`) replaces `coupling_mode`.
+  `hybrid_calibration` (default `rt_first_pose`) replaces the PO calibration
+  options of Hybrid PO in every entry point; the PO solver keeps
+  `POConfig.po_calibration` (default `none`).
+- Renamed `HumanPOMobilityConfig` to `POConfig` and `HybridStaticEnvPOConfig`
+  to `HybridPOConfig`, with `po_*`/`hybrid_*` fields. `SensingMetadata.mode` is
+  now `SensingMetadata.solver` (schema 2). Experiment manifests move to schema 2
+  with a `solver.solvers` list; Static Target records `["rt", "po"]`. Headless
+  JSON configurations move to `schema_version` 3 with a `solvers` list.
+  GUI bundle exports key each ADC by solver (`simulated_adc_<solver>.npz`) and
+  store the Hybrid PO components in `hybrid_po_components.npz`, replacing the
+  `simulated_adc_rt.npz`/`simulated_adc_po.npz` component aliases.
+- Renamed the remaining helpers and diagnostics that used the earlier solver
+  names. The full-scene RT reference is `run_rt_baseline()` returning
+  `RTBaselineResult` (was `run_full_rt_mobility_baseline()` and
+  `FullRTMobilityBaselineResult`; the `run_rt_mobility_baseline` alias was
+  removed). Runtime-profile stages are `rt_baseline_*` for that reference and
+  `rt_path_bank_*` for the RT solver's path bank, without the earlier duplicate
+  `full_rt_*`/`rt_*` aliases. The RT schedule profiler now works in
+  `rt_refresh_frames` (`rt_retrace_schedule_indices()`,
+  `recommend_rt_refresh_frames()`), and prepared bundles key their
+  `evaluation_notes` by solver.
+- Renamed the demo notebooks `Human-Only-PO.ipynb` and `Full-RT.ipynb` to
+  `PO.ipynb` and `RT.ipynb`, and the `human_only_rt_po_range_profile`
+  benchmark to `rt_po_range_profile`.
+
+- Reused the direct-human PO incremental facet updater for both image-source
+  coupling directions. Coupling now caches surface terms per reflector,
+  updates phase/spreading/delay each chirp, and shares geometry-threshold and
+  receiver IF-edge refresh rules with direct-human PO. Runtime metadata counts
+  reintegrated and phase-updated coupling facets.
 - Accelerated adaptive PO without changing its numerical result by caching
   Tx-independent quadrature distances, fixed human-mesh face adjacency,
   immutable ADC fast-time tensors, and sorted incremental face-bank lookups,

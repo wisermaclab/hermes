@@ -5,6 +5,13 @@
 
 from .mesh import (
     MeshSequence,
+    MeshSequenceBase,
+    MeshSequenceView,
+    PlacedMeshSequence,
+    MeshSequenceTimeWindow,
+    TimeWindowMeshSequence,
+    EndpointTimeWindowMeshSequence,
+    RigidTransformMeshSequence,
     MeshTarget,
     ensure_outward_face_winding,
     face_winding_signed_volume,
@@ -23,6 +30,13 @@ from .smpl import (
 __all__ = [
     "AMASSSMPLMotionSequence",
     "MeshSequence",
+    "MeshSequenceBase",
+    "MeshSequenceView",
+    "PlacedMeshSequence",
+    "MeshSequenceTimeWindow",
+    "TimeWindowMeshSequence",
+    "EndpointTimeWindowMeshSequence",
+    "RigidTransformMeshSequence",
     "MeshTarget",
     "ensure_outward_face_winding",
     "face_winding_signed_volume",

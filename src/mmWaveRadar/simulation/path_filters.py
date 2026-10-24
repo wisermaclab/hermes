@@ -254,8 +254,7 @@ def _one_target_bounce_mask(paths, targets: list[MeshTarget]) -> np.ndarray:
         if not hasattr(paths, "objects"):
             return np.ones(paths.tau.shape[-1], dtype=bool)
         target_ids = {
-            int(np.asarray(h.ensure_scene_object().object_id).reshape(-1)[0])
-            for h in targets
+            int(np.asarray(h.ensure_scene_object().object_id).reshape(-1)[0]) for h in targets
         }
         objects = np.asarray(paths.objects)
         if objects.size == 0:

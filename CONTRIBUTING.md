@@ -41,6 +41,23 @@ repository; other released files are synchronized from the authoritative source.
 - Keep Python source headers consistent with the project SPDX and copyright
   headers.
 
+Install the development tools and format the maintained Python directories from
+`public/`:
+
+```bash
+"$YOUR_PYTHON_ENV/bin/python" -m pip install -e ".[dev,gui]"
+"$YOUR_PYTHON_ENV/bin/python" -m black src validation tools benchmarks tests
+"$YOUR_PYTHON_ENV/bin/python" -m black --check src validation tools benchmarks tests
+"$YOUR_PYTHON_ENV/bin/python" -m pylint src validation tools benchmarks
+"$YOUR_PYTHON_ENV/bin/python" -m mypy
+```
+
+Black, pylint and mypy versions are pinned in `pyproject.toml`. Black uses 99
+characters; pylint checks source/control-flow errors and unused imports. Mypy
+checks GUI workflow dependencies and assembly. CI runs all three checks.
+See [code organization](docs/code_organization.md)
+for the shared helpers and workflow boundaries.
+
 ## Tests
 
 Run the relevant tests before submitting changes:

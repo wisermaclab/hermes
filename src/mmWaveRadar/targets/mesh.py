@@ -5,8 +5,9 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from contextlib import contextmanager
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING, Iterator
 
 import numpy as np
 
@@ -20,7 +21,120 @@ if TYPE_CHECKING:
     from sionna.rt import SceneObject
 
 
-from ..materials import human_skin_material
+# Compatibility export also exposed by targets.__init__.
+from ..materials import human_skin_material  # pylint: disable=unused-import
+from ..geometry import rotation_matrix
+
+
+class MeshSequenceBase:
+    """Common geometry operations for materialized and lazy mesh sequences.
+
+    Implementations supply ``times``, ``faces`` and ``vertices_at(time)``.
+    Motion views retain their own timing/coordinate mapping; these operations
+    never change sampling, interpolation or face winding.
+    """
+
+    @property
+    def vertex_count(self) -> int:
+        base = getattr(self, "base_sequence", getattr(self, "_base", None))
+        count = getattr(base, "vertex_count", None)
+        if count is not None:
+            return int(count)
+        return int(self.vertices_at(float(self.times[0])).shape[0])
+
+    @property
+    def face_count(self) -> int:
+        return int(np.asarray(self.faces).shape[0])
+
+    def max_vertex_displacement(self, time: float, reference_vertices: np.ndarray) -> float:
+        vertices = self.vertices_at(time)
+        reference = np.asarray(reference_vertices, dtype=np.float32)
+        if reference.shape != vertices.shape:
+            raise ValueError("reference_vertices shape mismatch")
+        return float(np.max(np.linalg.norm(vertices - reference, axis=1)))
+
+
+class MeshSequenceView(MeshSequenceBase):
+    """Lazy sequence whose vertices are evaluated at its declared sample times."""
+
+    @property
+    def vertices(self) -> np.ndarray:
+        return np.stack([self.vertices_at(float(t)) for t in self.times], axis=0)
+
+
+class TimeWindowMeshSequence(MeshSequenceView):
+    """Shared offset and optional clipping for views of a source time interval.
+
+    Wrappers declare ``base_sequence``, ``start_time_s``, ``end_time_s`` and
+    their own sample times. Radar-frame sampling and source-knot sampling stay
+    separate, while evaluation uses the same time mapping.
+    """
+
+    clip_to_window = True
+
+    def vertices_at(self, time: float) -> np.ndarray:
+        source_time = self.start_time_s + float(time)
+        if self.clip_to_window:
+            source_time = min(max(source_time, self.start_time_s), self.end_time_s)
+        return self.base_sequence.vertices_at(source_time)
+
+
+@dataclass(frozen=True)
+class EndpointTimeWindowMeshSequence(TimeWindowMeshSequence):
+    """Offset view sampled at the two endpoints of a selected frame range."""
+
+    base_sequence: object
+    start_time_s: float
+    duration_s: float
+
+    @property
+    def times(self) -> np.ndarray:
+        if self.duration_s <= 0.0:
+            return np.asarray([0.0], dtype=float)
+        return np.asarray([0.0, float(self.duration_s)], dtype=float)
+
+    @property
+    def faces(self):
+        return self.base_sequence.faces
+
+    @property
+    def end_time_s(self) -> float:
+        return float(self.start_time_s) + max(float(self.duration_s), 0.0)
+
+
+class PlacedMeshSequence(MeshSequenceView):
+    """Place a sequence around its initial bounding-box centre, preserving yaw.
+
+    ``position=None`` preserves source positions. ``rebase_time`` explicitly
+    selects GUI-relative time; bundle motion keeps its original timeline.
+    """
+
+    def __init__(self, base, *, position=None, yaw_deg=0.0, rebase_time=False):
+        self._base = base
+        base_times = np.asarray(base.times, dtype=float)
+        self.time_offset_s = float(base_times[0]) if rebase_time else 0.0
+        self._time_offset = self.time_offset_s
+        self.times = base_times - self.time_offset_s
+        initial = np.asarray(base.vertices_at(float(base_times[0])), dtype=float)
+        self._center = 0.5 * (np.min(initial, axis=0) + np.max(initial, axis=0))
+        self._position = (
+            self._center.copy() if position is None else np.asarray(position, dtype=float)
+        )
+        if self._position.shape != (3,) or not np.all(np.isfinite(self._position)):
+            raise ValueError("human_position_m must contain three finite values")
+        yaw = np.deg2rad(float(yaw_deg))
+        if not np.isfinite(yaw):
+            raise ValueError("human_yaw_deg must be finite")
+        self._rotation = rotation_matrix((yaw, 0.0, 0.0))
+        self.faces = ensure_outward_face_winding(
+            self.vertices_at(float(self.times[0])), base.faces
+        )
+
+    def vertices_at(self, time: float) -> np.ndarray:
+        vertices = np.asarray(
+            self._base.vertices_at(float(time) + self.time_offset_s), dtype=float
+        )
+        return ((vertices - self._center) @ self._rotation.T + self._position).astype(np.float32)
 
 
 def face_winding_signed_volume(vertices: np.ndarray, faces: np.ndarray) -> float:
@@ -86,7 +200,106 @@ def ensure_outward_face_winding(
 
 
 @dataclass(frozen=True)
-class MeshSequence:
+class RigidTransformMeshSequence(MeshSequenceView):
+    """Rigidly transformed view of a mesh sequence."""
+
+    base_sequence: object
+    rotation: np.ndarray
+    translation: np.ndarray = field(default_factory=lambda: np.zeros(3, dtype=np.float32))
+
+    def __post_init__(self):
+        rotation = np.asarray(self.rotation, dtype=np.float32)
+        translation = np.asarray(self.translation, dtype=np.float32)
+        if rotation.shape != (3, 3) or not np.all(np.isfinite(rotation)):
+            raise ValueError("rotation must be a finite 3x3 matrix")
+        if not np.allclose(rotation @ rotation.T, np.eye(3), atol=1e-6):
+            raise ValueError("rotation must be orthonormal")
+        if not np.isclose(np.linalg.det(rotation), 1.0, atol=1e-6):
+            raise ValueError("rotation must be right-handed")
+        if translation.shape != (3,) or not np.all(np.isfinite(translation)):
+            raise ValueError("translation must be a finite 3-vector")
+        object.__setattr__(self, "rotation", rotation)
+        object.__setattr__(self, "translation", translation)
+
+    @property
+    def times(self):
+        """Sample times from the base sequence."""
+
+        return self.base_sequence.times
+
+    @property
+    def faces(self):
+        """Triangle indices from the base sequence."""
+
+        return self.base_sequence.faces
+
+    def vertices_at(self, time: float) -> np.ndarray:
+        """Evaluates and transforms vertices at ``time`` seconds."""
+
+        vertices = np.asarray(self.base_sequence.vertices_at(time))
+        return (vertices @ self.rotation.T + self.translation[None, :]).astype(
+            np.float32, copy=False
+        )
+
+
+@dataclass(frozen=True)
+class MeshSequenceTimeWindow(TimeWindowMeshSequence):
+    """Time-rebased view of a mesh sequence.
+
+    The wrapper is useful for AMASS tutorial motions whose raw sequence starts
+    with calibration poses or contains a much longer global trajectory than a
+    short radar demo needs.
+    """
+
+    base_sequence: object
+    start_time_s: float
+    duration_s: float | None = None
+    times: np.ndarray = field(init=False)
+    end_time_s: float = field(init=False)
+
+    def __post_init__(self):
+        base_times = np.asarray(self.base_sequence.times, dtype=float)
+        if base_times.ndim != 1 or base_times.size == 0:
+            raise ValueError("base sequence times must be a non-empty 1D array")
+        if base_times.size > 1 and np.any(np.diff(base_times) <= 0.0):
+            raise ValueError("base sequence times must be strictly increasing")
+
+        start = float(self.start_time_s)
+        base_start = float(base_times[0])
+        base_end = float(base_times[-1])
+        if start < base_start or start >= base_end:
+            raise ValueError(f"start_time_s must be in [{base_start}, {base_end})")
+
+        if self.duration_s is None:
+            end = base_end
+        else:
+            duration = float(self.duration_s)
+            if duration <= 0.0:
+                raise ValueError("duration_s must be positive")
+            end = min(start + duration, base_end)
+        if end <= start:
+            raise ValueError("time window must contain a positive span")
+
+        window_base_times = base_times[(base_times >= start) & (base_times <= end)]
+        if window_base_times.size == 0 or not np.isclose(window_base_times[0], start):
+            window_base_times = np.concatenate(([start], window_base_times))
+        if not np.isclose(window_base_times[-1], end):
+            window_base_times = np.concatenate((window_base_times, [end]))
+        rebased_times = np.unique(np.round(window_base_times - start, 12))
+
+        object.__setattr__(self, "start_time_s", start)
+        object.__setattr__(self, "end_time_s", end)
+        object.__setattr__(self, "times", rebased_times.astype(float))
+
+    @property
+    def faces(self):
+        """Triangle indices from the base sequence."""
+
+        return self.base_sequence.faces
+
+
+@dataclass(frozen=True)
+class MeshSequence(MeshSequenceBase):
     r"""
     Fixed-topology mesh sequence.
 
@@ -122,9 +335,7 @@ class MeshSequence:
             raise ValueError("times must contain only finite values")
         if times.shape[0] > 1 and np.any(np.diff(times) <= 0.0):
             raise ValueError("times must be strictly increasing")
-        if faces.size > 0 and (
-            np.any(faces < 0) or np.any(faces >= vertices.shape[1])
-        ):
+        if faces.size > 0 and (np.any(faces < 0) or np.any(faces >= vertices.shape[1])):
             raise ValueError("faces reference vertex indices outside vertices")
         object.__setattr__(self, "vertices", vertices)
         object.__setattr__(self, "faces", faces.astype(np.uint32, copy=False))
@@ -171,11 +382,6 @@ class MeshSequence:
         """Number of vertices."""
         return int(self.vertices.shape[1])
 
-    @property
-    def face_count(self) -> int:
-        """Number of triangular faces."""
-        return int(self.faces.shape[0])
-
     def vertices_at(self, time: float) -> np.ndarray:
         """Linearly interpolates vertices at ``time`` [s]."""
         t = float(time)
@@ -189,16 +395,8 @@ class MeshSequence:
         i0 = i1 - 1
         w = (t - self.times[i0]) / (self.times[i1] - self.times[i0])
         return ((1.0 - w) * self.vertices[i0] + w * self.vertices[i1]).astype(
-            np.float32, copy=False)
-
-    def max_vertex_displacement(self, time: float,
-                                reference_vertices: np.ndarray) -> float:
-        """Maximum vertex displacement relative to ``reference_vertices``."""
-        v = self.vertices_at(time)
-        ref = np.asarray(reference_vertices, dtype=np.float32)
-        if ref.shape != v.shape:
-            raise ValueError("reference_vertices shape mismatch")
-        return float(np.max(np.linalg.norm(v - ref, axis=1)))
+            np.float32, copy=False
+        )
 
 
 @dataclass
@@ -220,7 +418,8 @@ class MeshTarget:
         if material is None:
             raise ValueError(
                 "MeshTarget.material must be set explicitly. For the tutorial "
-                "human proxy, pass human_skin_material(...).")
+                "human proxy, pass human_skin_material(...)."
+            )
 
         import mitsuba as mi  # pylint: disable=import-outside-toplevel
         from sionna.rt import SceneObject
@@ -228,18 +427,19 @@ class MeshTarget:
         start_time = float(np.asarray(self.mesh_sequence.times, dtype=float)[0])
         vertices = self.mesh_sequence.vertices_at(start_time)
         faces = self.mesh_sequence.faces
-        mesh = mi.Mesh(name=self.name,
-                       vertex_count=vertices.shape[0],
-                       face_count=faces.shape[0],
-                       has_vertex_normals=False,
-                       has_vertex_texcoords=False)
+        mesh = mi.Mesh(
+            name=self.name,
+            vertex_count=vertices.shape[0],
+            face_count=faces.shape[0],
+            has_vertex_normals=False,
+            has_vertex_texcoords=False,
+        )
         params = mi.traverse(mesh)
         params["vertex_positions"] = mi.Float(vertices.reshape(-1))
         params["faces"] = mi.UInt(faces.reshape(-1))
         params.update()
         mesh.set_bsdf(material)
-        self.scene_object = SceneObject(mi_mesh=mesh, name=self.name,
-                                        radio_material=material)
+        self.scene_object = SceneObject(mi_mesh=mesh, name=self.name, radio_material=material)
         self.reference_vertices = vertices.copy()
         return self.scene_object
 
@@ -251,6 +451,25 @@ class MeshTarget:
         elif obj.scene is not scene:
             raise ValueError("Mesh target already belongs to another scene")
         return obj
+
+    @contextmanager
+    def detached_from_scene(self, scene) -> Iterator[None]:
+        """Temporarily removes this target's mesh from ``scene``.
+
+        RT runs leave their targets in the scene. Static-environment passes
+        must not trace or occlude with a frozen copy of the moving mesh, so
+        they detach it here; it is restored on exit.
+        """
+        obj = self.scene_object
+        if obj is None or obj.scene is not scene or obj.name not in scene.objects:
+            yield
+            return
+        scene.edit(remove=[obj])
+        obj._scene = lambda: None  # pylint: disable=protected-access
+        try:
+            yield
+        finally:
+            scene.edit(add=[obj])
 
     def update_to_time(
         self,
@@ -283,9 +502,7 @@ def _update_scene_object_vertices(obj: "SceneObject", vertices: np.ndarray) -> N
 
     mesh = getattr(obj, "mi_mesh", None)
     if mesh is None:
-        raise AttributeError(
-            "SceneObject has neither update_vertex_positions nor mi_mesh"
-        )
+        raise AttributeError("SceneObject has neither update_vertex_positions nor mi_mesh")
     if vertices.shape != (int(mesh.vertex_count()), 3):
         raise ValueError("vertices shape mismatch for scene object mesh")
 

@@ -12,7 +12,6 @@ from typing import Callable
 
 import numpy as np
 
-
 MeshEvaluator = Callable[..., tuple[np.ndarray, np.ndarray, np.ndarray]]
 
 
@@ -122,9 +121,7 @@ def bake_smpl_motion_mesh(
             out_npz_path=None,
         )
 
-    transformed_vertices = (
-        np.asarray(vertices, dtype=np.float32)[..., axes] * signs
-    )
+    transformed_vertices = np.asarray(vertices, dtype=np.float32)[..., axes] * signs
     from mmWaveRadar.targets.mesh import ensure_outward_face_winding
 
     outward_faces = ensure_outward_face_winding(

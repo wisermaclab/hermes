@@ -1,0 +1,13 @@
+{
+  "schema_version": 1,
+  "adc": "radar_adc.npz",
+  "sensor": "sensor.json",
+  "origin": "simulation",
+  "scene": "scene.xml",
+  "target_mesh": "target_mesh.npz",
+  "frame_times_s": [
+    0.0
+  ],
+  "output": "static-target.zip",
+  "target_material": "material.json"
+}

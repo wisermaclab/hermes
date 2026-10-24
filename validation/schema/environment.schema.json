@@ -4,16 +4,52 @@
   "title": "HERMES Bundle v1 environment",
   "type": "object",
   "properties": {
-    "scene_path": {"$ref": "#/$defs/relativePath"},
-    "motion_parameters": {"$ref": "#/$defs/relativePath"},
-    "motion_mesh": {"$ref": "#/$defs/relativePath"},
-    "scene_source": {"type": "string", "minLength": 1},
-    "environment_mesh_sequence": {"$ref": "#/$defs/relativePath"},
+    "scene_path": {
+      "$ref": "#/$defs/relativePath"
+    },
+    "motion_parameters": {
+      "$ref": "#/$defs/relativePath"
+    },
+    "motion_mesh": {
+      "$ref": "#/$defs/relativePath"
+    },
+    "scene_source": {
+      "type": "string",
+      "minLength": 1
+    },
+    "environment_mesh_sequence": {
+      "$ref": "#/$defs/relativePath"
+    },
     "geometry_outputs": {
       "type": "object",
-      "additionalProperties": {"$ref": "#/$defs/relativePath"}
+      "additionalProperties": {
+        "$ref": "#/$defs/relativePath"
+      }
     },
-    "metadata": {"type": "object"}
+    "metadata": {
+      "type": "object"
+    },
+    "scene_file": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/relativePath"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "human_position_m": {
+      "type": "array",
+      "items": {
+        "type": "number"
+      },
+      "minItems": 3,
+      "maxItems": 3
+    },
+    "human_yaw_deg": {
+      "type": "number"
+    }
   },
   "$defs": {
     "relativePath": {
@@ -21,9 +57,15 @@
       "minLength": 1,
       "not": {
         "anyOf": [
-          {"pattern": "^/"},
-          {"pattern": "^[A-Za-z]:[\\\\/]"},
-          {"pattern": "(^|[\\\\/])\\.\\.([\\\\/]|$)"}
+          {
+            "pattern": "^/"
+          },
+          {
+            "pattern": "^[A-Za-z]:[\\\\/]"
+          },
+          {
+            "pattern": "(^|[\\\\/])\\.\\.([\\\\/]|$)"
+          }
         ]
       }
     }

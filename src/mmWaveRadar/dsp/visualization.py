@@ -37,13 +37,9 @@ def plot_axis_image(
     if z.ndim != 2:
         raise ValueError("image must have shape [num_y, num_x]")
     if x.shape not in ((z.shape[1],), (z.shape[1] + 1,)):
-        raise ValueError(
-            "x_axis length must match image columns or image column edges"
-        )
+        raise ValueError("x_axis length must match image columns or image column edges")
     if y.shape not in ((z.shape[0],), (z.shape[0] + 1,)):
-        raise ValueError(
-            "y_axis length must match image rows or image row edges"
-        )
+        raise ValueError("y_axis length must match image rows or image row edges")
     if x.size == 0 or y.size == 0:
         raise ValueError("x_axis and y_axis must be non-empty")
 
@@ -104,7 +100,7 @@ def plot_range_profile(
         mask = (ranges >= lo) & (ranges <= hi)
         ax.set_xlim(lo, hi)
 
-    line, = ax.plot(ranges[mask], y[mask], label=label, **plot_kwargs)
+    (line,) = ax.plot(ranges[mask], y[mask], label=label, **plot_kwargs)
     if target_range_m is not None:
         ax.axvline(
             float(target_range_m),
@@ -150,8 +146,7 @@ def plot_point_cloud_projection(
     x_index = _point_axis_index(x_axis)
     y_index = _point_axis_index(y_axis)
     if pts.shape[0] == 0:
-        ax.text(0.5, 0.5, empty_label, transform=ax.transAxes,
-                ha="center", va="center")
+        ax.text(0.5, 0.5, empty_label, transform=ax.transAxes, ha="center", va="center")
         scatter = None
     elif power is None:
         scatter = ax.scatter(pts[:, x_index], pts[:, y_index])
@@ -215,9 +210,17 @@ def plot_range_time_map(
         times_s = np.asarray(times_s, dtype=float).reshape(-1)
         if times_s.shape != (rt.shape[0],):
             raise ValueError("times_s length must match range_time")
-        im = ax.imshow(z, aspect="auto", origin="lower",
-                       extent=[float(ranges_m[0]), float(ranges_m[-1]),
-                               float(times_s[0]), float(times_s[-1])])
+        im = ax.imshow(
+            z,
+            aspect="auto",
+            origin="lower",
+            extent=[
+                float(ranges_m[0]),
+                float(ranges_m[-1]),
+                float(times_s[0]),
+                float(times_s[-1]),
+            ],
+        )
         ax.set_ylabel("Time (s)")
         plt.colorbar(im, ax=ax, label="Power (dB)" if use_db else "Power")
 
@@ -275,9 +278,12 @@ def plot_angle_map(
         z = angle_map.astype(float)
         if db:
             z = np.maximum(10.0 * np.log10(np.maximum(z, 1e-24)), db_floor)
-        im = ax.imshow(z, origin="lower", aspect="auto",
-                       extent=[theta_x[0], theta_x[-1],
-                               theta_y[0], theta_y[-1]])
+        im = ax.imshow(
+            z,
+            origin="lower",
+            aspect="auto",
+            extent=[theta_x[0], theta_x[-1], theta_y[0], theta_y[-1]],
+        )
         ax.set_xlabel(f"Azimuth angle ({angle_unit})")
         ax.set_ylabel(f"Elevation angle ({angle_unit})")
         plt.colorbar(im, ax=ax, label="Power (dB)" if db else "Power")
@@ -287,7 +293,6 @@ def plot_angle_map(
     if title is not None:
         ax.set_title(title)
     return ax
-
 
 
 def plot_pseudospectrum(

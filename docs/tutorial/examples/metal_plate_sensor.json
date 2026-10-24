@@ -1,0 +1,50 @@
+{
+  "name": "radar",
+  "board_model": "IWR6843AOP",
+  "position": [0.0, 0.0, 0.0],
+  "orientation": [0.0, 0.0, 0.0],
+  "pattern_mode": "none",
+  "virtual_channel_order": "tx_major",
+  "adc_units": "V",
+  "metadata": {
+    "waveform_source": "metal_plate_experiment_capture_metadata",
+    "capture_type": "raw_adc_observation",
+    "physical_conventions_verified": false,
+    "assumptions": {
+      "tdm_tx_order_zero_based": [0, 1, 2],
+      "frame_period_s": 0.05,
+      "phase_signs_retained": true,
+      "iq_transform": "none"
+    }
+  },
+  "fmcw": {
+    "carrier_frequency_hz": 60476000000.0,
+    "carrier_reference": "first_adc_sample",
+    "start_frequency_hz": 60000000000.0,
+    "adc_start_time_s": 0.000007,
+    "idle_time_s": 0.000007,
+    "slope_hz_per_s": 68000000000000.0,
+    "chirp_duration_s": 0.000058,
+    "chirp_repetition_time_s": 0.000065,
+    "sampling_frequency_hz": 4500000.0,
+    "num_adc_samples": 225,
+    "num_chirps_per_frame": 1,
+    "frame_period_s": 0.05,
+    "num_tx": 3,
+    "tx_schedule": "tdm",
+    "tdm_tx_order": [0, 1, 2],
+    "adc_mode": "complex1x",
+    "if_bandwidth_hz": null,
+    "tx_start_time_s": 0.000001,
+    "tx_output_power_backoff_db": [0, 0, 0],
+    "tx_phase_shift_degrees": [0.0, 0.0, 0.0],
+    "high_pass_filter_hz": [175000.0, 350000.0],
+    "rx_gain_db": 30,
+    "rx_gain_target_db": 36
+  },
+  "channel_map": [
+    [0, 0], [0, 1], [0, 2], [0, 3],
+    [1, 0], [1, 1], [1, 2], [1, 3],
+    [2, 0], [2, 1], [2, 2], [2, 3]
+  ]
+}

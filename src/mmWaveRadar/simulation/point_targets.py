@@ -7,11 +7,11 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-import operator
 from typing import Any
 
 import numpy as np
 
+from ..values import positive_integer, finite_float
 from ..dsp import angle_map_fft, range_fft
 from ..dsp.constants import SPEED_OF_LIGHT
 from ..radar.fmcw import FMCWConfig
@@ -56,6 +56,7 @@ class PointTargetSynthesisResult:
     coefficients: np.ndarray
     delays_s: np.ndarray
     adc: np.ndarray
+    adc_if_filter: dict | None = None
 
 
 def make_point_target_fmcw_config(
@@ -69,7 +70,9 @@ def make_point_target_fmcw_config(
     num_chirps_per_frame: int = 96,
     frame_period: float = 50.0e-3,
     num_tx: int = 1,
-    tdm_enabled: bool = False,
+    tx_schedule: str = "simultaneous",
+    adc_mode: str = "complex1x",
+    if_bandwidth_hz: float | None = None,
 ) -> FMCWConfig:
     """Builds a configurable FMCW profile for analytic point-target examples."""
 
@@ -83,7 +86,9 @@ def make_point_target_fmcw_config(
         num_chirps_per_frame=num_chirps_per_frame,
         frame_period=frame_period,
         num_tx=num_tx,
-        tdm_enabled=tdm_enabled,
+        tx_schedule=tx_schedule,
+        adc_mode=adc_mode,
+        if_bandwidth_hz=if_bandwidth_hz,
     )
 
 
@@ -136,9 +141,7 @@ def synthesize_virtual_center_point_targets(
             target.elevation_deg,
         )
         delays_s[path_index] = 2.0 * target.range_m / SPEED_OF_LIGHT
-        array_phase = np.exp(
-            1j * 2.0 * np.pi * (positions_lambda @ direction_yz)
-        )
+        array_phase = np.exp(1j * 2.0 * np.pi * (positions_lambda @ direction_yz))
         gain = hardware.channel_gain(
             azimuth_deg=target.azimuth_deg,
             elevation_deg=target.elevation_deg,
@@ -151,16 +154,16 @@ def synthesize_virtual_center_point_targets(
             spreading = 1.0 / max(target.range_m * target.range_m, 1e-12)
         else:
             spreading = 1.0
-        coeffs[:, path_index] = (
-            target.reflectivity * spreading * gain * array_phase
-        )
+        coeffs[:, path_index] = target.reflectivity * spreading * gain * array_phase
 
+    filter_diagnostics = {}
     adc = synthesize_adc_from_paths(
         coeffs,
         delays_s,
         fmcw,
         backend=backend,
         precision=precision,
+        diagnostics=filter_diagnostics,
     )
     return PointTargetSynthesisResult(
         hardware=hardware,
@@ -169,6 +172,7 @@ def synthesize_virtual_center_point_targets(
         coefficients=coeffs,
         delays_s=delays_s,
         adc=adc,
+        adc_if_filter=filter_diagnostics,
     )
 
 
@@ -212,15 +216,9 @@ def virtual_snapshot_grid(
         lattice = (
             f"lambda/{scale}"
             if np.allclose(grid_spacing, 1.0 / float(scale))
-            else (
-                f"the configured y/z wavelength grid "
-                f"({spacing_y:g}, {spacing_z:g})"
-            )
+            else (f"the configured y/z wavelength grid " f"({spacing_y:g}, {spacing_z:g})")
         )
-        raise ValueError(
-            f"{hardware.name} virtual coordinates are not on a "
-            f"{lattice} grid"
-        )
+        raise ValueError(f"{hardware.name} virtual coordinates are not on a " f"{lattice} grid")
 
     x = np.asarray(range_cube)
     if x.ndim < 1 or x.shape[-1] != hardware.num_virtual_channels:
@@ -243,14 +241,8 @@ def virtual_snapshot_grid(
     occupied = counts > 0.0
     grid[..., occupied] /= counts[occupied]
     if return_metadata:
-        y_lambda = (
-            origin[0]
-            + (min_index[0] + np.arange(nx)) * spacing_y
-        )
-        z_lambda = (
-            origin[1]
-            + (min_index[1] + np.arange(ny)) * spacing_z
-        )
+        y_lambda = origin[0] + (min_index[0] + np.arange(nx)) * spacing_y
+        z_lambda = origin[1] + (min_index[1] + np.arange(ny)) * spacing_z
         metadata = {
             "occupied": occupied,
             "y_lambda": y_lambda,
@@ -267,26 +259,30 @@ def virtual_snapshot_grid(
 
 def calibrate_range_cube_channel_phase(
     range_cube: np.ndarray,
-    hardware: RadarHardware,
+    hardware: RadarHardware | None = None,
     *,
     enabled: bool = True,
+    phase_signs=None,
 ) -> np.ndarray:
     """Removes fixed virtual-channel phase signs before array FFT processing."""
 
     if not enabled:
         return range_cube
-    signs = hardware.virtual_channel_phase_signs
+    signs = (
+        phase_signs
+        if phase_signs is not None
+        else (None if hardware is None else hardware.virtual_channel_phase_signs)
+    )
     if signs is None:
         return range_cube
     x = np.asarray(range_cube)
-    if x.ndim < 1 or x.shape[-1] != hardware.num_virtual_channels:
+    signs = np.asarray(signs)
+    if x.ndim < 1 or signs.shape != (x.shape[-1],):
         raise ValueError(
             "range_cube must have the virtual-channel axis last and match "
             "hardware.num_virtual_channels"
         )
-    safe = np.where(np.abs(signs) > 0.0, signs, 1.0 + 0.0j).astype(
-        np.complex128
-    )
+    safe = np.where(np.abs(signs) > 0.0, signs, 1.0 + 0.0j).astype(np.complex128)
     safe = safe.reshape((1,) * (x.ndim - 1) + (safe.size,))
     return x / safe
 
@@ -359,12 +355,8 @@ def azimuth_elevation_axes(angle: Mapping[str, Any]) -> tuple[np.ndarray, np.nda
     :func:`azimuth_elevation_grids` when both direction-cosine dimensions vary.
     """
 
-    azimuth_deg = np.rad2deg(
-        np.arcsin(np.clip(np.asarray(angle["u"]), -1.0, 1.0))
-    )
-    elevation_deg = np.rad2deg(
-        np.arcsin(np.clip(np.asarray(angle["v"]), -1.0, 1.0))
-    )
+    azimuth_deg = np.rad2deg(np.arcsin(np.clip(np.asarray(angle["u"]), -1.0, 1.0)))
+    elevation_deg = np.rad2deg(np.arcsin(np.clip(np.asarray(angle["v"]), -1.0, 1.0)))
     return azimuth_deg, elevation_deg
 
 
@@ -403,9 +395,7 @@ def db_relative(power: np.ndarray) -> np.ndarray:
         raise ValueError("power must be non-empty")
     if not np.all(np.isfinite(power)) or np.any(power < 0.0):
         raise ValueError("power must contain finite, non-negative values")
-    return 10.0 * np.log10(
-        np.maximum(power, 1e-30) / np.maximum(np.max(power), 1e-30)
-    )
+    return 10.0 * np.log10(np.maximum(power, 1e-30) / np.maximum(np.max(power), 1e-30))
 
 
 def _virtual_positions_lambda(
@@ -439,9 +429,7 @@ def _virtual_positions_lambda(
             "(num_virtual_channels, 2)"
         )
     if not np.all(np.isfinite(positions)):
-        raise ValueError(
-            "hardware virtual-channel positions must contain finite values"
-        )
+        raise ValueError("hardware virtual-channel positions must contain finite values")
     return positions
 
 
@@ -457,14 +445,10 @@ def _virtual_grid_spacings_lambda(
     spacing_y_value = metadata.get("spacing_y_lambda", legacy)
     spacing_z_value = metadata.get("spacing_z_lambda", legacy)
     spacing_y = (
-        fallback
-        if spacing_y_value is None
-        else _finite_float("spacing_y_lambda", spacing_y_value)
+        fallback if spacing_y_value is None else _finite_float("spacing_y_lambda", spacing_y_value)
     )
     spacing_z = (
-        fallback
-        if spacing_z_value is None
-        else _finite_float("spacing_z_lambda", spacing_z_value)
+        fallback if spacing_z_value is None else _finite_float("spacing_z_lambda", spacing_z_value)
     )
     if spacing_y <= 0.0:
         raise ValueError("spacing_y_lambda must be positive")
@@ -473,30 +457,10 @@ def _virtual_grid_spacings_lambda(
     return spacing_y, spacing_z
 
 
-def _finite_float(name: str, value: object) -> float:
-    """Returns ``value`` as a finite real scalar."""
-
-    try:
-        scalar = float(value)
-    except (TypeError, ValueError, OverflowError) as exc:
-        raise ValueError(f"{name} must be a finite real scalar") from exc
-    if not np.isfinite(scalar):
-        raise ValueError(f"{name} must be a finite real scalar")
-    return scalar
+_finite_float = finite_float
 
 
-def _positive_integer(name: str, value: object) -> int:
-    """Returns a positive integer without truncating floats or booleans."""
-
-    if isinstance(value, (bool, np.bool_)):
-        raise ValueError(f"{name} must be a positive integer")
-    try:
-        integer = operator.index(value)
-    except TypeError as exc:
-        raise ValueError(f"{name} must be a positive integer") from exc
-    if integer <= 0:
-        raise ValueError(f"{name} must be a positive integer")
-    return int(integer)
+_positive_integer = positive_integer
 
 
 def _coerce_point_target(

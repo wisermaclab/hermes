@@ -12,9 +12,11 @@ build/
 dist/
 *.egg-info/
 
-# Local data/model/output artifacts. Only the documented, byte-pinned fixtures
-# below are tracked; all neighboring files remain local.
+# Local data/model/output artifacts. Only the scene presets and documented,
+# byte-pinned fixtures below are tracked; neighboring files remain local.
 /data/**
+!/data/scenes/
+!/data/scenes/empty_room.xml
 !/data/AMASS/
 !/data/AMASS/README.md
 !/data/AMASS/walking_poses_cmu_105_02.npz
@@ -51,6 +53,8 @@ dist/
 # License-gated models downloaded by each user. Demos look here by default.
 /models/
 /outputs/
+/internal/references/
+/internal/outputs/
 /benchmarks/**/results/
 
 # Local walk-through slide deck build artifacts

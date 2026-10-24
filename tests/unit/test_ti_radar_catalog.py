@@ -99,26 +99,22 @@ def test_aw2243_cascade_catalog_geometry_and_profiles():
 
     metadata = spec.metadata()
     profile = metadata["fmcw_profiles"]["rtpose_high_resolution_mimo"]
-    assert profile["tdm_enabled"] is True
+    assert profile["tx_schedule"] == "tdm"
     assert profile["num_tx"] == 12
     assert profile["num_adc_samples"] == 256
     assert profile["num_chirps_per_frame"] == 768
     assert np.isclose(profile["frame_period_s"], 0.1)
-    assert metadata["fmcw_profiles"]["ti_mimo_srr"]["tdm_enabled"] is True
-    assert metadata["fmcw_profiles"]["ti_mimo_mrr"]["tdm_enabled"] is True
-    assert "tdm_enabled" not in metadata["fmcw_profiles"]["ti_txbf"]
-    assert metadata["fmcw_profiles"]["ti_mimo_srr"][
-        "published_frame_period_s"
-    ] == pytest.approx(69.0e-3)
-    assert metadata["fmcw_profiles"]["ti_mimo_srr"][
-        "frame_period_s"
-    ] == pytest.approx(69.12e-3)
-    assert metadata["fmcw_profiles"]["ti_mimo_mrr"][
-        "published_frame_period_s"
-    ] == pytest.approx(4.4e-3)
-    assert metadata["fmcw_profiles"]["ti_mimo_mrr"][
-        "frame_period_s"
-    ] == pytest.approx(41.472e-3)
+    assert metadata["fmcw_profiles"]["ti_mimo_srr"]["tx_schedule"] == "tdm"
+    assert metadata["fmcw_profiles"]["ti_mimo_mrr"]["tx_schedule"] == "tdm"
+    assert "tx_schedule" not in metadata["fmcw_profiles"]["ti_txbf"]
+    assert metadata["fmcw_profiles"]["ti_mimo_srr"]["published_frame_period_s"] == pytest.approx(
+        69.0e-3
+    )
+    assert metadata["fmcw_profiles"]["ti_mimo_srr"]["frame_period_s"] == pytest.approx(69.12e-3)
+    assert metadata["fmcw_profiles"]["ti_mimo_mrr"]["published_frame_period_s"] == pytest.approx(
+        4.4e-3
+    )
+    assert metadata["fmcw_profiles"]["ti_mimo_mrr"]["frame_period_s"] == pytest.approx(41.472e-3)
 
 
 def test_ti_default_simple_cosine_pattern_needs_no_digitized_asset(monkeypatch):
@@ -437,7 +433,7 @@ frameCfg 0 1 32 0 50 1 0
     assert radar.hardware.num_rx == 4
     assert radar.hardware.num_virtual_channels == 8
     assert radar.fmcw.num_tx == 2
-    assert radar.fmcw.tdm_enabled is True
+    assert radar.fmcw.tx_schedule == "tdm"
     assert radar.hardware.virtual_channel_labels[:4] == (
         "TX1 to RX1",
         "TX1 to RX2",
@@ -469,7 +465,7 @@ frameCfg 0 0 32 0 50 1 0
 
     assert radar.hardware.num_tx == 2
     assert radar.fmcw.num_tx == 2
-    assert radar.fmcw.tdm_enabled is False
+    assert radar.fmcw.tx_schedule == "simultaneous"
     assert radar.fmcw.num_chirps_per_frame == 32
 
 
@@ -489,7 +485,7 @@ frameCfg 0 1 32 0 50 1 0
         pattern_mode="none",
     )
 
-    assert radar.fmcw.tdm_enabled is True
+    assert radar.fmcw.tx_schedule == "tdm"
     assert radar.fmcw.num_chirps_per_frame == 32
     assert radar.hardware.virtual_channel_labels[:4] == (
         "TX1 to RX1",
@@ -528,10 +524,7 @@ def test_ti_cli_rejects_unrepresentable_changing_tx_masks(
     tmp_path,
     chirp_lines,
 ):
-    cfg = (
-        "profileCfg 0 60 7 7 58 0 0 68 1 225 4500 0 0 158\n"
-        + chirp_lines
-    )
+    cfg = "profileCfg 0 60 7 7 58 0 0 68 1 225 4500 0 0 158\n" + chirp_lines
     path = tmp_path / "changing-tx-mask.cfg"
     path.write_text(cfg, encoding="utf-8")
 
@@ -569,10 +562,9 @@ def test_channel_gain_treats_one_dimensional_angles_as_paths():
     )
 
     actual = hardware.apply_channel_gain(coeffs, azimuth_deg=angles)
-    expected = np.column_stack([
-        hardware.channel_gain(azimuth_deg=float(angle))
-        for angle in angles
-    ])
+    expected = np.column_stack(
+        [hardware.channel_gain(azimuth_deg=float(angle)) for angle in angles]
+    )
 
     assert actual.shape == coeffs.shape
     np.testing.assert_allclose(actual, expected)
@@ -586,15 +578,17 @@ def test_digitized_pattern_broadcasts_scalar_and_vector_angles(vector_axis):
     kwargs[f"{vector_axis}_deg"] = vector
 
     actual = pattern.loss_db(**kwargs)
-    expected = np.column_stack([
-        pattern.loss_db(**{
-            "azimuth_deg": float(value) if vector_axis == "azimuth" else 5.0,
-            "elevation_deg": (
-                float(value) if vector_axis == "elevation" else 10.0
-            ),
-        })
-        for value in vector
-    ])
+    expected = np.column_stack(
+        [
+            pattern.loss_db(
+                **{
+                    "azimuth_deg": float(value) if vector_axis == "azimuth" else 5.0,
+                    "elevation_deg": (float(value) if vector_axis == "elevation" else 10.0),
+                }
+            )
+            for value in vector
+        ]
+    )
 
     assert actual.shape == (pattern.num_virtual_channels, vector.size)
     np.testing.assert_allclose(actual, expected)
@@ -605,10 +599,12 @@ def test_digitized_pattern_accepts_explicit_per_channel_angles():
     angles = np.linspace(-20.0, 20.0, pattern.num_virtual_channels)
 
     actual = pattern.loss_db(azimuth_deg=angles[:, None])
-    expected = np.asarray([
-        pattern.loss_db(azimuth_deg=float(angle))[channel]
-        for channel, angle in enumerate(angles)
-    ])[:, None]
+    expected = np.asarray(
+        [
+            pattern.loss_db(azimuth_deg=float(angle))[channel]
+            for channel, angle in enumerate(angles)
+        ]
+    )[:, None]
 
     assert actual.shape == (pattern.num_virtual_channels, 1)
     np.testing.assert_allclose(actual, expected)
@@ -641,7 +637,7 @@ frameCfg 0 0 32 0 50 1 0
     assert radar.hardware.num_tx == 1
     assert radar.fmcw.num_tx == 1
     assert radar.fmcw.num_chirps_per_frame == 32
-    assert radar.fmcw.tdm_enabled is False
+    assert radar.fmcw.tx_schedule == "simultaneous"
 
 
 def test_ti_cli_honors_chirp_ranges_and_compatible_profile_ids(tmp_path):
@@ -664,7 +660,7 @@ frameCfg 1 2 16 0 50 1 0
     assert radar.hardware.num_tx == 2
     assert radar.fmcw.num_tx == 2
     assert radar.fmcw.num_chirps_per_frame == 16
-    assert radar.fmcw.tdm_enabled is True
+    assert radar.fmcw.tx_schedule == "tdm"
 
 
 def test_ti_cli_rejects_incompatible_in_frame_profiles(tmp_path):

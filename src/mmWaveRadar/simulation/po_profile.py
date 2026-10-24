@@ -16,7 +16,7 @@ from mmWaveRadar.dsp import range_fft
 
 from .types import (
     SENSING_METADATA_SCHEMA_VERSION,
-    HumanPOMobilityConfig,
+    POConfig,
     RadarCube,
     SensingMetadata,
 )
@@ -27,10 +27,8 @@ class POIncrementalSweepSetting:
     """One incremental-PO profiling point."""
 
     label: str
-    visibility_refresh_chirps: int
-    normal_threshold_deg: float
-    centroid_displacement_threshold_m: float
-    area_relative_threshold: float
+    po_visibility_refresh_frames: int
+    po_refresh_on_phase_error_rad: float
 
 
 @dataclass(frozen=True)
@@ -81,38 +79,27 @@ def relative_norm_error(reference: np.ndarray, estimate: np.ndarray) -> float:
     estimate = np.asarray(estimate, dtype=np.complex128)
     if reference.shape != estimate.shape:
         raise ValueError("reference and estimate must have the same shape")
-    return float(
-        np.linalg.norm(reference - estimate) / max(np.linalg.norm(reference), 1e-30)
-    )
+    return float(np.linalg.norm(reference - estimate) / max(np.linalg.norm(reference), 1e-30))
 
 
 def make_incremental_po_config(
     setting: POIncrementalSweepSetting,
     *,
-    visibility_samples_per_face: int,
-    adaptive_visibility_edge_margin: float = 0.15,
-    visibility_fade_chirps: int = 8,
-    visibility_use_phase_center: bool = True,
-    full_refresh_chirps: int = 0,
-) -> HumanPOMobilityConfig:
-    """Builds a simulator config from a sweep setting."""
+    po_visibility_samples_per_face: int,
+    po_adaptive_visibility_edge_margin: float = 0.15,
+    po_visibility_fade_frames: int = 0,
+    po_refresh_frames: int = 1,
+) -> POConfig:
+    """Builds a phase-updating PO config from a sweep setting."""
 
-    return HumanPOMobilityConfig(
-        visibility_samples_per_face=int(visibility_samples_per_face),
-        visibility_fade_chirps=int(visibility_fade_chirps),
-        visibility_use_phase_center=bool(visibility_use_phase_center),
-        adaptive_visibility_sampling=True,
-        adaptive_visibility_edge_margin=float(adaptive_visibility_edge_margin),
-        incremental_update=True,
-        incremental_visibility_refresh_chirps=int(
-            setting.visibility_refresh_chirps
-        ),
-        incremental_full_refresh_chirps=int(full_refresh_chirps),
-        incremental_normal_threshold_deg=float(setting.normal_threshold_deg),
-        incremental_centroid_displacement_threshold_m=float(
-            setting.centroid_displacement_threshold_m
-        ),
-        incremental_area_relative_threshold=float(setting.area_relative_threshold),
+    return POConfig(
+        po_refresh_frames=int(po_refresh_frames),
+        po_visibility_refresh_frames=int(setting.po_visibility_refresh_frames),
+        po_visibility_fade_frames=int(po_visibility_fade_frames),
+        po_visibility_samples_per_face=int(po_visibility_samples_per_face),
+        po_adaptive_visibility_sampling=True,
+        po_adaptive_visibility_edge_margin=float(po_adaptive_visibility_edge_margin),
+        po_refresh_on_phase_error_rad=float(setting.po_refresh_on_phase_error_rad),
     )
 
 
@@ -152,7 +139,6 @@ def _count_dict_from_npz(data, prefix: str) -> dict[str, int]:
     }
 
 
-
 def _json_default(value):
     """JSON encoder fallback for NumPy scalars and arrays."""
 
@@ -169,6 +155,7 @@ def _optional_json(data, key: str):
     if key not in data:
         return None
     return json.loads(str(data[key].item()))
+
 
 def _optional_array(data, key: str):
     """Returns an optional array from an NPZ archive."""
@@ -192,10 +179,10 @@ def save_radar_cube_npz(
     payload = {
         "adc": cube.adc,
         "times": cube.times,
-        "mode": np.asarray(cube.metadata.mode),
-        "metadata_schema_version": np.asarray(
-            int(cube.metadata.metadata_schema_version)
-        ),
+        "solver": np.asarray(cube.metadata.solver),
+        "adc_if_filter_json": np.asarray(json.dumps(cube.metadata.adc_if_filter)),
+        "provenance_json": np.asarray(json.dumps(cube.metadata.provenance, default=_json_default)),
+        "metadata_schema_version": np.asarray(int(cube.metadata.metadata_schema_version)),
         "virtual_channel_order": np.asarray(cube.metadata.virtual_channel_order),
         "path_counts": cube.metadata.path_counts,
         "wall_time_s": np.asarray(float(wall_time_s)),
@@ -266,9 +253,7 @@ def save_radar_cube_npz(
                 continue
             slug = label_slug(str(key))
             if not slug:
-                raise ValueError(
-                    f"component name {key!r} has no usable filename characters"
-                )
+                raise ValueError(f"component name {key!r} has no usable filename characters")
             if slug in used_slugs:
                 raise ValueError(
                     "component names must remain unique after filename "
@@ -289,122 +274,96 @@ def save_radar_cube_npz(
     np.savez_compressed(path, **payload)
 
 
+# Caches written before the solver names were unified store ``mode``.
+_SAVED_MODE_SOLVERS = {
+    "rt_baseline": "rt",
+    "rt_retrace": "rt",
+    "rt_coherent_bank": "rt",
+    "human_only_po": "po",
+    "hybrid_static_env_po": "hybrid_po",
+}
+
+
+def _saved_solver(data) -> str:
+    """Reads the solver of a saved cube, including older ``mode`` caches."""
+
+    if "solver" in data:
+        solver = str(data["solver"].item())
+        return _SAVED_MODE_SOLVERS.get(solver, solver)
+    if "mode" in data:
+        mode = str(data["mode"].item())
+        return _SAVED_MODE_SOLVERS.get(mode, mode)
+    return "po"
+
+
 def load_radar_cube_npz(path: str | Path) -> tuple[RadarCube, float, int]:
     """Loads a cube saved by :func:`save_radar_cube_npz`."""
 
     with np.load(path, allow_pickle=False) as archive:
-        data = {
-            key: np.array(archive[key], copy=True) for key in archive.files
-        }
+        data = {key: np.array(archive[key], copy=True) for key in archive.files}
     metadata = SensingMetadata(
         events=_optional_json(data, "events_json") or [],
+        adc_if_filter=_optional_json(data, "adc_if_filter_json"),
+        provenance=_optional_json(data, "provenance_json"),
         path_counts=data["path_counts"],
         max_displacements=_optional_array(data, "max_displacements"),
-        virtual_channel_order=str(data["virtual_channel_order"].item())
-        if "virtual_channel_order" in data
-        else "tx_major",
-        metadata_schema_version=int(data["metadata_schema_version"].item())
-        if "metadata_schema_version" in data
-        else SENSING_METADATA_SCHEMA_VERSION,
-        mode=str(data["mode"].item()) if "mode" in data else "human_only_po",
+        virtual_channel_order=(
+            str(data["virtual_channel_order"].item())
+            if "virtual_channel_order" in data
+            else "tx_major"
+        ),
+        metadata_schema_version=(
+            int(data["metadata_schema_version"].item())
+            if "metadata_schema_version" in data
+            else SENSING_METADATA_SCHEMA_VERSION
+        ),
+        solver=_saved_solver(data),
         visible_face_counts=_optional_array(data, "visible_face_counts"),
-        effective_visible_area_fraction=_optional_array(
-            data, "effective_visible_area_fraction"
-        ),
+        effective_visible_area_fraction=_optional_array(data, "effective_visible_area_fraction"),
         runtime_per_chirp_s=_optional_array(data, "runtime_per_chirp_s"),
-        max_unwrapped_phase_jump=_optional_array(
-            data, "max_unwrapped_phase_jump"
-        ),
+        max_unwrapped_phase_jump=_optional_array(data, "max_unwrapped_phase_jump"),
         runtime_profile_s=_profile_dict_from_npz(data, "runtime_profile_s"),
-        runtime_profile_counts=_count_dict_from_npz(
-            data, "runtime_profile_counts"
-        ),
+        runtime_profile_counts=_count_dict_from_npz(data, "runtime_profile_counts"),
         incremental_recomputed_face_counts=_optional_array(
             data, "incremental_recomputed_face_counts"
         ),
         incremental_phase_updated_face_counts=_optional_array(
             data, "incremental_phase_updated_face_counts"
         ),
-        incremental_full_refresh=_optional_array(
-            data, "incremental_full_refresh"
-        ),
-        incremental_visibility_refresh=_optional_array(
-            data, "incremental_visibility_refresh"
-        ),
+        incremental_full_refresh=_optional_array(data, "incremental_full_refresh"),
+        incremental_visibility_refresh=_optional_array(data, "incremental_visibility_refresh"),
         static_path_counts=_optional_array(data, "static_path_counts"),
-        blocked_static_path_counts=_optional_array(
-            data, "blocked_static_path_counts"
-        ),
-        mean_static_path_visibility=_optional_array(
-            data, "mean_static_path_visibility"
-        ),
+        blocked_static_path_counts=_optional_array(data, "blocked_static_path_counts"),
+        mean_static_path_visibility=_optional_array(data, "mean_static_path_visibility"),
         human_env_path_counts=_optional_array(data, "human_env_path_counts"),
         env_human_path_counts=_optional_array(data, "env_human_path_counts"),
         human_touch_path_counts=_optional_array(data, "human_touch_path_counts"),
-        one_human_touch_path_counts=_optional_array(
-            data, "one_human_touch_path_counts"
-        ),
-        single_human_only_path_counts=_optional_array(
-            data, "single_human_only_path_counts"
-        ),
-        human_env_coupled_path_counts=_optional_array(
-            data, "human_env_coupled_path_counts"
-        ),
-        human_multi_touch_path_counts=_optional_array(
-            data, "human_multi_touch_path_counts"
-        ),
+        one_human_touch_path_counts=_optional_array(data, "one_human_touch_path_counts"),
+        single_human_only_path_counts=_optional_array(data, "single_human_only_path_counts"),
+        human_env_coupled_path_counts=_optional_array(data, "human_env_coupled_path_counts"),
+        human_multi_touch_path_counts=_optional_array(data, "human_multi_touch_path_counts"),
         path_depth_histogram=_optional_array(data, "path_depth_histogram"),
         total_path_power=_optional_array(data, "total_path_power"),
         human_touch_path_power=_optional_array(data, "human_touch_path_power"),
-        one_human_touch_path_power=_optional_array(
-            data, "one_human_touch_path_power"
-        ),
-        single_human_only_path_power=_optional_array(
-            data, "single_human_only_path_power"
-        ),
-        human_env_coupled_path_power=_optional_array(
-            data, "human_env_coupled_path_power"
-        ),
-        human_multi_touch_path_power=_optional_array(
-            data, "human_multi_touch_path_power"
-        ),
-        human_env_min_path_lengths_m=_optional_array(
-            data, "human_env_min_path_lengths_m"
-        ),
-        human_env_mean_path_lengths_m=_optional_array(
-            data, "human_env_mean_path_lengths_m"
-        ),
-        human_env_max_path_lengths_m=_optional_array(
-            data, "human_env_max_path_lengths_m"
-        ),
-        env_human_min_path_lengths_m=_optional_array(
-            data, "env_human_min_path_lengths_m"
-        ),
-        env_human_mean_path_lengths_m=_optional_array(
-            data, "env_human_mean_path_lengths_m"
-        ),
-        env_human_max_path_lengths_m=_optional_array(
-            data, "env_human_max_path_lengths_m"
-        ),
+        one_human_touch_path_power=_optional_array(data, "one_human_touch_path_power"),
+        single_human_only_path_power=_optional_array(data, "single_human_only_path_power"),
+        human_env_coupled_path_power=_optional_array(data, "human_env_coupled_path_power"),
+        human_multi_touch_path_power=_optional_array(data, "human_multi_touch_path_power"),
+        human_env_min_path_lengths_m=_optional_array(data, "human_env_min_path_lengths_m"),
+        human_env_mean_path_lengths_m=_optional_array(data, "human_env_mean_path_lengths_m"),
+        human_env_max_path_lengths_m=_optional_array(data, "human_env_max_path_lengths_m"),
+        env_human_min_path_lengths_m=_optional_array(data, "env_human_min_path_lengths_m"),
+        env_human_mean_path_lengths_m=_optional_array(data, "env_human_mean_path_lengths_m"),
+        env_human_max_path_lengths_m=_optional_array(data, "env_human_max_path_lengths_m"),
         rt_transition_persistent_path_counts=_optional_array(
             data, "rt_transition_persistent_path_counts"
         ),
-        rt_transition_birth_path_counts=_optional_array(
-            data, "rt_transition_birth_path_counts"
-        ),
-        rt_transition_death_path_counts=_optional_array(
-            data, "rt_transition_death_path_counts"
-        ),
+        rt_transition_birth_path_counts=_optional_array(data, "rt_transition_birth_path_counts"),
+        rt_transition_death_path_counts=_optional_array(data, "rt_transition_death_path_counts"),
         rt_transition_alpha=_optional_array(data, "rt_transition_alpha"),
-        rt_transition_old_weights=_optional_array(
-            data, "rt_transition_old_weights"
-        ),
-        rt_transition_new_weights=_optional_array(
-            data, "rt_transition_new_weights"
-        ),
-        virtual_channel_times_s=_optional_array(
-            data, "virtual_channel_times_s"
-        ),
+        rt_transition_old_weights=_optional_array(data, "rt_transition_old_weights"),
+        rt_transition_new_weights=_optional_array(data, "rt_transition_new_weights"),
+        virtual_channel_times_s=_optional_array(data, "virtual_channel_times_s"),
         po_calibration=_optional_json(data, "po_calibration_json"),
     )
     components = None
@@ -420,11 +379,7 @@ def load_radar_cube_npz(path: str | Path) -> tuple[RadarCube, float, int]:
         metadata=metadata,
         components=components,
     )
-    wall_time_s = (
-        float(data["wall_time_s"].item())
-        if "wall_time_s" in data
-        else float("nan")
-    )
+    wall_time_s = float(data["wall_time_s"].item()) if "wall_time_s" in data else float("nan")
     if "num_chirps" in data:
         num_chirps = int(data["num_chirps"].item())
     elif cube.adc.ndim == 4:
@@ -432,9 +387,7 @@ def load_radar_cube_npz(path: str | Path) -> tuple[RadarCube, float, int]:
     elif cube.adc.ndim == 3:
         num_chirps = int(cube.adc.shape[0])
     else:
-        raise ValueError(
-            "stored adc must have shape [F, M, N, C] or [M, N, C]"
-        )
+        raise ValueError("stored adc must have shape [F, M, N, C] or [M, N, C]")
     return cube, wall_time_s, num_chirps
 
 
@@ -526,28 +479,20 @@ def summarize_incremental_po_result(
         num_chirps=int(num_chirps),
         speedup=float(baseline_wall_time_s) / max(float(wall_time_s), 1e-12),
         adc_relative_error=relative_norm_error(baseline_cube.adc, cube.adc),
-        range_profile_relative_error=relative_norm_error(
-            baseline_range_profiles, inc_profiles
-        ),
+        range_profile_relative_error=relative_norm_error(baseline_range_profiles, inc_profiles),
         path_count_delta_min=int(np.min(path_count_delta)),
         path_count_delta_mean=float(np.mean(path_count_delta)),
         path_count_delta_max=int(np.max(path_count_delta)),
-        recomputed_mean=(
-            float(np.mean(recomputed)) if recomputed is not None else float("nan")
-        ),
+        recomputed_mean=(float(np.mean(recomputed)) if recomputed is not None else float("nan")),
         recomputed_max=int(np.max(recomputed)) if recomputed is not None else 0,
         phase_updated_mean=(
-            float(np.mean(phase_updated))
-            if phase_updated is not None
-            else float("nan")
+            float(np.mean(phase_updated)) if phase_updated is not None else float("nan")
         ),
         full_refresh_count=(
             int(np.count_nonzero(full_refresh)) if full_refresh is not None else 0
         ),
         visibility_refresh_count=(
-            int(np.count_nonzero(visibility_refresh))
-            if visibility_refresh is not None
-            else 0
+            int(np.count_nonzero(visibility_refresh)) if visibility_refresh is not None else 0
         ),
         path=None if path is None else Path(path),
     )
@@ -559,12 +504,12 @@ def run_incremental_po_sweep(
     baseline_cube: RadarCube,
     baseline_wall_time_s: float,
     fmcw,
-    visibility_samples_per_face: int,
-    run_cube: Callable[[str, HumanPOMobilityConfig], tuple[RadarCube, float, int]],
+    po_visibility_samples_per_face: int,
+    run_cube: Callable[[str, POConfig], tuple[RadarCube, float, int]],
     output_dir: str | Path | None = None,
     reuse_saved: bool = True,
     cache_match: Callable[[RadarCube], bool] | None = None,
-    filename_prefix: str = "human_only_po_incremental",
+    filename_prefix: str = "po_incremental",
 ) -> list[POIncrementalProfileResult]:
     """Runs or loads a set of incremental PO configurations."""
 
@@ -581,7 +526,7 @@ def run_incremental_po_sweep(
             if cache_match is not None and not cache_match(cube):
                 config = make_incremental_po_config(
                     setting,
-                    visibility_samples_per_face=visibility_samples_per_face,
+                    po_visibility_samples_per_face=po_visibility_samples_per_face,
                 )
                 cube, wall_time_s, num_chirps = run_cube(setting.label, config)
                 save_radar_cube_npz(
@@ -594,7 +539,7 @@ def run_incremental_po_sweep(
         else:
             config = make_incremental_po_config(
                 setting,
-                visibility_samples_per_face=visibility_samples_per_face,
+                po_visibility_samples_per_face=po_visibility_samples_per_face,
             )
             cube, wall_time_s, num_chirps = run_cube(setting.label, config)
             if cache_path is not None:

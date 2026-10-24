@@ -23,27 +23,18 @@ from mmWaveRadar.tutorial_support import (
 def test_prepared_bedroom_is_tight_but_clears_the_default_walk_and_furniture():
     boxes = {box["id"]: box for box in BEDROOM_SCENE_BOXES}
     floor = boxes["floor"]
-    room_min = np.asarray(floor["translate"][:2]) - np.asarray(
-        floor["scale"][:2]
-    )
-    room_max = np.asarray(floor["translate"][:2]) + np.asarray(
-        floor["scale"][:2]
-    )
+    room_min = np.asarray(floor["translate"][:2]) - np.asarray(floor["scale"][:2])
+    room_max = np.asarray(floor["translate"][:2]) + np.asarray(floor["scale"][:2])
 
     assert room_min == pytest.approx([-0.45, -3.6])
     assert room_max == pytest.approx([5.45, 5.1])
     assert np.prod(room_max - room_min) < 52.0
     motion_path = (
-        Path(__file__).resolve().parents[2]
-        / "data"
-        / "AMASS"
-        / "walking_poses_cmu_105_02.npz"
+        Path(__file__).resolve().parents[2] / "data" / "AMASS" / "walking_poses_cmu_105_02.npz"
     )
     with np.load(motion_path, allow_pickle=False) as archive:
         translation = np.asarray(archive["trans"], dtype=float)
-    centerline = np.asarray([1.6, 0.0]) + (
-        translation[:, :2] - translation[0, :2]
-    )
+    centerline = np.asarray([1.6, 0.0]) + (translation[:, :2] - translation[0, :2])
     # A 0.5 m horizontal body envelope is conservative for the bundled SMPL
     # walk while keeping this test independent of separately licensed models.
     walk_min = np.min(centerline, axis=0) - 0.5
@@ -54,12 +45,8 @@ def test_prepared_bedroom_is_tight_but_clears_the_default_walk_and_furniture():
 
     for furniture_id in ("bed", "nightstand", "wardrobe"):
         furniture = boxes[furniture_id]
-        furniture_min = np.asarray(furniture["translate"][:2]) - np.asarray(
-            furniture["scale"][:2]
-        )
-        furniture_max = np.asarray(furniture["translate"][:2]) + np.asarray(
-            furniture["scale"][:2]
-        )
+        furniture_min = np.asarray(furniture["translate"][:2]) - np.asarray(furniture["scale"][:2])
+        furniture_max = np.asarray(furniture["translate"][:2]) + np.asarray(furniture["scale"][:2])
         assert np.min(furniture_min - room_min) >= 0.05 - 1e-9
         assert np.min(room_max - furniture_max) >= 0.05 - 1e-9
         separation = max(
@@ -83,46 +70,41 @@ def test_bedroom_xml_geometry_matches_preview_boxes():
         translate = transform.find("./translate")
         assert scale is not None
         assert translate is not None
-        assert tuple(float(scale.attrib[axis]) for axis in "xyz") == pytest.approx(
-            box["scale"]
+        assert tuple(float(scale.attrib[axis]) for axis in "xyz") == pytest.approx(box["scale"])
+        assert tuple(float(translate.attrib[axis]) for axis in "xyz") == pytest.approx(
+            box["translate"]
         )
-        assert tuple(
-            float(translate.attrib[axis]) for axis in "xyz"
-        ) == pytest.approx(box["translate"])
 
 
-def test_bedroom_right_wall_uses_the_metal_reflector():
+def test_bedroom_box_materials_are_derived_from_the_xml():
     scene = ET.fromstring(bedroom_scene_xml())
-    wall_material = scene.find("./bsdf[@id='mat-wall']")
-    material = scene.find("./bsdf[@id='mat-reflective-wall']")
-    right_wall = scene.find("./shape[@id='right_wall']")
+    material_types = {
+        material.attrib["id"]: material.find("./string[@name='type']").attrib["value"]
+        for material in scene.findall("./bsdf")
+    }
+    shapes = {shape.attrib["id"]: shape for shape in scene.findall("./shape")}
 
-    assert wall_material is not None
-    assert float(
-        wall_material.find("./float[@name='scattering_coefficient']").attrib[
-            "value"
-        ]
-    ) == pytest.approx(0.2)
-    assert material is not None
-    assert material.find("./string[@name='type']").attrib["value"] == "metal"
-    assert float(
-        material.find("./float[@name='scattering_coefficient']").attrib["value"]
-    ) == pytest.approx(0.2)
-    assert right_wall is not None
-    assert right_wall.find("./ref[@name='bsdf']").attrib["id"] == (
-        "mat-reflective-wall"
-    )
+    for box in BEDROOM_SCENE_BOXES:
+        material_id = shapes[box["id"]].find("./ref[@name='bsdf']").attrib["id"]
+        assert box["material_id"] == material_id
+        assert box["material"] == material_types[material_id]
+
+    boxes = {box["id"]: box for box in BEDROOM_SCENE_BOXES}
+    assert boxes["floor"]["material"] == "metal"
+    assert boxes["right_wall"]["material"] == "plasterboard"
 
 
 def test_mesh_preview_uses_fixed_legend_locations(monkeypatch):
     import matplotlib.pyplot as plt
 
     sequence = MeshSequence(
-        vertices=[[
-            [0.0, 0.0, 0.0],
-            [1.0, 0.0, 0.0],
-            [0.0, 1.0, 0.0],
-        ]],
+        vertices=[
+            [
+                [0.0, 0.0, 0.0],
+                [1.0, 0.0, 0.0],
+                [0.0, 1.0, 0.0],
+            ]
+        ],
         faces=[[0, 1, 2]],
         times=[0.0],
     )
@@ -154,11 +136,13 @@ def test_rigid_transform_mesh_sequence_rotates_and_translates_vertices():
         faces=[[0, 0, 0]],
         times=[0.0, 1.0],
     )
-    rotation = np.array([
-        [1.0, 0.0, 0.0],
-        [0.0, 0.0, -1.0],
-        [0.0, 1.0, 0.0],
-    ])
+    rotation = np.array(
+        [
+            [1.0, 0.0, 0.0],
+            [0.0, 0.0, -1.0],
+            [0.0, 1.0, 0.0],
+        ]
+    )
 
     transformed = rigid_transform_mesh_sequence(
         sequence,
@@ -211,10 +195,7 @@ def test_rigid_transform_mesh_sequence_defaults_to_translation_only():
 
 
 def test_time_window_mesh_sequence_rebases_times_and_vertices():
-    vertices = [
-        [[time_s, 0.0, 0.0], [time_s, 1.0, 0.0]]
-        for time_s in (0.0, 1.0, 2.0, 3.0)
-    ]
+    vertices = [[[time_s, 0.0, 0.0], [time_s, 1.0, 0.0]] for time_s in (0.0, 1.0, 2.0, 3.0)]
     sequence = MeshSequence(
         vertices=vertices,
         faces=[[0, 1, 1]],

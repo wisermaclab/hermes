@@ -23,12 +23,12 @@ frameCfg 0 2 32 0 50 1 0
 
     radar = RadarSensor.from_ti_cli_config(path)
 
-    assert radar.fmcw.carrier_frequency == 60e9
+    assert radar.fmcw.carrier_frequency == 60e9 + 68e12 * 7e-6
     assert radar.fmcw.slope == 68e12
     assert radar.fmcw.num_adc_samples == 225
     assert radar.fmcw.sampling_frequency == 4.5e6
     assert radar.fmcw.num_chirps_per_frame == 32
-    assert radar.fmcw.tdm_enabled is True
+    assert radar.fmcw.tx_schedule == "tdm"
     assert radar.hardware.num_virtual_channels == 12
 
 
@@ -74,15 +74,18 @@ def test_mesh_sequence_rejects_nonfinite_interpolation_time():
 @pytest.mark.parametrize(
     "kwargs",
     [
-        {"visibility_samples_per_face": 0},
-        {"visibility_fade_chirps": 1.5},
-        {"visibility_use_phase_center": 1},
-        {"adaptive_visibility_sampling": "false"},
-        {"incremental_update": None},
-        {"adaptive_visibility_edge_margin": np.nan},
+        {"po_visibility_samples_per_face": 0},
+        {"po_visibility_fade_frames": 1.5},
+        {"po_visibility_fade_frames": -1},
+        {"po_visibility_refresh_frames": True},
+        {"po_adaptive_visibility_sampling": "false"},
+        {"po_refresh_frames": None},
+        {"po_refresh_frames": -1},
+        {"po_adaptive_visibility_edge_margin": np.nan},
         {"compute_backend": "invalid"},
         {"po_integration_mode": "invalid"},
-        {"calibration": {}},
+        {"po_calibration": {}},
+        {"po_calibration": "rt_full_sequence"},
         {"precomputed_raw_fractional_visibility": np.array([1.0 + 0.0j])},
         {"precomputed_raw_fractional_visibility": np.array([1.1])},
         {"precomputed_visible_sample_counts": np.array([1])},
@@ -90,19 +93,19 @@ def test_mesh_sequence_rejects_nonfinite_interpolation_time():
 )
 def test_human_po_config_rejects_invalid_values(kwargs):
     with pytest.raises(ValueError):
-        HumanPOMobilityConfig(**kwargs)
+        POConfig(**kwargs)
 
 
 def test_human_po_config_validates_precomputed_visibility_counts():
-    config = HumanPOMobilityConfig(
-        visibility_samples_per_face=4,
+    config = POConfig(
+        po_visibility_samples_per_face=4,
         precomputed_raw_fractional_visibility=np.array([0.25, 1.0]),
         precomputed_visible_sample_counts=np.array([1, 4]),
     )
 
     assert "precomputed_raw_fractional_visibility" not in repr(config)
-    assert config == HumanPOMobilityConfig(
-        visibility_samples_per_face=4,
+    assert config == POConfig(
+        po_visibility_samples_per_face=4,
         precomputed_raw_fractional_visibility=np.array([0.5]),
     )
 
@@ -123,22 +126,20 @@ def test_rt_transition_config_rejects_ambiguous_values(kwargs):
 @pytest.mark.parametrize(
     "kwargs",
     [
-        {"blocking_enabled": 1},
         {"blocking_aabb_culling": "true"},
-        {"coupling_enabled": None},
-        {"coupling_incremental_update": 0},
+        {"hybrid_coupling": None},
+        {"hybrid_calibration": "unknown"},
     ],
 )
 def test_hybrid_po_config_rejects_ambiguous_booleans(kwargs):
     with pytest.raises(ValueError):
-        HybridStaticEnvPOConfig(**kwargs)
+        HybridPOConfig(**kwargs)
 
 
 def test_amass_pose_interpolation_slerps_joint_rotations():
     poses = np.zeros((2, 72), dtype=np.float32)
     poses[1, 2] = np.pi
-    translations = np.array([[0.0, 0.0, 0.0], [2.0, 4.0, 6.0]],
-                            dtype=np.float32)
+    translations = np.array([[0.0, 0.0, 0.0], [2.0, 4.0, 6.0]], dtype=np.float32)
     times = np.array([0.0, 2.0], dtype=float)
 
     pose, trans = interpolate_amass_pose_params(poses, translations, times, 1.0)
@@ -169,8 +170,9 @@ def test_human_skin_material_has_diffuse_scattering():
 
 def test_mesh_target_updates_scene_mesh_vertices():
     scene = load_scene()
-    target = MeshTarget("target", _mesh_sequence(displacement=0.1),
-                        material=human_skin_material("target-material"))
+    target = MeshTarget(
+        "target", _mesh_sequence(displacement=0.1), material=human_skin_material("target-material")
+    )
     obj = target.add_to_scene(scene)
 
     target.update_to_time(1.0)
@@ -179,14 +181,39 @@ def test_mesh_target_updates_scene_mesh_vertices():
     assert np.allclose(vertices[:, 0], [1.1, 1.1, 1.1])
 
 
+def test_mesh_target_detaches_from_scene_and_restores():
+    scene = load_scene()
+    target = MeshTarget(
+        "target", _mesh_sequence(displacement=0.1), material=human_skin_material("detach-material")
+    )
+    obj = target.add_to_scene(scene)
+
+    with target.detached_from_scene(scene):
+        assert "target" not in scene.objects
+        assert obj.scene is None
+    assert "target" in scene.objects
+    assert obj.scene is scene
+
+    # A scene that does not hold the target is left untouched.
+    with target.detached_from_scene(load_scene()):
+        assert "target" in scene.objects
+    with pytest.raises(RuntimeError):
+        with target.detached_from_scene(scene):
+            raise RuntimeError("stage failed")
+    assert "target" in scene.objects
+
+
 def test_mesh_target_update_refreshes_rt_visibility():
     scene = load_scene()
-    vertices0 = np.array([
-        [0.5, -0.5, -0.5],
-        [0.5, 0.5, -0.5],
-        [0.5, -0.5, 0.5],
-        [0.5, 0.5, 0.5],
-    ], dtype=np.float32)
+    vertices0 = np.array(
+        [
+            [0.5, -0.5, -0.5],
+            [0.5, 0.5, -0.5],
+            [0.5, -0.5, 0.5],
+            [0.5, 0.5, 0.5],
+        ],
+        dtype=np.float32,
+    )
     vertices1 = vertices0.copy()
     vertices1[:, 1] += 2.0
     sequence = MeshSequence(
@@ -234,9 +261,7 @@ def test_rt_target_face_hit_counts_preserve_original_mesh_indices():
         sequence,
         material=human_skin_material("hit-target-material"),
     )
-    object_id = int(
-        np.asarray(target.ensure_scene_object().object_id).reshape(-1)[0]
-    )
+    object_id = int(np.asarray(target.ensure_scene_object().object_id).reshape(-1)[0])
     invalid = np.uint32(0xFFFFFFFF)
 
     class FakePaths:
@@ -262,16 +287,20 @@ def test_rt_target_face_hit_counts_preserve_original_mesh_indices():
 
 
 def test_one_target_bounce_filter():
-    target = MeshTarget("target", _mesh_sequence(),
-                        material=human_skin_material("target-material"))
+    target = MeshTarget(
+        "target", _mesh_sequence(), material=human_skin_material("target-material")
+    )
     tid = int(np.asarray(target.ensure_scene_object().object_id).reshape(-1)[0])
 
     class FakePaths:
         tau = np.zeros((1, 1, 3))
-        objects = np.array([
-            [[[tid, 7, tid]]],
-            [[[9, tid, tid]]],
-        ], dtype=np.uint32)
+        objects = np.array(
+            [
+                [[[tid, 7, tid]]],
+                [[[9, tid, tid]]],
+            ],
+            dtype=np.uint32,
+        )
 
     mask = MmWaveRadarSimulator.one_target_bounce_mask(FakePaths(), [target])
 
@@ -279,8 +308,9 @@ def test_one_target_bounce_filter():
 
 
 def test_human_specular_reflection_flag_preserves_legacy_specular_paths():
-    target = MeshTarget("target", _mesh_sequence(),
-                        material=human_skin_material("target-spec-material"))
+    target = MeshTarget(
+        "target", _mesh_sequence(), material=human_skin_material("target-spec-material")
+    )
     tid = int(np.asarray(target.ensure_scene_object().object_id).reshape(-1)[0])
     a = np.ones((1, 1, 1, 1, 1, 1), dtype=np.complex128)
     tau = np.array([[[1e-9]]], dtype=float)
@@ -301,29 +331,38 @@ def test_human_specular_reflection_flag_preserves_legacy_specular_paths():
             return objects
 
     sim = MmWaveRadarSimulator(
-        coupling_mode="unrestricted",
-        human_specular_reflection=True,
+        rt_human_bounces="any",
+        rt_human_specular_reflection=True,
     )
 
-    _, _, valid = sim._path_arrays(
-        FakePaths(), [target], virtual_channel_order="tx_major")
+    _, _, valid = sim._path_arrays(FakePaths(), [target], virtual_channel_order="tx_major")
 
     assert np.array_equal(valid, [True])
 
 
 def test_human_specular_reflection_false_drops_only_human_specular_paths():
-    target = MeshTarget("target", _mesh_sequence(),
-                        material=human_skin_material("target-nospec-material"))
+    target = MeshTarget(
+        "target", _mesh_sequence(), material=human_skin_material("target-nospec-material")
+    )
     tid = int(np.asarray(target.ensure_scene_object().object_id).reshape(-1)[0])
     env_id = 99
     a = np.ones((1, 1, 1, 1, 4, 1), dtype=np.complex128)
     tau = np.array([[[1e-9, 2e-9, 3e-9, 4e-9]]], dtype=float)
-    interactions = np.array([[[[
-        InteractionType.SPECULAR,
-        InteractionType.DIFFUSE,
-        InteractionType.SPECULAR,
-        InteractionType.SPECULAR,
-    ]]]], dtype=np.uint32)
+    interactions = np.array(
+        [
+            [
+                [
+                    [
+                        InteractionType.SPECULAR,
+                        InteractionType.DIFFUSE,
+                        InteractionType.SPECULAR,
+                        InteractionType.SPECULAR,
+                    ]
+                ]
+            ]
+        ],
+        dtype=np.uint32,
+    )
     objects = np.array([[[[tid, tid, env_id, env_id]]]], dtype=np.uint32)
 
     class FakePaths:
@@ -339,10 +378,9 @@ def test_human_specular_reflection_false_drops_only_human_specular_paths():
         def objects(self):
             return objects
 
-    sim = MmWaveRadarSimulator(coupling_mode="unrestricted")
+    sim = MmWaveRadarSimulator(rt_human_bounces="any")
 
-    _, _, valid = sim._path_arrays(
-        FakePaths(), [target], virtual_channel_order="tx_major")
+    _, _, valid = sim._path_arrays(FakePaths(), [target], virtual_channel_order="tx_major")
 
     assert np.array_equal(valid, [False, True, True, True])
 
@@ -362,12 +400,14 @@ def test_path_arrays_respect_virtual_channel_order():
             del normalize_delays, out_type
             return a, tau
 
-    sim = MmWaveRadarSimulator(coupling_mode="unrestricted")
+    sim = MmWaveRadarSimulator(rt_human_bounces="any")
 
     tx_major, tau_tx, valid_tx = sim._path_arrays(
-        FakePaths(), [], virtual_channel_order="tx_major")
+        FakePaths(), [], virtual_channel_order="tx_major"
+    )
     rx_major, tau_rx, valid_rx = sim._path_arrays(
-        FakePaths(), [], virtual_channel_order="rx_major")
+        FakePaths(), [], virtual_channel_order="rx_major"
+    )
 
     assert np.array_equal(tx_major[:, 0], [10.0, 20.0, 30.0, 40.0, 50.0, 60.0])
     assert np.array_equal(rx_major[:, 0], [10.0, 30.0, 50.0, 20.0, 40.0, 60.0])
@@ -379,10 +419,12 @@ def test_path_arrays_respect_virtual_channel_order():
 
 def test_path_arrays_respect_explicit_board_channel_map():
     a = np.zeros((1, 2, 1, 3, 1, 1), dtype=np.complex128)
-    a[0, :, 0, :, 0, 0] = np.array([
-        [10.0, 30.0, 50.0],
-        [20.0, 40.0, 60.0],
-    ])
+    a[0, :, 0, :, 0, 0] = np.array(
+        [
+            [10.0, 30.0, 50.0],
+            [20.0, 40.0, 60.0],
+        ]
+    )
     tau = np.array([[[7e-9]]], dtype=float)
 
     class FakePaths:
@@ -390,7 +432,7 @@ def test_path_arrays_respect_explicit_board_channel_map():
             del normalize_delays, out_type
             return a, tau
 
-    sim = MmWaveRadarSimulator(coupling_mode="unrestricted")
+    sim = MmWaveRadarSimulator(rt_human_bounces="any")
     coefficients, _, _ = sim._path_arrays(
         FakePaths(),
         [],
@@ -414,10 +456,9 @@ def test_path_arrays_handle_empty_paths():
             del normalize_delays, out_type
             return a, tau
 
-    sim = MmWaveRadarSimulator(coupling_mode="unrestricted")
+    sim = MmWaveRadarSimulator(rt_human_bounces="any")
 
-    coeffs, delays, valid = sim._path_arrays(
-        FakePaths(), [], virtual_channel_order="tx_major")
+    coeffs, delays, valid = sim._path_arrays(FakePaths(), [], virtual_channel_order="tx_major")
 
     assert coeffs.shape == (6, 0)
     assert delays.shape == (0,)
@@ -425,10 +466,16 @@ def test_path_arrays_handle_empty_paths():
 
 
 def test_adc_synthesis_matches_single_path_beat():
-    fmcw = FMCWConfig(carrier_frequency=60e9, slope=2e12,
-                      chirp_duration=1e-3, chirp_repetition_time=1e-3,
-                      sampling_frequency=10e3, num_adc_samples=8,
-                      num_chirps_per_frame=1, frame_period=1e-3)
+    fmcw = FMCWConfig(
+        carrier_frequency=60e9,
+        slope=2e12,
+        chirp_duration=1e-3,
+        chirp_repetition_time=1e-3,
+        sampling_frequency=10e3,
+        num_adc_samples=8,
+        num_chirps_per_frame=1,
+        frame_period=1e-3,
+    )
     tau = np.array([2e-9])
     a = np.array([[1.0 + 0.0j]])
 
@@ -437,6 +484,77 @@ def test_adc_synthesis_matches_single_path_beat():
     t = np.arange(fmcw.num_adc_samples) / fmcw.sampling_frequency
     expected = np.exp(1j * 2.0 * np.pi * fmcw.slope * tau[0] * t)
     assert np.allclose(y[:, 0], expected)
+
+
+@pytest.mark.parametrize("backend", ["numpy", "torch"])
+def test_imported_carrier_preserves_analytic_half_cell_two_scatterer_interference(
+    tmp_path, backend, monkeypatch
+):
+    if backend == "torch":
+        pytest.importorskip("torch")
+        monkeypatch.setenv("MMWAVE_TORCH_DEVICE", "cpu")
+    source = tmp_path / "radar.cfg"
+    source.write_text(
+        "profileCfg 0 60 7 4 40 0 0 20 1 64 2000 0 0 30\n"
+        "chirpCfg 0 0 0 0 0 0 0 1\nframeCfg 0 0 1 0 50 1 0\n"
+    )
+    radar = RadarSensor.from_ti_cli_config(str(source))
+    f = radar.fmcw
+    bandwidth = 20e12 * 64 / 2e6
+    delays = np.array([2e-9, 2e-9 + 1 / (2 * bandwidth)])
+    reflection = np.array([1 + 0.2j, -0.3 + 0.7j])
+    coefficients = reflection[None] * np.exp(-2j * np.pi * f.carrier_frequency * delays)
+    actual = MmWaveRadarSimulator.synthesize_adc_from_paths(
+        coefficients, delays, f, backend=backend
+    )
+    # Independent RF sweep reference: fast time begins at ADC start, rather
+    # than at the centre of its window. Delta tau is half a range cell.
+    frequencies = 60e9 + 20e12 * (4e-6 + np.arange(64) / 2e6)
+    expected = np.sum(
+        reflection.conj()[None] * np.exp(2j * np.pi * frequencies[:, None] * delays[None]), axis=1
+    )
+    np.testing.assert_allclose(actual[:, 0], expected, rtol=1e-10, atol=1e-11)
+    phase_error = np.pi * bandwidth * (delays[1] - delays[0])
+    assert phase_error == pytest.approx(np.pi / 2)
+    wrong = np.sum(
+        reflection.conj()[None]
+        * np.exp(2j * np.pi * (frequencies[:, None] + bandwidth / 2) * delays[None]),
+        axis=1,
+    )
+    assert np.linalg.norm(actual[:, 0] - wrong) > 1
+
+
+@pytest.mark.parametrize("backend", ["numpy", "torch"])
+@pytest.mark.parametrize("channel_delays", [False, True])
+def test_adc_mixer_conjugates_physical_channel_once(backend, channel_delays, monkeypatch):
+    if backend == "torch":
+        pytest.importorskip("torch")
+        monkeypatch.setenv("MMWAVE_TORCH_DEVICE", "cpu")
+    fmcw = replace(_phase_one_radar(num_chirps=1).fmcw, num_adc_samples=8)
+    delays = np.array([2e-9, 3e-9])
+    if channel_delays:
+        delays = np.array([delays, delays + 0.1e-9])
+    reflection = np.array([[0.4 + 0.3j, -0.2 + 0.1j], [0.1 - 0.5j, 0.3 + 0.2j]])
+    coefficients = reflection * np.exp(-2j * np.pi * fmcw.carrier_frequency * delays)
+    adc = MmWaveRadarSimulator.synthesize_adc_from_paths(
+        coefficients,
+        delays,
+        fmcw,
+        backend=backend,
+    )
+    t = np.arange(fmcw.num_adc_samples) / fmcw.sampling_frequency
+    expected = np.zeros_like(adc)
+    for channel in range(2):
+        for path in range(2):
+            delay = delays[channel, path] if channel_delays else delays[path]
+            # Tx * conj(Rx) reverses both propagation and reflection phases.
+            mixed_carrier = reflection[channel, path].conjugate() * np.exp(
+                2j * np.pi * fmcw.carrier_frequency * delay,
+            )
+            expected[:, channel] += mixed_carrier * np.exp(
+                2j * np.pi * fmcw.slope * delay * t,
+            )
+    np.testing.assert_allclose(adc, expected, rtol=1e-12, atol=1e-14)
 
 
 def test_torch_fast_time_reuses_immutable_sampling_tensor():
@@ -477,15 +595,20 @@ def test_adc_synthesis_is_public_simulation_api():
 
 
 def test_adc_synthesis_accepts_channel_path_delay_matrix():
-    fmcw = FMCWConfig(carrier_frequency=60e9, slope=2e12,
-                      chirp_duration=1e-3, chirp_repetition_time=1e-3,
-                      sampling_frequency=10e3, num_adc_samples=8,
-                      num_chirps_per_frame=1, frame_period=1e-3)
+    fmcw = FMCWConfig(
+        carrier_frequency=60e9,
+        slope=2e12,
+        chirp_duration=1e-3,
+        chirp_repetition_time=1e-3,
+        sampling_frequency=10e3,
+        num_adc_samples=8,
+        num_chirps_per_frame=1,
+        frame_period=1e-3,
+    )
     tau = np.array([[2e-9], [3e-9]])
     a = np.ones((2, 1), dtype=np.complex128)
 
-    y = MmWaveRadarSimulator.synthesize_adc_from_paths(a, tau, fmcw,
-                                                       backend="numpy")
+    y = MmWaveRadarSimulator.synthesize_adc_from_paths(a, tau, fmcw, backend="numpy")
 
     t = np.arange(fmcw.num_adc_samples) / fmcw.sampling_frequency
     expected = np.exp(1j * 2.0 * np.pi * fmcw.slope * tau * t[None, :])

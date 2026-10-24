@@ -13,7 +13,6 @@ import numpy as np
 from PIL import Image
 import pytest
 
-
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
 
@@ -148,9 +147,7 @@ def test_rtpose_background_reconstruction_uses_dataset_frame_and_baked_mesh(tmp_
     assert result.background_ply.is_file()
     assert result.stats_path.is_file()
     assert result.stats["background_points"] == len(points)
-    assert result.stats["source_lidar"] == (
-        "Data/sequences/176/lidar/000005.pcd"
-    )
+    assert result.stats["source_lidar"] == ("Data/sequences/176/lidar/000005.pcd")
     assert "/private/" not in result.stats_path.read_text(encoding="utf-8")
 
 
@@ -161,8 +158,7 @@ def test_rtpose_bundle_calls_bundled_environment_fitter(tmp_path, monkeypatch):
     )
     dataset = tmp_path / "dataset"
     background = (
-        dataset
-        / "Data/sequences/176/map/background_reconstruction/"
+        dataset / "Data/sequences/176/map/background_reconstruction/"
         "000005_background_lidar_colored.ply"
     )
     background.parent.mkdir(parents=True)
@@ -206,8 +202,7 @@ def test_rtpose_bundle_calls_bundled_environment_fitter(tmp_path, monkeypatch):
 
     assert len(calls) == 1
     assert Path(calls[0][1]) == (
-        REPO_ROOT
-        / "tools/bundle_prepare/rtpose/fit_rtpose_environment_geometry.py"
+        REPO_ROOT / "tools/bundle_prepare/rtpose/fit_rtpose_environment_geometry.py"
     )
     wall_mode_index = calls[0].index("--wall-mode")
     assert calls[0][wall_mode_index + 1] == "solid"
@@ -273,9 +268,7 @@ def test_rtpose_bundle_reconstructs_and_fits_missing_geometry(tmp_path, monkeypa
     assert np.array_equal(observed["body_vertices"], np.ones((3, 3)))
     assert observed["fit_background"].name.endswith("background_lidar_colored.ply")
     assert outputs["geometry_source"] == "reconstructed_lidar_stereo"
-    assert outputs["reconstruction_stats"] == (
-        "environment_geometry/reconstruction_stats.json"
-    )
+    assert outputs["reconstruction_stats"] == ("environment_geometry/reconstruction_stats.json")
     assert (bundle / outputs["reconstruction_stats"]).is_file()
 
 
@@ -350,29 +343,32 @@ def test_rtpose_environment_fitter_writes_pickle_free_scene(tmp_path):
     )
     output_dir = tmp_path / "environment"
 
-    assert module.main(
-        [
-            str(background),
-            "--output-dir",
-            str(output_dir),
-            "--min-plane-bin-count",
-            "10",
-            "--min-wall-bin-count",
-            "10",
-            "--min-plane-inliers",
-            "30",
-            "--min-wall-inliers",
-            "30",
-            "--min-wall-height",
-            "0.5",
-            "--min-wall-span",
-            "0.5",
-            "--wall-mode",
-            "solid",
-            "--no-furniture",
-            "--no-preview",
-        ]
-    ) == 0
+    assert (
+        module.main(
+            [
+                str(background),
+                "--output-dir",
+                str(output_dir),
+                "--min-plane-bin-count",
+                "10",
+                "--min-wall-bin-count",
+                "10",
+                "--min-plane-inliers",
+                "30",
+                "--min-wall-inliers",
+                "30",
+                "--min-wall-height",
+                "0.5",
+                "--min-wall-span",
+                "0.5",
+                "--wall-mode",
+                "solid",
+                "--no-furniture",
+                "--no-preview",
+            ]
+        )
+        == 0
+    )
 
     with np.load(
         output_dir / "environment_mesh_sequence.npz",

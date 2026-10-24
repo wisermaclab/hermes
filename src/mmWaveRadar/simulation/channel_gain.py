@@ -7,26 +7,50 @@ from __future__ import annotations
 
 import numpy as np
 
+from ..geometry import rotation_matrix
 
-def path_azimuth_elevation_deg(paths) -> tuple[np.ndarray, np.ndarray] | tuple[None, None]:
+
+def path_azimuth_elevation_deg(
+    paths,
+    *,
+    radar_orientation: tuple[float, float, float] = (0.0, 0.0, 0.0),
+    endpoint: str = "tx",
+) -> tuple[np.ndarray, np.ndarray] | tuple[None, None]:
     """
-    Extracts common path AoD angles from a Sionna ``Paths`` object.
+    Returns radar-local endpoint look angles from scene-frame Sionna angles.
 
-    Sionna reports zenith ``theta`` and azimuth ``phi`` in the device local
-    spherical frame. The simulator's TI board convention uses azimuth around
-    local boresight ``x`` and elevation from the local ``x-y`` plane.
+    Sionna reports departure and arrival look directions in the world frame. Rotate
+    their unit directions into the radar frame before evaluating hardware
+    patterns. ``radar_orientation`` is the device's scene-frame yaw, pitch,
+    roll in radians. Local ``x`` is boresight and local ``z`` is up.
     """
 
-    if not hasattr(paths, "theta_t") or not hasattr(paths, "phi_t"):
+    suffix = {"tx": "t", "rx": "r"}[endpoint]
+    if not hasattr(paths, f"theta_{suffix}") or not hasattr(paths, f"phi_{suffix}"):
         return None, None
-    theta = _last_axis_vector(getattr(paths, "theta_t"))
-    phi = _last_axis_vector(getattr(paths, "phi_t"))
+    theta = _last_axis_vector(getattr(paths, f"theta_{suffix}"))
+    phi = _last_axis_vector(getattr(paths, f"phi_{suffix}"))
     if theta is None or phi is None:
         return None, None
     if theta.shape != phi.shape:
         return None, None
-    azimuth = np.degrees(phi)
-    elevation = 90.0 - np.degrees(theta)
+    scene_directions = np.stack(
+        [
+            np.sin(theta) * np.cos(phi),
+            np.sin(theta) * np.sin(phi),
+            np.cos(theta),
+        ],
+        axis=-1,
+    )
+    # R maps local column vectors to the scene frame; row-vector inverse is @ R.
+    local_directions = scene_directions @ rotation_matrix(radar_orientation)
+    azimuth = np.degrees(np.arctan2(local_directions[:, 1], local_directions[:, 0]))
+    elevation = np.degrees(
+        np.arctan2(
+            local_directions[:, 2],
+            np.hypot(local_directions[:, 0], local_directions[:, 1]),
+        )
+    )
     return azimuth, elevation
 
 
@@ -36,12 +60,41 @@ def apply_path_hardware_gain(
     *,
     paths=None,
     frequency_hz: float | None = None,
+    radar_orientation: tuple[float, float, float] = (0.0, 0.0, 0.0),
 ) -> np.ndarray:
-    """Applies hardware phase/scalar/pattern gains to path coefficients."""
+    """Applies hardware gains after converting scene directions to radar-local."""
 
     azimuth = elevation = None
     if paths is not None:
-        azimuth, elevation = path_azimuth_elevation_deg(paths)
+        azimuth, elevation = path_azimuth_elevation_deg(
+            paths,
+            radar_orientation=radar_orientation,
+        )
+        rx_az, rx_el = path_azimuth_elevation_deg(
+            paths,
+            radar_orientation=radar_orientation,
+            endpoint="rx",
+        )
+        if azimuth is not None and rx_az is not None:
+            # The hardware model supplies a combined channel pattern. Use the
+            # same equal Tx/Rx split as PO, with scalar gain and phase once.
+            tx_gain = hardware.channel_gain(
+                azimuth_deg=azimuth,
+                elevation_deg=elevation,
+                frequency_hz=frequency_hz,
+                include_phase=False,
+            )
+            rx_gain = hardware.channel_gain(
+                azimuth_deg=rx_az,
+                elevation_deg=rx_el,
+                frequency_hz=frequency_hz,
+                include_phase=False,
+            )
+            phase = hardware.channel_gain(
+                include_antenna_gain=False,
+                include_pattern=False,
+            ).reshape((-1, 1))
+            return np.asarray(coefficients) * np.sqrt(tx_gain * rx_gain) * phase
     return hardware.apply_channel_gain(
         coefficients,
         azimuth_deg=azimuth,

@@ -9,6 +9,7 @@ from typing import Any, Dict, Iterable, Optional
 
 import numpy as np
 
+from .arrays import fmcw_value
 from .angle import angle_map_fft, direction_cosine_valid_mask
 from .cfar import ca_cfar_1d
 from .fft import range_fft
@@ -76,9 +77,7 @@ def point_cloud_3d_from_adc(
         nfft_mult=range_nfft_mult,
     )
     if rt.shape[-1] != np.asarray(virtual_positions_lambda).shape[0]:
-        raise ValueError(
-            "virtual_positions_lambda must have one row per ADC virtual channel"
-        )
+        raise ValueError("virtual_positions_lambda must have one row per ADC virtual channel")
 
     range_power = np.sum(np.abs(rt) ** 2, axis=(0, 2))
     range_detect = _range_cfar(range_power, ranges_m, range_cfar, range_limits_m)
@@ -93,9 +92,7 @@ def point_cloud_3d_from_adc(
         if channel_calibration is not None:
             calibration = np.asarray(channel_calibration, dtype=np.complex128)
             if calibration.shape != snapshot.shape:
-                raise ValueError(
-                    "channel_calibration must have shape [num_virtual_channels]"
-                )
+                raise ValueError("channel_calibration must have shape [num_virtual_channels]")
             snapshot = snapshot * calibration
 
         grid, grid_meta = _virtual_snapshot_grid(
@@ -143,23 +140,26 @@ def point_cloud_3d_from_adc(
             xyz = _direction_cosine_point(float(ranges_m[int(range_index)]), u, v)
             if xyz is None:
                 continue
-            points.append({
-                "range_m": float(ranges_m[int(range_index)]),
-                "azimuth_deg": _azimuth_deg(u, v),
-                "elevation_deg": float(np.degrees(np.arcsin(np.clip(v, -1.0, 1.0)))),
-                "u": u,
-                "v": v,
-                "power": float(angle_power[int(v_index), int(u_index)]),
-                "range_bin": int(range_index),
-                "angle_bin": (int(v_index), int(u_index)),
-                "xyz": xyz,
-            })
+            points.append(
+                {
+                    "range_m": float(ranges_m[int(range_index)]),
+                    "azimuth_deg": _azimuth_deg(u, v),
+                    "elevation_deg": float(np.degrees(np.arcsin(np.clip(v, -1.0, 1.0)))),
+                    "u": u,
+                    "v": v,
+                    "power": float(angle_power[int(v_index), int(u_index)]),
+                    "range_bin": int(range_index),
+                    "angle_bin": (int(v_index), int(u_index)),
+                    "xyz": xyz,
+                }
+            )
             range_indices.append(int(range_index))
             angle_indices.append((int(v_index), int(u_index)))
 
     point_xyz = (
         np.asarray([p["xyz"] for p in points], dtype=float)
-        if points else np.zeros((0, 3), dtype=float)
+        if points
+        else np.zeros((0, 3), dtype=float)
     )
 
     return {
@@ -182,10 +182,7 @@ def point_cloud_3d_from_adc(
     }
 
 
-def _fmcw_value(fmcw, name: str, fallback):
-    """Returns an FMCW attribute or a provided fallback value."""
-
-    return fallback if fmcw is None else getattr(fmcw, name, fallback)
+_fmcw_value = fmcw_value
 
 
 def _as_adc_cube(adc: np.ndarray) -> np.ndarray:
@@ -259,9 +256,7 @@ def _virtual_snapshot_grid(
     values = np.asarray(snapshot, dtype=np.complex128).reshape(-1)
     positions = np.asarray(virtual_positions_lambda, dtype=float)
     if positions.shape != (values.size, 2):
-        raise ValueError(
-            "virtual_positions_lambda must have shape [num_virtual_channels, 2]"
-        )
+        raise ValueError("virtual_positions_lambda must have shape [num_virtual_channels, 2]")
 
     origin = np.min(positions, axis=0)
     relative = positions - origin
@@ -408,10 +403,7 @@ def _postprocess_angle_detections(
         )
     if global_peak is not None:
         global_peak_array = np.asarray(global_peak, dtype=np.int64).reshape((1, 2))
-        already_present = (
-            peaks.shape[0] > 0
-            and np.any(np.all(peaks == global_peak_array, axis=1))
-        )
+        already_present = peaks.shape[0] > 0 and np.any(np.all(peaks == global_peak_array, axis=1))
         if not already_present:
             peaks = np.vstack([peaks, global_peak_array])
             fallback_added = fallback_to_global_peak
@@ -512,24 +504,16 @@ def _ca_cfar_2d(
     ny, nx = x.shape
     pad_y = train_y + guard_y
     pad_x = train_x + guard_x
-    train_count = (
-        (2 * pad_y + 1) * (2 * pad_x + 1)
-        - (2 * guard_y + 1) * (2 * guard_x + 1)
-    )
-    alpha = (
-        train_count * (pfa ** (-1.0 / train_count) - 1.0)
-        if scale is None else float(scale)
-    )
+    train_count = (2 * pad_y + 1) * (2 * pad_x + 1) - (2 * guard_y + 1) * (2 * guard_x + 1)
+    alpha = train_count * (pfa ** (-1.0 / train_count) - 1.0) if scale is None else float(scale)
 
     det = np.zeros_like(x, dtype=bool)
     thr = np.full_like(x, np.nan, dtype=float)
     noise = np.full_like(x, np.nan, dtype=float)
     for iy in range(pad_y, ny - pad_y):
         for ix in range(pad_x, nx - pad_x):
-            window = x[iy - pad_y: iy + pad_y + 1,
-                       ix - pad_x: ix + pad_x + 1]
-            guard = x[iy - guard_y: iy + guard_y + 1,
-                      ix - guard_x: ix + guard_x + 1]
+            window = x[iy - pad_y : iy + pad_y + 1, ix - pad_x : ix + pad_x + 1]
+            guard = x[iy - guard_y : iy + guard_y + 1, ix - guard_x : ix + guard_x + 1]
             z = (float(np.sum(window)) - float(np.sum(guard))) / train_count
             noise[iy, ix] = z
             thr[iy, ix] = alpha * z

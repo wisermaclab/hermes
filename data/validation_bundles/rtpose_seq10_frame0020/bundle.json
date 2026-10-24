@@ -1,5 +1,5 @@
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "profile": "hermes",
   "primary_adc": "primary",
   "adcs": {
@@ -11,5 +11,12 @@
   "motion": {
     "parameters": "amass_sequence.npz"
   },
-  "environment": "environment.json"
+  "environment": "environment.json",
+  "required_features": [
+    "channel_map",
+    "explicit_tdm_slots"
+  ],
+  "scene": {
+    "file": "environment_geometry/environment_scene.xml"
+  }
 }

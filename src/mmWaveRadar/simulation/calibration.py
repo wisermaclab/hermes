@@ -6,36 +6,26 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-import operator
 from typing import Literal
 
 import numpy as np
 
+from ..values import boolean
+from ..naming import validate_frames
 
 POCalibrationMode = Literal["none", "rt_first_pose", "rt_sequence"]
 POCalibrationGainType = Literal["amplitude"]
-POCalibrationSampleMode = Literal[
-    "first_frame", "all_chirps", "retrace_chirps", "retraced_chirps"
-]
+POCalibrationSampleMode = Literal["first_frame", "all_chirps", "retrace_chirps", "retraced_chirps"]
 POCalibrationReference = Literal[
     "single_human_only",
     "one_human_touch",
     "human_touch",
     "human_env_coupled",
-    "human_multi_touch",
 ]
 POCalibrationAlignment = Literal["last_retrace", "nearest", "same_index"]
 
 
-def _boolean(name: str, value: object, *, optional: bool = False) -> bool | None:
-    """Validates a boolean option without applying truth-value coercion."""
-
-    if value is None and optional:
-        return None
-    if not isinstance(value, (bool, np.bool_)):
-        suffix = " or None" if optional else ""
-        raise ValueError(f"{name} must be a boolean{suffix}")
-    return bool(value)
+_boolean = boolean
 
 
 def _nonnegative_float(name: str, value: object) -> float:
@@ -50,22 +40,6 @@ def _nonnegative_float(name: str, value: object) -> float:
     return scalar
 
 
-def _optional_positive_integer(name: str, value: object) -> int | None:
-    """Returns an optional positive integer without silent truncation."""
-
-    if value is None:
-        return None
-    if isinstance(value, (bool, np.bool_)):
-        raise ValueError(f"{name} must be a positive integer or None")
-    try:
-        integer = operator.index(value)
-    except TypeError as exc:
-        raise ValueError(f"{name} must be a positive integer or None") from exc
-    if integer <= 0:
-        raise ValueError(f"{name} must be a positive integer or None")
-    return int(integer)
-
-
 @dataclass(frozen=True)
 class POCalibrationConfig:
     """Calibration policy for custom human PO amplitudes.
@@ -77,18 +51,22 @@ class POCalibrationConfig:
 
     Attributes:
         mode: ``"none"`` disables fitting, ``"rt_first_pose"`` uses the first
-            RT/PO ADC frame, and ``"rt_sequence"`` fits from path-power samples
-            selected across the available sequence.
+            RT/PO ADC frame (all chirps, virtual channels, and ADC samples) to
+            fit one amplitude gain reused throughout the run, and
+            ``"rt_sequence"`` fits from coherent ADC powers selected across
+            the available sequence. Hybrid PO compares single-human-only RT
+            with human-only PO and applies the gain to direct-human PO and
+            both coupling orders, leaving static-environment RT unchanged.
         gain_type: Gain domain. Only amplitude gains are currently supported.
         reference_power_floor: Minimum RT/PO power allowed when forming a gain;
             samples at or below the floor are ignored or reported as warnings.
         keep_rt_baseline: Whether higher-level pipelines should retain the RT
             baseline cube/metadata after calibration.
-        rt_periodic_retrace: Enables RT reference retracing on a periodic
-            schedule. ``rt_retrace_once_per_frame`` is the legacy alias.
-        rt_periodic_retrace_period_chirps: Optional chirp period for retraces.
+        rt_refresh_frames: Retrace cadence of the RT reference in frames;
+            0 retraces every chirp, N retraces every N frames with coherent
+            phase updates in between.
         sample_mode: Which PO chirps contribute to sequence fitting.
-        reference_component: RT path-power component used as the reference.
+        reference_component: RT path component used to synthesize the reference.
         alignment: How selected PO chirps are matched to RT reference chirps.
     """
 
@@ -96,9 +74,7 @@ class POCalibrationConfig:
     gain_type: POCalibrationGainType = "amplitude"
     reference_power_floor: float = 1e-30
     keep_rt_baseline: bool = True
-    rt_periodic_retrace: bool | None = None
-    rt_periodic_retrace_period_chirps: int | None = None
-    rt_retrace_once_per_frame: bool | None = None
+    rt_refresh_frames: int = 1
     sample_mode: POCalibrationSampleMode = "retrace_chirps"
     reference_component: POCalibrationReference = "single_human_only"
     alignment: POCalibrationAlignment = "last_retrace"
@@ -106,8 +82,7 @@ class POCalibrationConfig:
     def __post_init__(self):
         if self.mode not in ("none", "rt_first_pose", "rt_sequence"):
             raise ValueError(
-                "PO calibration mode must be 'none', 'rt_first_pose', "
-                "or 'rt_sequence'"
+                "PO calibration mode must be 'none', 'rt_first_pose', or 'rt_sequence'"
             )
         if self.gain_type != "amplitude":
             raise ValueError("Only amplitude PO calibration is currently supported")
@@ -116,38 +91,12 @@ class POCalibrationConfig:
             self.reference_power_floor,
         )
         keep_rt_baseline = _boolean("keep_rt_baseline", self.keep_rt_baseline)
-        rt_periodic_retrace = _boolean(
-            "rt_periodic_retrace",
-            self.rt_periodic_retrace,
-            optional=True,
-        )
-        legacy_retrace = _boolean(
-            "rt_retrace_once_per_frame",
-            self.rt_retrace_once_per_frame,
-            optional=True,
-        )
-        retrace_period = _optional_positive_integer(
-            "rt_periodic_retrace_period_chirps",
-            self.rt_periodic_retrace_period_chirps,
-        )
-        if rt_periodic_retrace is None:
-            rt_periodic_retrace = (
-                True
-                if legacy_retrace is None
-                else legacy_retrace
-            )
-        elif legacy_retrace is not None and legacy_retrace != rt_periodic_retrace:
-            raise ValueError(
-                "rt_periodic_retrace and legacy rt_retrace_once_per_frame disagree"
-            )
         object.__setattr__(self, "reference_power_floor", reference_power_floor)
         object.__setattr__(self, "keep_rt_baseline", keep_rt_baseline)
-        object.__setattr__(self, "rt_periodic_retrace", rt_periodic_retrace)
-        object.__setattr__(self, "rt_retrace_once_per_frame", rt_periodic_retrace)
         object.__setattr__(
             self,
-            "rt_periodic_retrace_period_chirps",
-            retrace_period,
+            "rt_refresh_frames",
+            validate_frames(self.rt_refresh_frames, name="rt_refresh_frames"),
         )
         if self.sample_mode == "retraced_chirps":
             object.__setattr__(self, "sample_mode", "retrace_chirps")
@@ -161,17 +110,23 @@ class POCalibrationConfig:
             "one_human_touch",
             "human_touch",
             "human_env_coupled",
-            "human_multi_touch",
         ):
             raise ValueError(
                 "reference_component must be one of: single_human_only, "
-                "one_human_touch, human_touch, human_env_coupled, "
-                "human_multi_touch"
+                "one_human_touch, human_touch, human_env_coupled"
             )
         if self.alignment not in ("last_retrace", "nearest", "same_index"):
-            raise ValueError(
-                "alignment must be 'last_retrace', 'nearest', or 'same_index'"
-            )
+            raise ValueError("alignment must be 'last_retrace', 'nearest', or 'same_index'")
+
+
+def rt_baseline_schedule_metadata(rt_baseline) -> dict:
+    """Summarizes how the calibration's RT reference was retraced."""
+
+    return {
+        "rt_baseline_refresh_frames": int(rt_baseline.get("rt_refresh_frames", 1)),
+        "rt_baseline_retrace_period_chirps": int(rt_baseline.get("retrace_period_chirps", 0)),
+        "rt_baseline_coherent_path_update": bool(rt_baseline.get("coherent_path_update", False)),
+    }
 
 
 def rt_calibration_enabled(config: POCalibrationConfig) -> bool:
@@ -249,12 +204,15 @@ def fit_first_pose_adc_calibration(
     po_reference_adc: np.ndarray,
     config: POCalibrationConfig,
 ) -> tuple[float, dict]:
-    """Fits the legacy first-frame ADC RMS calibration gain.
+    """Fits one amplitude gain from whole-first-frame ADC powers.
 
-    This path is retained for callers that calibrate directly from synthesized
-    ADC tensors instead of path-power samples.  It uses the full ADC RMS power
-    of each reference tensor and reports metadata compatible with sequence
-    calibration outputs.
+    Callers supply the single-human-only RT and human-only PO ADC tensors for
+    the first simulated radar frame. Mean power includes every chirp, virtual
+    channel, and ADC sample in each tensor, rather than only the first chirp.
+    The returned gain is ``sqrt(P_rt_human / P_po_human)`` (subject to reference
+    power guards). Hybrid PO reuses it for all frames and chirps of the human
+    PO and coupling terms; static-environment RT is not rescaled. Metadata is
+    compatible with sequence calibration outputs.
     """
 
     return fit_amplitude_gain_from_powers(
@@ -292,20 +250,35 @@ def po_path_power_from_coefficients(
     return float(np.sum(path_power[np.asarray(valid, dtype=bool)]))
 
 
-def rt_reference_power_array(rt_baseline: dict, component: str) -> np.ndarray | None:
-    """Returns the RT path-power array used by a sequence calibration.
+def rt_reference_power_array(
+    rt_baseline: dict,
+    component: str,
+    *,
+    power_kind: str = "path_coefficient_power",
+) -> np.ndarray | None:
+    """Return RT powers for the requested received-signal or path diagnostic metric.
 
-    The lookup first checks the baseline dictionary, then falls back to matching
-    metadata attributes on ``rt_baseline["cube"]``. ``None`` means the requested
-    reference component was not recorded by the RT run.
+    Coherent ADC powers come from the baseline's per-component channel powers.
+    Legacy path powers also support lookup in cube metadata. ``None`` means
+    the requested reference component was not recorded by the RT run.
     """
 
+    if power_kind == "adc_rms_power":
+        value = rt_baseline.get("reference_adc_power", {}).get(component)
+        if value is None:
+            return None
+        # Retain channel powers separately until physical TDM slots are packed.
+        power = np.asarray(value, dtype=np.float64)
+        if power.ndim != 3:
+            raise ValueError("RT reference ADC power must have shape [frames, chirps, channels]")
+        return np.mean(power, axis=-1)
+    if power_kind != "path_coefficient_power":
+        raise ValueError(f"unsupported reference power kind: {power_kind!r}")
     key = {
         "single_human_only": "single_human_only_path_power",
         "one_human_touch": "one_human_touch_path_power",
         "human_touch": "human_touch_path_power",
         "human_env_coupled": "human_env_coupled_path_power",
-        "human_multi_touch": "human_multi_touch_path_power",
     }[component]
     value = rt_baseline.get(key)
     if value is None:
@@ -366,9 +339,8 @@ def _selected_po_indices(
         nearest_po = np.searchsorted(po_flat_times, event_times)
         nearest_po = np.clip(nearest_po, 0, po_flat_times.size - 1)
         prev_po = np.maximum(nearest_po - 1, 0)
-        use_prev = (
-            np.abs(po_flat_times[prev_po] - event_times)
-            <= np.abs(po_flat_times[nearest_po] - event_times)
+        use_prev = np.abs(po_flat_times[prev_po] - event_times) <= np.abs(
+            po_flat_times[nearest_po] - event_times
         )
         nearest_po = np.where(use_prev, prev_po, nearest_po)
         po_frame_idx, po_chirp_idx = np.unravel_index(nearest_po, po_times.shape)
@@ -404,9 +376,8 @@ def _aligned_rt_indices(
         nearest_rt = np.searchsorted(rt_flat_times, selected_po_times)
         nearest_rt = np.clip(nearest_rt, 0, rt_flat_times.size - 1)
         prev_rt = np.maximum(nearest_rt - 1, 0)
-        use_prev = (
-            np.abs(rt_flat_times[prev_rt] - selected_po_times)
-            <= np.abs(rt_flat_times[nearest_rt] - selected_po_times)
+        use_prev = np.abs(rt_flat_times[prev_rt] - selected_po_times) <= np.abs(
+            rt_flat_times[nearest_rt] - selected_po_times
         )
         nearest_rt = np.where(use_prev, prev_rt, nearest_rt)
         return (*np.unravel_index(nearest_rt, rt_times.shape), "nearest")
@@ -433,6 +404,7 @@ def _sequence_power_samples(
     po_times: np.ndarray,
     po_path_power: np.ndarray,
     config: POCalibrationConfig,
+    reference_power_kind: str = "path_coefficient_power",
 ) -> tuple[dict[str, np.ndarray], dict]:
     """Builds aligned finite RT/PO power samples for gain fitting."""
 
@@ -440,7 +412,11 @@ def _sequence_power_samples(
     if cube is None:
         return {}, {"warnings": ["rt_baseline_cube_missing"]}
     rt_times = np.asarray(cube.times, dtype=float)
-    rt_power = rt_reference_power_array(rt_baseline, config.reference_component)
+    rt_power = rt_reference_power_array(
+        rt_baseline,
+        config.reference_component,
+        power_kind=reference_power_kind,
+    )
     if rt_power is None:
         return {}, {"warnings": ["rt_reference_power_missing"]}
     po_times = np.asarray(po_times, dtype=float)
@@ -508,7 +484,7 @@ def _sequence_power_samples(
         "effective_alignment": effective_alignment,
         "sample_mode": config.sample_mode,
         "reference_component": config.reference_component,
-        "reference_power_kind": "path_coefficient_power",
+        "reference_power_kind": reference_power_kind,
     }
     return samples, meta
 
@@ -599,7 +575,9 @@ def _time_varying_gain_map(
         "human_po_amplitude_gain_map_mean": float(np.mean(gain_map)),
         "human_po_amplitude_gain_map_max": float(np.max(gain_map)),
         "human_po_amplitude_gain_map_min_db": float(np.min(map_db)),
-        "human_po_amplitude_gain_map_mean_db": float(20.0 * np.log10(max(float(np.mean(gain_map)), 1e-300))),
+        "human_po_amplitude_gain_map_mean_db": float(
+            20.0 * np.log10(max(float(np.mean(gain_map)), 1e-300))
+        ),
         "human_po_amplitude_gain_map_max_db": float(np.max(map_db)),
         "human_po_amplitude_gain_schedule_min_db": float(np.min(gain_db)),
         "human_po_amplitude_gain_schedule_max_db": float(np.max(gain_db)),
@@ -608,14 +586,15 @@ def _time_varying_gain_map(
     return gain_map, meta, warnings
 
 
-def fit_sequence_path_power_calibration(
+def _fit_sequence_power_calibration(
     *,
     rt_baseline: dict,
     po_times: np.ndarray,
     po_path_power: np.ndarray,
     config: POCalibrationConfig,
+    reference_power_kind: str,
 ) -> tuple[float, dict]:
-    """Fits PO amplitude gains from an aligned RT path-power sequence.
+    """Fit PO amplitude gains from aligned RT and PO power samples.
 
     A scalar gain is always returned for compatibility with older call sites.
     When ``sample_mode="retrace_chirps"`` and ``alignment="last_retrace"``, the
@@ -628,6 +607,7 @@ def fit_sequence_path_power_calibration(
         po_times=po_times,
         po_path_power=po_path_power,
         config=config,
+        reference_power_kind=reference_power_kind,
     )
     warnings = list(meta.pop("warnings", []))
     rt_values = np.asarray(samples.get("rt_power", []), dtype=float)
@@ -662,9 +642,7 @@ def fit_sequence_path_power_calibration(
     out["warnings"] = warnings + out.get("warnings", [])
     out["rt_reference_integrated_power"] = rt_integrated
     out["raw_po_reference_integrated_power"] = po_integrated
-    out["calibrated_po_reference_integrated_power"] = float(
-        po_integrated * gain * gain
-    )
+    out["calibrated_po_reference_integrated_power"] = float(po_integrated * gain * gain)
     out["rt_reference_power_peak"] = float(np.max(rt_values))
     out["raw_po_reference_power_peak"] = float(np.max(po_values))
     out["rt_reference_power_peak_over_mean_db"] = float(
@@ -676,6 +654,63 @@ def fit_sequence_path_power_calibration(
             np.mean(np.asarray(po_path_power, dtype=float) * gain_map * gain_map)
         )
     return gain, out
+
+
+def fit_sequence_adc_calibration(
+    *,
+    rt_baseline: dict,
+    po_times: np.ndarray,
+    po_adc: np.ndarray,
+    config: POCalibrationConfig,
+) -> tuple[float, dict]:
+    """Fit from coherent received waveforms, averaging power across ADC samples.
+
+    Path contributions must already be summed in each channel's waveform.
+    Channels and chirps contribute powers, not a further coherent field sum.
+    No incoherent path-power fallback is allowed for an absent RT reference.
+    """
+
+    po_adc = np.asarray(po_adc)
+    if po_adc.ndim != 4 or po_adc.shape[:2] != np.shape(po_times):
+        raise ValueError("PO ADC must have shape [frames, chirps, samples, channels]")
+    if (
+        rt_reference_power_array(
+            rt_baseline,
+            config.reference_component,
+            power_kind="adc_rms_power",
+        )
+        is None
+    ):
+        raise ValueError(f"missing coherent RT ADC power for {config.reference_component!r}")
+    # Reduce one chirp at a time to avoid allocating another full ADC cube.
+    po_power = np.empty(np.shape(po_times), dtype=np.float64)
+    for index in np.ndindex(po_power.shape):
+        po_power[index] = adc_rms_power(po_adc[index])
+    return _fit_sequence_power_calibration(
+        rt_baseline=rt_baseline,
+        po_times=po_times,
+        po_path_power=po_power,
+        config=config,
+        reference_power_kind="adc_rms_power",
+    )
+
+
+def fit_sequence_path_power_calibration(
+    *,
+    rt_baseline: dict,
+    po_times: np.ndarray,
+    po_path_power: np.ndarray,
+    config: POCalibrationConfig,
+) -> tuple[float, dict]:
+    """Legacy fit from incoherent path powers; simulation uses ADC calibration."""
+
+    return _fit_sequence_power_calibration(
+        rt_baseline=rt_baseline,
+        po_times=po_times,
+        po_path_power=po_path_power,
+        config=config,
+        reference_power_kind="path_coefficient_power",
+    )
 
 
 def calibration_gain_array(

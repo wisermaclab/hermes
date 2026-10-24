@@ -8,13 +8,11 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 from pathlib import Path
 import sys
 import tempfile
 
 import numpy as np
-
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SRC_PATH = str(REPO_ROOT / "src")
@@ -24,13 +22,7 @@ if SRC_PATH not in sys.path:
 from mmWaveRadar import amass_to_mesh_sequence, load_amass_npz
 
 
-def _default_smpl_model_dir() -> Path:
-    """Resolves the model override or the repository-local model directory."""
-
-    value = os.environ.get("MMWAVE_SMPL_MODEL_DIR")
-    if value:
-        return Path(value).expanduser()
-    return REPO_ROOT / "models" / "smpl_models"
+from mmWaveRadar.defaults import default_smpl_model_dir as _default_smpl_model_dir
 
 
 def _slice_amass_npz(
@@ -48,9 +40,7 @@ def _slice_amass_npz(
         raise ValueError(f"{source_path} contains no pose frames")
     start = int(start_frame)
     if start < 0 or start >= total_frames:
-        raise ValueError(
-            f"start_frame must be between 0 and {total_frames - 1}"
-        )
+        raise ValueError(f"start_frame must be between 0 and {total_frames - 1}")
     if num_frames is None:
         stop = total_frames
     else:
@@ -95,9 +85,7 @@ def convert_amass_to_mesh_sequence(
             "MMWAVE_SMPL_MODEL_DIR, or pass --smpl-model-dir."
         )
     if output_npz.exists() and not force:
-        raise FileExistsError(
-            f"{output_npz} already exists; pass --force to overwrite"
-        )
+        raise FileExistsError(f"{output_npz} already exists; pass --force to overwrite")
     output_npz.parent.mkdir(parents=True, exist_ok=True)
 
     temp_dir = None
@@ -113,9 +101,7 @@ def convert_amass_to_mesh_sequence(
                 num_frames=num_frames,
             )
         else:
-            temp_dir = tempfile.TemporaryDirectory(
-                prefix="mmwave-amass-slice-"
-            )
+            temp_dir = tempfile.TemporaryDirectory(prefix="mmwave-amass-slice-")
             sliced_amass_path = Path(temp_dir.name) / "amass_slice.npz"
             source_for_conversion, start, count = _slice_amass_npz(
                 source_path=amass_npz,
@@ -126,9 +112,7 @@ def convert_amass_to_mesh_sequence(
     else:
         data = load_amass_npz(str(amass_npz))
         if "poses" not in data:
-            raise ValueError(
-                f"{amass_npz} is missing required AMASS array 'poses'"
-            )
+            raise ValueError(f"{amass_npz} is missing required AMASS array 'poses'")
         start = 0
         count = int(np.asarray(data["poses"]).shape[0])
         if count == 0:
@@ -150,8 +134,7 @@ def convert_amass_to_mesh_sequence(
         "amass_npz": str(amass_npz),
         "output_npz": str(output_npz),
         "sliced_amass_npz": (
-            "" if not keep_sliced_amass or sliced_amass_path is None
-            else str(sliced_amass_path)
+            "" if not keep_sliced_amass or sliced_amass_path is None else str(sliced_amass_path)
         ),
         "smpl_model_dir": str(smpl_model_dir),
         "model_type": str(model_type),
@@ -184,8 +167,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--model-type", default="smpl")
     parser.add_argument("--device", default="cpu")
     parser.add_argument("--start-frame", type=int, default=0)
-    parser.add_argument("--frame-index", type=int, default=None,
-                        help="Shortcut for --start-frame N --num-frames 1.")
+    parser.add_argument(
+        "--frame-index",
+        type=int,
+        default=None,
+        help="Shortcut for --start-frame N --num-frames 1.",
+    )
     parser.add_argument("--num-frames", type=int, default=None)
     parser.add_argument("--keep-sliced-amass", action="store_true")
     parser.add_argument("--force", action="store_true")
@@ -196,11 +183,7 @@ def main() -> None:
     """Runs the CLI conversion and prints a JSON summary."""
 
     args = build_arg_parser().parse_args()
-    start_frame = (
-        int(args.frame_index)
-        if args.frame_index is not None
-        else int(args.start_frame)
-    )
+    start_frame = int(args.frame_index) if args.frame_index is not None else int(args.start_frame)
     num_frames = 1 if args.frame_index is not None else args.num_frames
     summary = convert_amass_to_mesh_sequence(
         amass_npz=args.amass_npz,

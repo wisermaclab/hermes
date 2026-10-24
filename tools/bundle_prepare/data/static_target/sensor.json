@@ -1,0 +1,34 @@
+{
+  "name": "radar",
+  "position": [
+    0.0,
+    0.0,
+    0.0
+  ],
+  "orientation": [
+    0.0,
+    0.0,
+    0.0
+  ],
+  "pattern_mode": "none",
+  "cosine_3db_beamwidth_deg": 60.0,
+  "virtual_channel_order": "tx_major",
+  "adc_units": "arbitrary",
+  "metadata": {},
+  "fmcw": {
+    "carrier_frequency_hz": 60000000000.0,
+    "slope_hz_per_s": 20000000000000.0,
+    "chirp_duration_s": 4e-05,
+    "chirp_repetition_time_s": 5e-05,
+    "sampling_frequency_hz": 2000000.0,
+    "num_adc_samples": 64,
+    "num_chirps_per_frame": 4,
+    "frame_period_s": 0.1,
+    "num_tx": 3,
+    "tx_schedule": "simultaneous",
+    "adc_mode": "complex1x",
+    "if_bandwidth_hz": null,
+    "carrier_reference": "first_adc_sample"
+  },
+  "board_model": "IWR6843AOP"
+}

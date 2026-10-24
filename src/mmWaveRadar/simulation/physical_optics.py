@@ -8,25 +8,51 @@ from __future__ import annotations
 from dataclasses import dataclass
 import math
 from typing import Callable, Literal
-import warnings
 
 import mitsuba as mi
 import numpy as np
 from scipy.constants import c, epsilon_0, pi
 
+from .options import (
+    POArraySettings,
+    POChannelSettings,
+    POComputeSettings,
+    POIntegrationSettings,
+    POVisibilitySettings,
+)
 from ..radar.hardware import resolve_virtual_channel_pairs
 from ..targets.mesh import ensure_outward_face_winding
-
+from .compute import (
+    ComputeBackend,
+    ComputePrecision,
+    TorchRuntime,
+    numpy_dtypes_for_precision as _numpy_dtypes_for_precision,
+    resolve_torch_runtime,
+    torch_vector_cross,
+    validate_compute_backend,
+)
+from .po_wideband import PODelayResponse
 
 VisibilityMode = Literal["fractional_shadow_fade", "none"]
 MaterialModel = Literal["slab", "interface", "pec"]
-ComputeBackend = Literal["auto", "numpy", "torch"]
-ComputePrecision = Literal["float64", "float32"]
 POIntegrationMode = Literal[
     "face_centroid",
     "parent_face_quadrature",
+    "parent_face_adaptive_analytic",
     "parent_face_far_field_analytic",
 ]
+PolarizationCallback = Callable[[np.ndarray], tuple[np.ndarray, np.ndarray]]
+
+
+def default_phase_span_scale_rad(po_integration_mode: str) -> float:
+    """Returns the subdivision phase span suited to one PO integration mode.
+
+    Midpoint quadrature samples the propagation phase once per subface, so a
+    subface must stay well below a pi span. The analytic modes integrate the
+    linear phase exactly; their span only bounds amplitude variation.
+    """
+
+    return 1.0 if po_integration_mode == "parent_face_quadrature" else 6.0
 
 
 PHASE_SPAN_SAMPLE_BARYCENTRICS = np.asarray(
@@ -87,6 +113,7 @@ class POChannelResult:
     visibility_state: FaceVisibilityState
     far_field_max_edge_m: float | None = None
     far_field_nearest_distance_m: float | None = None
+    delay_response: PODelayResponse | None = None
 
 
 def complex_relative_permittivity(
@@ -110,10 +137,7 @@ def fresnel_interface_coefficients(
     sin_theta_sqr = 1.0 - cos_theta * cos_theta
     a = np.sqrt(epsilon_r_complex - sin_theta_sqr + 0j)
     r_te = (cos_theta - a) / (cos_theta + a)
-    r_tm = (
-        (epsilon_r_complex * cos_theta - a)
-        / (epsilon_r_complex * cos_theta + a)
-    )
+    r_tm = (epsilon_r_complex * cos_theta - a) / (epsilon_r_complex * cos_theta + a)
     return r_te, r_tm
 
 
@@ -133,18 +157,9 @@ def fresnel_slab_coefficients(
     a = np.sqrt(epsilon_r_complex - sin_theta_sqr + 0j)
 
     r_te_p = (cos_theta - a) / (cos_theta + a)
-    r_tm_p = (
-        (epsilon_r_complex * cos_theta - a)
-        / (epsilon_r_complex * cos_theta + a)
-    )
+    r_tm_p = (epsilon_r_complex * cos_theta - a) / (epsilon_r_complex * cos_theta + a)
 
-    q = (
-        2.0
-        * pi
-        * thickness_m
-        / wavelength_m
-        * np.sqrt(epsilon_r_complex - sin_theta_sqr + 0j)
-    )
+    q = 2.0 * pi * thickness_m / wavelength_m * np.sqrt(epsilon_r_complex - sin_theta_sqr + 0j)
     exp_j_2q = np.exp(-2.0j * q)
 
     r_te = r_te_p * (1.0 - exp_j_2q) / (1.0 - (r_te_p * r_te_p) * exp_j_2q)
@@ -257,6 +272,74 @@ def parent_face_quadrature_geometry(
     integration without changing the visibility mesh topology.
     """
 
+    triangles, parent_indices = _adaptive_parent_triangles(
+        vertices,
+        faces,
+        selected_parent_indices,
+        tx_positions,
+        rx_positions,
+        frequency_hz,
+        phase_span_scale_rad,
+        max_refinement_depth=max_refinement_depth,
+        max_subfaces_per_parent=max_subfaces_per_parent,
+        progress_callback=progress_callback,
+    )
+    centroids, normals, areas = _triangle_geometry_from_triangles(triangles)
+    return centroids, normals, areas, parent_indices
+
+
+def parent_face_adaptive_analytic_geometry(
+    vertices: np.ndarray,
+    faces: np.ndarray,
+    selected_parent_indices: np.ndarray,
+    tx_positions: np.ndarray,
+    rx_positions: np.ndarray,
+    frequency_hz: float,
+    phase_span_scale_rad: float = 6.0,
+    *,
+    curvature_error_rad: float = 0.005,
+    max_refinement_depth: int = 16,
+    max_subfaces_per_parent: int = 0,
+    progress_callback: Callable[[dict], None] | None = None,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Refine by phase span OR edge-midpoint curvature, retaining parent ids.
+
+    Each leaf is evaluated with the exact triangle integral of its locally
+    linear propagation phase. Curvature uses k_c/3 times the largest midpoint
+    path-length interpolation error over all edges and Tx/Rx combinations.
+    """
+    triangles, parent_indices = _adaptive_parent_triangles(
+        vertices,
+        faces,
+        selected_parent_indices,
+        tx_positions,
+        rx_positions,
+        frequency_hz,
+        phase_span_scale_rad,
+        curvature_error_rad=curvature_error_rad,
+        max_refinement_depth=max_refinement_depth,
+        max_subfaces_per_parent=max_subfaces_per_parent,
+        progress_callback=progress_callback,
+    )
+    centroids, normals, areas = _triangle_geometry_from_triangles(triangles)
+    return centroids, normals, areas, parent_indices, triangles
+
+
+def _adaptive_parent_triangles(
+    vertices,
+    faces,
+    selected_parent_indices,
+    tx_positions,
+    rx_positions,
+    frequency_hz,
+    phase_span_scale_rad,
+    *,
+    curvature_error_rad=None,
+    max_refinement_depth=16,
+    max_subfaces_per_parent=0,
+    progress_callback=None,
+):
+    """Common four-child refinement; only the analytic mode tests curvature."""
     vertices = np.asarray(vertices, dtype=np.float64)
     faces = np.asarray(faces, dtype=np.uint32)
     selected_parent_indices = np.asarray(
@@ -264,14 +347,13 @@ def parent_face_quadrature_geometry(
         dtype=np.int64,
     ).reshape(-1)
     if selected_parent_indices.size == 0:
-        return (
-            np.zeros((0, 3), dtype=np.float64),
-            np.zeros((0, 3), dtype=np.float64),
-            np.zeros((0,), dtype=np.float64),
-            selected_parent_indices.copy(),
-        )
-    if phase_span_scale_rad <= 0.0:
-        raise ValueError("phase_span_scale_rad must be positive")
+        return np.zeros((0, 3, 3), dtype=np.float64), selected_parent_indices.copy()
+    if not np.isfinite(phase_span_scale_rad) or phase_span_scale_rad <= 0.0:
+        raise ValueError("phase_span_scale_rad must be finite and positive")
+    if curvature_error_rad is not None and (
+        not np.isfinite(curvature_error_rad) or curvature_error_rad <= 0.0
+    ):
+        raise ValueError("curvature_error_rad must be finite and positive")
     if max_refinement_depth < 0:
         raise ValueError("max_refinement_depth must be non-negative")
     if max_subfaces_per_parent < 0:
@@ -285,21 +367,35 @@ def parent_face_quadrature_geometry(
     num_faces = int(faces.shape[0])
     max_depth = int(max_refinement_depth)
     max_per_parent = int(max_subfaces_per_parent)
+    stage_prefix = "quadrature" if curvature_error_rad is None else "adaptive_analytic"
     if progress_callback is not None:
-        progress_callback({
-            "stage": "quadrature_geometry_start",
-            "parent_faces_processed": 0,
-            "parent_faces_total": int(selected_parent_indices.size),
-            "subfaces_total": int(triangles.shape[0]),
-        })
-    for depth in range(max_depth):
-        phase_span = _triangle_phase_span_rad(
-            triangles,
-            tx_positions,
-            rx_positions,
-            frequency_hz,
+        progress_callback(
+            {
+                "stage": f"{stage_prefix}_geometry_start",
+                "parent_faces_processed": 0,
+                "parent_faces_total": int(selected_parent_indices.size),
+                "subfaces_total": int(triangles.shape[0]),
+            }
         )
-        split_mask = phase_span > float(phase_span_scale_rad)
+
+    def split_tests(current):
+        span_function = (
+            _triangle_phase_span_rad
+            if curvature_error_rad is None
+            else _triangle_linear_phase_span_rad
+        )
+        span = span_function(current, tx_positions, rx_positions, frequency_hz)
+        split = span > float(phase_span_scale_rad)
+        curvature = None
+        if curvature_error_rad is not None:
+            curvature = _triangle_phase_curvature_rad(
+                current, tx_positions, rx_positions, frequency_hz
+            )
+            split |= curvature > float(curvature_error_rad)
+        return split, span, curvature
+
+    for depth in range(max_depth):
+        split_mask, _, _ = split_tests(triangles)
         if max_per_parent > 0 and np.any(split_mask):
             current_counts = np.bincount(parent_indices, minlength=num_faces)
             split_counts = np.bincount(
@@ -310,20 +406,26 @@ def parent_face_quadrature_geometry(
             split_mask &= allowed_parent[parent_indices]
         split_count = int(np.count_nonzero(split_mask))
         if progress_callback is not None:
-            progress_callback({
-                "stage": "quadrature_geometry_refinement",
-                "refinement_depth": int(depth),
-                "parent_faces_processed": int(
-                    selected_parent_indices.size
-                    - np.unique(parent_indices[split_mask]).size
-                ) if split_count else int(selected_parent_indices.size),
-                "parent_faces_total": int(selected_parent_indices.size),
-                "parent_faces_to_split": int(
-                    np.unique(parent_indices[split_mask]).size
-                ) if split_count else 0,
-                "subfaces_total": int(triangles.shape[0]),
-                "subfaces_to_split": split_count,
-            })
+            progress_callback(
+                {
+                    "stage": f"{stage_prefix}_geometry_refinement",
+                    "refinement_depth": int(depth),
+                    "parent_faces_processed": (
+                        int(
+                            selected_parent_indices.size
+                            - np.unique(parent_indices[split_mask]).size
+                        )
+                        if split_count
+                        else int(selected_parent_indices.size)
+                    ),
+                    "parent_faces_total": int(selected_parent_indices.size),
+                    "parent_faces_to_split": (
+                        int(np.unique(parent_indices[split_mask]).size) if split_count else 0
+                    ),
+                    "subfaces_total": int(triangles.shape[0]),
+                    "subfaces_to_split": split_count,
+                }
+            )
         if not np.any(split_mask):
             break
         keep_mask = ~split_mask
@@ -340,27 +442,39 @@ def parent_face_quadrature_geometry(
             axis=0,
         )
         if progress_callback is not None:
-            progress_callback({
-                "stage": "quadrature_geometry_split",
-                "refinement_depth": int(depth + 1),
-                "parent_faces_processed": int(
-                    selected_parent_indices.size
-                    - np.unique(split_parent_indices).size
-                ),
-                "parent_faces_total": int(selected_parent_indices.size),
-                "parent_faces_to_split": int(np.unique(split_parent_indices).size),
-                "subfaces_total": int(triangles.shape[0]),
-            })
+            progress_callback(
+                {
+                    "stage": f"{stage_prefix}_geometry_split",
+                    "refinement_depth": int(depth + 1),
+                    "parent_faces_processed": int(
+                        selected_parent_indices.size - np.unique(split_parent_indices).size
+                    ),
+                    "parent_faces_total": int(selected_parent_indices.size),
+                    "parent_faces_to_split": int(np.unique(split_parent_indices).size),
+                    "subfaces_total": int(triangles.shape[0]),
+                }
+            )
 
     if progress_callback is not None:
-        progress_callback({
-            "stage": "quadrature_geometry_done",
-            "parent_faces_processed": int(selected_parent_indices.size),
-            "parent_faces_total": int(selected_parent_indices.size),
-            "subfaces_total": int(triangles.shape[0]),
-        })
-    centroids, normals, areas = _triangle_geometry_from_triangles(triangles)
-    return centroids, normals, areas, parent_indices
+        diagnostics = {}
+        if curvature_error_rad is not None:
+            unresolved, span, curvature = split_tests(triangles)
+            diagnostics = {
+                "unresolved_subfaces": int(np.count_nonzero(unresolved)),
+                "unresolved_parent_faces": int(np.unique(parent_indices[unresolved]).size),
+                "max_phase_span_rad": float(np.max(span, initial=0.0)),
+                "max_curvature_error_rad": float(np.max(curvature, initial=0.0)),
+            }
+        progress_callback(
+            {
+                "stage": f"{stage_prefix}_geometry_done",
+                "parent_faces_processed": int(selected_parent_indices.size),
+                "parent_faces_total": int(selected_parent_indices.size),
+                "subfaces_total": int(triangles.shape[0]),
+                **diagnostics,
+            }
+        )
+    return triangles, parent_indices
 
 
 def parent_face_far_field_analytic_geometry(
@@ -441,14 +555,16 @@ def parent_face_far_field_analytic_geometry(
     max_depth = int(max_refinement_depth)
     max_per_parent = int(max_subfaces_per_parent)
     if progress_callback is not None:
-        progress_callback({
-            "stage": "far_field_geometry_start",
-            "parent_faces_processed": 0,
-            "parent_faces_total": int(selected_parent_indices.size),
-            "subfaces_total": int(triangles.shape[0]),
-            "nearest_mesh_distance_m": float(nearest_distance_m),
-            "far_field_max_edge_m": float(max_edge_m),
-        })
+        progress_callback(
+            {
+                "stage": "far_field_geometry_start",
+                "parent_faces_processed": 0,
+                "parent_faces_total": int(selected_parent_indices.size),
+                "subfaces_total": int(triangles.shape[0]),
+                "nearest_mesh_distance_m": float(nearest_distance_m),
+                "far_field_max_edge_m": float(max_edge_m),
+            }
+        )
     for depth in range(max_depth):
         max_edges = _triangle_max_edge_lengths(triangles)
         split_mask = max_edges > max_edge_m
@@ -462,22 +578,28 @@ def parent_face_far_field_analytic_geometry(
             split_mask &= allowed_parent[parent_indices]
         split_count = int(np.count_nonzero(split_mask))
         if progress_callback is not None:
-            progress_callback({
-                "stage": "far_field_geometry_refinement",
-                "refinement_depth": int(depth),
-                "parent_faces_processed": int(
-                    selected_parent_indices.size
-                    - np.unique(parent_indices[split_mask]).size
-                ) if split_count else int(selected_parent_indices.size),
-                "parent_faces_total": int(selected_parent_indices.size),
-                "parent_faces_to_split": int(
-                    np.unique(parent_indices[split_mask]).size
-                ) if split_count else 0,
-                "subfaces_total": int(triangles.shape[0]),
-                "subfaces_to_split": split_count,
-                "nearest_mesh_distance_m": float(nearest_distance_m),
-                "far_field_max_edge_m": float(max_edge_m),
-            })
+            progress_callback(
+                {
+                    "stage": "far_field_geometry_refinement",
+                    "refinement_depth": int(depth),
+                    "parent_faces_processed": (
+                        int(
+                            selected_parent_indices.size
+                            - np.unique(parent_indices[split_mask]).size
+                        )
+                        if split_count
+                        else int(selected_parent_indices.size)
+                    ),
+                    "parent_faces_total": int(selected_parent_indices.size),
+                    "parent_faces_to_split": (
+                        int(np.unique(parent_indices[split_mask]).size) if split_count else 0
+                    ),
+                    "subfaces_total": int(triangles.shape[0]),
+                    "subfaces_to_split": split_count,
+                    "nearest_mesh_distance_m": float(nearest_distance_m),
+                    "far_field_max_edge_m": float(max_edge_m),
+                }
+            )
         if not np.any(split_mask):
             break
         keep_mask = ~split_mask
@@ -494,31 +616,34 @@ def parent_face_far_field_analytic_geometry(
             axis=0,
         )
         if progress_callback is not None:
-            progress_callback({
-                "stage": "far_field_geometry_split",
-                "refinement_depth": int(depth + 1),
-                "parent_faces_processed": int(
-                    selected_parent_indices.size
-                    - np.unique(split_parent_indices).size
-                ),
+            progress_callback(
+                {
+                    "stage": "far_field_geometry_split",
+                    "refinement_depth": int(depth + 1),
+                    "parent_faces_processed": int(
+                        selected_parent_indices.size - np.unique(split_parent_indices).size
+                    ),
+                    "parent_faces_total": int(selected_parent_indices.size),
+                    "parent_faces_to_split": int(np.unique(split_parent_indices).size),
+                    "subfaces_total": int(triangles.shape[0]),
+                    "nearest_mesh_distance_m": float(nearest_distance_m),
+                    "far_field_max_edge_m": float(max_edge_m),
+                }
+            )
+    if progress_callback is not None:
+        progress_callback(
+            {
+                "stage": "far_field_geometry_done",
+                "parent_faces_processed": int(selected_parent_indices.size),
                 "parent_faces_total": int(selected_parent_indices.size),
-                "parent_faces_to_split": int(np.unique(split_parent_indices).size),
                 "subfaces_total": int(triangles.shape[0]),
                 "nearest_mesh_distance_m": float(nearest_distance_m),
                 "far_field_max_edge_m": float(max_edge_m),
-            })
-    if progress_callback is not None:
-        progress_callback({
-            "stage": "far_field_geometry_done",
-            "parent_faces_processed": int(selected_parent_indices.size),
-            "parent_faces_total": int(selected_parent_indices.size),
-            "subfaces_total": int(triangles.shape[0]),
-            "nearest_mesh_distance_m": float(nearest_distance_m),
-            "far_field_max_edge_m": float(max_edge_m),
-            "max_subface_edge_m": float(
-                np.max(_triangle_max_edge_lengths(triangles), initial=0.0)
-            ),
-        })
+                "max_subface_edge_m": float(
+                    np.max(_triangle_max_edge_lengths(triangles), initial=0.0)
+                ),
+            }
+        )
     centroids, normals, areas = _triangle_geometry_from_triangles(triangles)
     return (
         centroids,
@@ -541,19 +666,19 @@ def parent_face_far_field_edge_rule(
 ) -> tuple[float, float]:
     """Returns ``(D_max, R_min)`` for global far-field analytic subdivision."""
 
-    source_positions = np.vstack([
-        np.asarray(tx_positions, dtype=np.float64).reshape(-1, 3),
-        np.asarray(rx_positions, dtype=np.float64).reshape(-1, 3),
-    ])
+    source_positions = np.vstack(
+        [
+            np.asarray(tx_positions, dtype=np.float64).reshape(-1, 3),
+            np.asarray(rx_positions, dtype=np.float64).reshape(-1, 3),
+        ]
+    )
     nearest_distance_m = _nearest_distance_to_triangle_mesh(
         vertices,
         faces,
         source_positions,
     )
     wavelength_m = c / float(frequency_hz)
-    max_edge_m = math.sqrt(
-        max(wavelength_m * max(nearest_distance_m, 1e-18) / 2.0, 0.0)
-    )
+    max_edge_m = math.sqrt(max(wavelength_m * max(nearest_distance_m, 1e-18) / 2.0, 0.0))
     return float(max_edge_m), float(nearest_distance_m)
 
 
@@ -610,11 +735,14 @@ def _triangle_max_edge_lengths(triangles: np.ndarray) -> np.ndarray:
     if triangles.shape[0] == 0:
         return np.zeros((0,), dtype=np.float64)
     return np.max(
-        np.stack([
-            np.linalg.norm(triangles[:, 1] - triangles[:, 0], axis=1),
-            np.linalg.norm(triangles[:, 2] - triangles[:, 1], axis=1),
-            np.linalg.norm(triangles[:, 0] - triangles[:, 2], axis=1),
-        ], axis=1),
+        np.stack(
+            [
+                np.linalg.norm(triangles[:, 1] - triangles[:, 0], axis=1),
+                np.linalg.norm(triangles[:, 2] - triangles[:, 1], axis=1),
+                np.linalg.norm(triangles[:, 0] - triangles[:, 2], axis=1),
+            ],
+            axis=1,
+        ),
         axis=1,
     )
 
@@ -680,17 +808,16 @@ def _point_triangle_distance_squared(
         where=np.abs(denom) > 1e-30,
     )
     inside = (
-        (normal_norm_sqr > 1e-30)
-        & (bary_v >= 0.0)
-        & (bary_w >= 0.0)
-        & (bary_v + bary_w <= 1.0)
+        (normal_norm_sqr > 1e-30) & (bary_v >= 0.0) & (bary_w >= 0.0) & (bary_v + bary_w <= 1.0)
     )
     plane_distance_sqr = signed_plane * signed_plane * normal_norm_sqr
-    edge_distance_sqr = np.minimum.reduce([
-        _point_segment_distance_squared(point, a, b),
-        _point_segment_distance_squared(point, b, c_),
-        _point_segment_distance_squared(point, c_, a),
-    ])
+    edge_distance_sqr = np.minimum.reduce(
+        [
+            _point_segment_distance_squared(point, a, b),
+            _point_segment_distance_squared(point, b, c_),
+            _point_segment_distance_squared(point, c_, a),
+        ]
+    )
     return np.where(inside, plane_distance_sqr, edge_distance_sqr)
 
 
@@ -756,6 +883,49 @@ def _triangle_phase_span_rad(
     return (2.0 * pi * float(frequency_hz) / c) * max_delta_m
 
 
+def _triangle_phase_curvature_rad(triangles, tx_positions, rx_positions, frequency_hz):
+    """Return k_c/3 max_pq,edge |L(mid) - (L(v_i)+L(v_j))/2|.
+
+    Distance is convex along each edge, so both leg errors have the same sign.
+    The exact maximum over Tx/Rx pairs is therefore the sum of the separate
+    endpoint maxima for each edge; no pairwise PO integrations are involved.
+    """
+    triangles = np.asarray(triangles, dtype=np.float64).reshape(-1, 3, 3)
+    midpoints = 0.5 * (triangles + triangles[:, [1, 2, 0]])
+    max_error = np.zeros((2, len(triangles), 3), dtype=np.float64)
+    for leg, endpoints in enumerate((tx_positions, rx_positions)):
+        for endpoint in np.asarray(endpoints, dtype=np.float64).reshape(-1, 3):
+            distances = np.linalg.norm(triangles - endpoint, axis=-1)
+            error = 0.5 * (distances + distances[:, [1, 2, 0]]) - np.linalg.norm(
+                midpoints - endpoint, axis=-1
+            )
+            np.maximum(max_error[leg], error, out=max_error[leg])
+    return (2.0 * pi * float(frequency_hz) / (3.0 * c)) * np.max(max_error.sum(axis=0), axis=1)
+
+
+def _triangle_linear_phase_span_rad(triangles, tx_positions, rx_positions, frequency_hz):
+    """Worst Tx/Rx span of the centroid-linearized phase over the vertices.
+
+    A linear function's span on a triangle is its largest absolute edge
+    increment. Endpoint projection extrema give the exact maximum over all
+    Tx/Rx combinations without constructing a pair-by-face tensor.
+    """
+    triangles = np.asarray(triangles, dtype=np.float64).reshape(-1, 3, 3)
+    centers = triangles.mean(axis=1)
+    edges = triangles[:, [1, 2, 0]] - triangles
+    minima = np.full((2, len(triangles), 3), np.inf)
+    maxima = np.full_like(minima, -np.inf)
+    for leg, endpoints in enumerate((tx_positions, rx_positions)):
+        for endpoint in np.asarray(endpoints, dtype=np.float64).reshape(-1, 3):
+            vectors = endpoint - centers
+            directions = vectors / np.maximum(np.linalg.norm(vectors, axis=1)[:, None], 1e-18)
+            projections = np.einsum("ned,nd->ne", edges, directions)
+            np.minimum(minima[leg], projections, out=minima[leg])
+            np.maximum(maxima[leg], projections, out=maxima[leg])
+    span = np.max(np.maximum(maxima.sum(axis=0), -minima.sum(axis=0)), axis=1)
+    return (2.0 * pi * float(frequency_hz) / c) * span
+
+
 def _phase_center_delays_for_centroids(
     centroids: np.ndarray,
     tx_position: np.ndarray,
@@ -791,6 +961,10 @@ def _aggregate_parent_face_quadrature_contributions(
     precision: ComputePrecision,
     chunk_size: int = PARENT_QUADRATURE_CONTRIBUTION_CHUNK_SIZE,
     progress_callback: Callable[[dict], None] | None = None,
+    polarization_axis: np.ndarray | None = None,
+    polarization_callback: PolarizationCallback | None = None,
+    delay_response: PODelayResponse | None = None,
+    delay_path_indices: np.ndarray | None = None,
 ) -> np.ndarray:
     """Sums temporary quadrature subface PO terms onto parent face ids.
 
@@ -813,17 +987,20 @@ def _aggregate_parent_face_quadrature_contributions(
     parent_positions = np.searchsorted(selected_parent_indices, path_face_indices)
     valid = parent_positions < selected_parent_indices.size
     matched = np.zeros(path_face_indices.shape, dtype=bool)
-    matched[valid] = (
-        selected_parent_indices[parent_positions[valid]]
-        == path_face_indices[valid]
-    )
+    matched[valid] = selected_parent_indices[parent_positions[valid]] == path_face_indices[valid]
     if not np.all(matched):
-        raise ValueError(
-            "quadrature path_face_indices must reference selected parent faces"
-        )
+        raise ValueError("quadrature path_face_indices must reference selected parent faces")
 
     effective_weights = np.asarray(effective_weights, dtype=float_dtype).reshape(-1)
+    runtime = resolve_torch_runtime(backend, precision)
     max_chunk = max(1, int(chunk_size))
+    if delay_response is not None:
+        max_chunk = min(max_chunk, 32768)
+    response_indices = (
+        np.arange(selected_parent_indices.size)
+        if delay_path_indices is None
+        else np.asarray(delay_path_indices)
+    )
     chunk_total = int((path_face_indices.size + max_chunk - 1) // max_chunk)
     if progress_callback is not None:
         parent_subface_totals = np.bincount(
@@ -831,15 +1008,17 @@ def _aggregate_parent_face_quadrature_contributions(
             minlength=selected_parent_indices.size,
         )
         parent_subfaces_done = np.zeros_like(parent_subface_totals)
-        progress_callback({
-            "stage": "quadrature_aggregate_start",
-            "parent_faces_processed": 0,
-            "parent_faces_total": int(selected_parent_indices.size),
-            "subfaces_processed": 0,
-            "subfaces_total": int(path_face_indices.size),
-            "chunk_index": 0,
-            "chunk_total": chunk_total,
-        })
+        progress_callback(
+            {
+                "stage": "quadrature_aggregate_start",
+                "parent_faces_processed": 0,
+                "parent_faces_total": int(selected_parent_indices.size),
+                "subfaces_processed": 0,
+                "subfaces_total": int(path_face_indices.size),
+                "chunk_index": 0,
+                "chunk_total": chunk_total,
+            }
+        )
     for start in range(0, path_face_indices.size, max_chunk):
         stop = min(start + max_chunk, path_face_indices.size)
         local_indices = np.arange(stop - start, dtype=np.int64)
@@ -857,34 +1036,54 @@ def _aggregate_parent_face_quadrature_contributions(
             weights=effective_weights[chunk_parent_indices],
             backend=backend,
             precision=precision,
+            polarization_axis=polarization_axis,
+            polarization_callback=polarization_callback,
         )
+        if delay_response is not None:
+            points = integration_centroids[start:stop]
+            sample_delays = (
+                np.linalg.norm(points - tx_phase_center, axis=1)
+                + np.linalg.norm(points - rx_phase_center, axis=1)
+            ) / c
+            delay_response.accumulate(
+                chunk_contrib,
+                sample_delays,
+                response_indices[chunk_parent_positions],
+                backend=backend,
+                precision=precision,
+                runtime=runtime,
+            )
         np.add.at(contributions, chunk_parent_positions, chunk_contrib)
         if progress_callback is not None:
             parent_subfaces_done += np.bincount(
                 chunk_parent_positions,
                 minlength=selected_parent_indices.size,
             )
-            progress_callback({
-                "stage": "quadrature_aggregate_progress",
-                "parent_faces_processed": int(np.count_nonzero(
-                    parent_subfaces_done >= parent_subface_totals
-                )),
-                "parent_faces_total": int(selected_parent_indices.size),
-                "subfaces_processed": int(stop),
-                "subfaces_total": int(path_face_indices.size),
-                "chunk_index": int(start // max_chunk + 1),
-                "chunk_total": chunk_total,
-            })
+            progress_callback(
+                {
+                    "stage": "quadrature_aggregate_progress",
+                    "parent_faces_processed": int(
+                        np.count_nonzero(parent_subfaces_done >= parent_subface_totals)
+                    ),
+                    "parent_faces_total": int(selected_parent_indices.size),
+                    "subfaces_processed": int(stop),
+                    "subfaces_total": int(path_face_indices.size),
+                    "chunk_index": int(start // max_chunk + 1),
+                    "chunk_total": chunk_total,
+                }
+            )
     if progress_callback is not None:
-        progress_callback({
-            "stage": "quadrature_aggregate_done",
-            "parent_faces_processed": int(selected_parent_indices.size),
-            "parent_faces_total": int(selected_parent_indices.size),
-            "subfaces_processed": int(path_face_indices.size),
-            "subfaces_total": int(path_face_indices.size),
-            "chunk_index": chunk_total,
-            "chunk_total": chunk_total,
-        })
+        progress_callback(
+            {
+                "stage": "quadrature_aggregate_done",
+                "parent_faces_processed": int(selected_parent_indices.size),
+                "parent_faces_total": int(selected_parent_indices.size),
+                "subfaces_processed": int(path_face_indices.size),
+                "subfaces_total": int(path_face_indices.size),
+                "chunk_index": chunk_total,
+                "chunk_total": chunk_total,
+            }
+        )
     return contributions
 
 
@@ -909,10 +1108,8 @@ def _standard_simplex_exp_integral(
         for order in range(8):
             powers = np.zeros(a.shape, dtype=np.float64)
             for m in range(order + 1):
-                powers += (a ** m) * (b ** (order - m))
-            series += ((-1j) ** order) * powers / float(
-                math.factorial(order + 2)
-            )
+                powers += (a**m) * (b ** (order - m))
+            series += ((-1j) ** order) * powers / float(math.factorial(order + 2))
         result[small] = series
     regular = ~small
     if np.any(regular):
@@ -939,11 +1136,48 @@ def _standard_simplex_exp_integral(
     return result
 
 
+def _standard_simplex_exp_integral_torch(alpha, beta):
+    """Analytic simplex integral on the input tensors' device and precision."""
+    import torch
+
+    alpha, beta = torch.broadcast_tensors(alpha, beta)
+    # The regular expression subtracts nearly equal terms near zero. A wider
+    # series region controls cancellation when computing in float32.
+    threshold = 0.1 if alpha.dtype == torch.float32 else 1e-4
+    small = torch.maximum(alpha.abs(), beta.abs()) < threshold
+    use_beta = beta.abs() >= alpha.abs()
+    a = torch.where(use_beta, alpha, beta)
+    b = torch.where(small, torch.ones_like(beta), torch.where(use_beta, beta, alpha))
+
+    def interval(argument):
+        return torch.exp(-0.5j * argument) * torch.sinc(argument / (2.0 * pi))
+
+    result = (interval(a) - torch.exp(-1j * b) * interval(a - b)) / (1j * b)
+    a, b = alpha[small], beta[small]
+    if a.numel():
+        # h_n = sum(a**m * b**(n-m)); avoid repeated powers in the series.
+        h_previous, h_before_previous = torch.ones_like(a), torch.zeros_like(a)
+        series = 0.5 * h_previous.to(result.dtype)
+        for order in range(1, 8):
+            h = (a + b) * h_previous - a * b * h_before_previous
+            series += ((-1j) ** order / math.factorial(order + 2)) * h
+            h_before_previous, h_previous = h_previous, h
+        result[small] = series
+    return result
+
+
 def _triangle_linear_phase_integrals(
     triangles: np.ndarray,
     centroids: np.ndarray,
     q_vectors: np.ndarray,
 ) -> np.ndarray:
+    return _triangle_phase_integrals_from_geometry(
+        _triangle_linear_phase_geometry(triangles, centroids, q_vectors)
+    )
+
+
+def _triangle_linear_phase_geometry(triangles, centroids, q_vectors):
+    """Prepare triangle Jacobians and phase coordinates once per geometry."""
     triangles = np.asarray(triangles, dtype=np.float64).reshape(-1, 3, 3)
     centroids = np.asarray(centroids, dtype=np.float64).reshape(-1, 3)
     q_vectors = np.asarray(q_vectors, dtype=np.float64)
@@ -956,10 +1190,29 @@ def _triangle_linear_phase_integrals(
     alpha = np.einsum("pfd,fd->pf", q_vectors, edge_a)
     beta = np.einsum("pfd,fd->pf", q_vectors, edge_b)
     offset_phase = np.einsum("pfd,fd->pf", q_vectors, v0 - centroids)
+    return jacobian, alpha, beta, offset_phase
+
+
+def _triangle_phase_integrals_from_geometry(geometry, scale=1.0, *, runtime=None):
+    """Evaluate cached phase coordinates at broadcast wavenumber scales."""
+    if runtime is not None:
+        import torch
+
+        jacobian, alpha, beta, offset_phase = (
+            torch.as_tensor(value, dtype=runtime.float_dtype, device=runtime.device)
+            for value in geometry
+        )
+        scale = torch.as_tensor(scale, dtype=runtime.float_dtype, device=runtime.device)
+        return (
+            jacobian[None]
+            * torch.exp(-1j * (scale * offset_phase))
+            * _standard_simplex_exp_integral_torch(scale * alpha, scale * beta)
+        )
+    jacobian, alpha, beta, offset_phase = geometry
     return (
         jacobian[None, :]
-        * np.exp(-1j * offset_phase)
-        * _standard_simplex_exp_integral(alpha, beta)
+        * np.exp(-1j * (scale * offset_phase))
+        * _standard_simplex_exp_integral(scale * alpha, scale * beta)
     )
 
 
@@ -980,6 +1233,10 @@ def _aggregate_parent_face_far_field_analytic_contributions(
     precision: ComputePrecision,
     chunk_size: int = PARENT_QUADRATURE_CONTRIBUTION_CHUNK_SIZE,
     progress_callback: Callable[[dict], None] | None = None,
+    polarization_axis: np.ndarray | None = None,
+    polarization_callback: PolarizationCallback | None = None,
+    delay_response: PODelayResponse | None = None,
+    delay_path_indices: np.ndarray | None = None,
 ) -> np.ndarray:
     """Sums analytic linear-phase subface PO terms onto parent face ids."""
 
@@ -996,17 +1253,20 @@ def _aggregate_parent_face_far_field_analytic_contributions(
     parent_positions = np.searchsorted(selected_parent_indices, path_face_indices)
     valid = parent_positions < selected_parent_indices.size
     matched = np.zeros(path_face_indices.shape, dtype=bool)
-    matched[valid] = (
-        selected_parent_indices[parent_positions[valid]]
-        == path_face_indices[valid]
-    )
+    matched[valid] = selected_parent_indices[parent_positions[valid]] == path_face_indices[valid]
     if not np.all(matched):
-        raise ValueError(
-            "far-field path_face_indices must reference selected parent faces"
-        )
+        raise ValueError("far-field path_face_indices must reference selected parent faces")
 
     effective_weights = np.asarray(effective_weights, dtype=float_dtype).reshape(-1)
+    runtime = resolve_torch_runtime(backend, precision)
     max_chunk = max(1, int(chunk_size))
+    if delay_response is not None:
+        max_chunk = min(max_chunk, 32768, max(1, 1_000_000 // len(delay_response.frequencies_hz)))
+    response_indices = (
+        np.arange(selected_parent_indices.size)
+        if delay_path_indices is None
+        else np.asarray(delay_path_indices)
+    )
     chunk_total = int((path_face_indices.size + max_chunk - 1) // max_chunk)
     if progress_callback is not None:
         parent_subface_totals = np.bincount(
@@ -1014,18 +1274,19 @@ def _aggregate_parent_face_far_field_analytic_contributions(
             minlength=selected_parent_indices.size,
         )
         parent_subfaces_done = np.zeros_like(parent_subface_totals)
-        progress_callback({
-            "stage": "far_field_aggregate_start",
-            "parent_faces_processed": 0,
-            "parent_faces_total": int(selected_parent_indices.size),
-            "subfaces_processed": 0,
-            "subfaces_total": int(path_face_indices.size),
-            "chunk_index": 0,
-            "chunk_total": chunk_total,
-        })
+        progress_callback(
+            {
+                "stage": "far_field_aggregate_start",
+                "parent_faces_processed": 0,
+                "parent_faces_total": int(selected_parent_indices.size),
+                "subfaces_processed": 0,
+                "subfaces_total": int(path_face_indices.size),
+                "chunk_index": 0,
+                "chunk_total": chunk_total,
+            }
+        )
     wavelength_m = c / float(frequency_hz)
     k0 = 2.0 * pi / wavelength_m
-    phase_sign = -1.0 if _use_torch_backend(backend, precision) else 1.0
     tx_phase_center = np.asarray(tx_phase_center, dtype=np.float64).reshape(3)
     rx_phase_center = np.asarray(rx_phase_center, dtype=np.float64).reshape(3)
     for start in range(0, path_face_indices.size, max_chunk):
@@ -1047,6 +1308,8 @@ def _aggregate_parent_face_far_field_analytic_contributions(
             weights=effective_weights[chunk_parent_indices],
             backend=backend,
             precision=precision,
+            polarization_axis=polarization_axis,
+            polarization_callback=polarization_callback,
         )
         tx_vec = tx_phase_center[None, :] - chunk_centroids
         rx_vec = rx_phase_center[None, :] - chunk_centroids
@@ -1054,18 +1317,57 @@ def _aggregate_parent_face_far_field_analytic_contributions(
         rx_dist = np.linalg.norm(rx_vec, axis=1)
         tx_hat = tx_vec / np.maximum(tx_dist[:, None], 1e-18)
         rx_hat = rx_vec / np.maximum(rx_dist[:, None], 1e-18)
-        q_vectors = phase_sign * k0 * (tx_hat + rx_hat)[None, :, :]
-        integrals = _triangle_linear_phase_integrals(
+        # The integral evaluates exp(-j q·delta), while the local path length
+        # is L(delta) = L(0) - (tx_hat + rx_hat)·delta.
+        q_vectors = -k0 * (tx_hat + rx_hat)[None, :, :]
+        phase_geometry = _triangle_linear_phase_geometry(
             integration_triangles[start:stop],
             chunk_centroids,
             q_vectors,
-        ).reshape(-1)
-        area_ratio = np.divide(
-            integrals,
-            chunk_areas,
-            out=np.zeros_like(integrals),
-            where=chunk_areas > 0.0,
-        ).astype(complex_dtype)
+        )
+        # Keep analytic evaluation and leaf reduction on the configured device.
+        # The first scale supplies the carrier term; remaining scales supply
+        # the wideband nodes, without copying per-leaf integrals back to CPU.
+        scales = np.ones(1)
+        if delay_response is not None:
+            scales = np.concatenate(
+                (scales, (k0 + 2.0 * pi * delay_response.frequencies_hz / c) / k0)
+            )
+        integrals = _triangle_phase_integrals_from_geometry(
+            phase_geometry, scales[:, None, None], runtime=runtime
+        )[:, 0, :]
+        if runtime is None:
+            ratios = np.divide(
+                integrals, chunk_areas, out=np.zeros_like(integrals), where=chunk_areas > 0.0
+            )
+            area_ratio = ratios[0].astype(complex_dtype)
+        else:
+            import torch
+
+            areas_t = torch.as_tensor(
+                chunk_areas, dtype=runtime.float_dtype, device=runtime.device
+            )
+            ratios = torch.where(
+                areas_t > 0.0, integrals / areas_t.clamp_min(1e-30), torch.zeros_like(integrals)
+            )
+            area_ratio = ratios[0].cpu().numpy().astype(complex_dtype, copy=False)
+        if delay_response is not None:
+            delay_response.accumulate(
+                chunk_contrib,
+                (tx_dist + rx_dist) / c,
+                response_indices[chunk_parent_positions],
+                phase_integrals=ratios[1:],
+                backend=backend,
+                precision=precision,
+                runtime=runtime,
+                vertex_delay_offsets_s=-np.einsum(
+                    "nvi,ni->nv",
+                    integration_triangles[start:stop] - chunk_centroids[:, None],
+                    tx_hat + rx_hat,
+                )
+                / c,
+                carrier_frequency_hz=frequency_hz,
+            )
         chunk_contrib = chunk_contrib.astype(complex_dtype, copy=False) * area_ratio
         np.add.at(contributions, chunk_parent_positions, chunk_contrib)
         if progress_callback is not None:
@@ -1073,27 +1375,31 @@ def _aggregate_parent_face_far_field_analytic_contributions(
                 chunk_parent_positions,
                 minlength=selected_parent_indices.size,
             )
-            progress_callback({
-                "stage": "far_field_aggregate_progress",
-                "parent_faces_processed": int(np.count_nonzero(
-                    parent_subfaces_done >= parent_subface_totals
-                )),
-                "parent_faces_total": int(selected_parent_indices.size),
-                "subfaces_processed": int(stop),
-                "subfaces_total": int(path_face_indices.size),
-                "chunk_index": int(start // max_chunk + 1),
-                "chunk_total": chunk_total,
-            })
+            progress_callback(
+                {
+                    "stage": "far_field_aggregate_progress",
+                    "parent_faces_processed": int(
+                        np.count_nonzero(parent_subfaces_done >= parent_subface_totals)
+                    ),
+                    "parent_faces_total": int(selected_parent_indices.size),
+                    "subfaces_processed": int(stop),
+                    "subfaces_total": int(path_face_indices.size),
+                    "chunk_index": int(start // max_chunk + 1),
+                    "chunk_total": chunk_total,
+                }
+            )
     if progress_callback is not None:
-        progress_callback({
-            "stage": "far_field_aggregate_done",
-            "parent_faces_processed": int(selected_parent_indices.size),
-            "parent_faces_total": int(selected_parent_indices.size),
-            "subfaces_processed": int(path_face_indices.size),
-            "subfaces_total": int(path_face_indices.size),
-            "chunk_index": chunk_total,
-            "chunk_total": chunk_total,
-        })
+        progress_callback(
+            {
+                "stage": "far_field_aggregate_done",
+                "parent_faces_processed": int(selected_parent_indices.size),
+                "parent_faces_total": int(selected_parent_indices.size),
+                "subfaces_processed": int(path_face_indices.size),
+                "subfaces_total": int(path_face_indices.size),
+                "chunk_index": chunk_total,
+                "chunk_total": chunk_total,
+            }
+        )
     return contributions
 
 
@@ -1119,8 +1425,41 @@ def vector_facet_channel(
         frequency_hz=frequency_hz,
         material=material,
     )
-    return complex(np.sum(contributions)), int(np.count_nonzero(np.abs(
-        contributions) > 0.0))
+    return complex(np.sum(contributions)), int(np.count_nonzero(np.abs(contributions) > 0.0))
+
+
+def _reciprocal_facet_kernel(
+    tx_hat, rx_hat, normals, tx_pol, rx_pol, material, frequency_hz, preferred_axis
+):
+    """Reciprocal tangent-plane scattering dyadic projected onto antenna fields.
+
+    Symmetrize the local dielectric PO dyadic with its reciprocal transpose,
+    before integration. This preserves the monostatic and specular limits.
+    Receive fields use a Hermitian projection, hence conjugate both fields
+    when exchanging the source and receiver in the reciprocal term.
+    """
+    eta0 = 1.0 / (c * epsilon_0)
+    result = np.zeros(tx_hat.shape[0], dtype=np.complex128)
+    for source, observer, incident, receive in (
+        (tx_hat, rx_hat, tx_pol, rx_pol),
+        (rx_hat, tx_hat, rx_pol.conjugate(), tx_pol.conjugate()),
+    ):
+        cosine = np.einsum("ij,ij->i", normals, source)
+        r_te, r_tm = fresnel_coefficients(cosine, material, frequency_hz)
+        attenuation = coherent_surface_attenuation(cosine, material, frequency_hz)
+        k_inc = -source
+        k_ref = k_inc - 2.0 * np.einsum("ij,ij->i", k_inc, normals)[:, None] * normals
+        te, tm_inc = _local_incidence_bases(k_inc, normals, preferred_axis)
+        tm_ref = _normalize_rows(np.cross(te, k_ref), fallback=tm_inc)
+        e_ref = attenuation[:, None] * (
+            (r_te * np.einsum("ij,ij->i", incident, te))[:, None] * te
+            + (r_tm * np.einsum("ij,ij->i", incident, tm_inc))[:, None] * tm_ref
+        )
+        j = np.cross(normals, np.cross(k_ref, e_ref) / eta0)
+        m = -np.cross(normals, e_ref)
+        radiation = eta0 * np.cross(observer, np.cross(observer, j)) + np.cross(observer, m)
+        result += 0.5 * (cosine > 0.0) * np.einsum("ij,ij->i", receive.conjugate(), radiation)
+    return result
 
 
 def vector_facet_face_contributions(
@@ -1136,17 +1475,35 @@ def vector_facet_face_contributions(
     weights: np.ndarray | None = None,
     backend: ComputeBackend = "numpy",
     precision: ComputePrecision = "float64",
+    polarization_axis: np.ndarray | None = None,
+    polarization_callback: PolarizationCallback | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Returns per-face PO contributions and delays for one Tx/Rx pair."""
+    """Return facet fields projected onto the Tx/Rx polarization responses.
+
+    The optional callback receives selected integration points and returns
+    complex incident and receive polarization vectors there. Their magnitudes
+    carry reflection loss and must not be normalized. The receive projection
+    uses the Hermitian inner product, as for ordinary antenna polarizations.
+    """
 
     float_dtype, complex_dtype = _numpy_dtypes_for_precision(precision)
+    validate_compute_backend(backend)
     face_indices = np.asarray(face_indices, dtype=np.int64).reshape(-1)
     if face_indices.size == 0:
         return (
             np.zeros((0,), dtype=complex_dtype),
             np.zeros((0,), dtype=float_dtype),
         )
-    if _use_torch_backend(backend, precision):
+    polarizations = None
+    if polarization_callback is not None:
+        vectors = polarization_callback(np.asarray(centroids)[face_indices])
+        polarizations = tuple(np.asarray(p, dtype=complex_dtype) for p in vectors)
+        if len(polarizations) != 2 or any(
+            p.shape != (face_indices.size, 3) for p in polarizations
+        ):
+            raise ValueError("polarization callback must return two [selected faces, 3] arrays")
+    runtime = resolve_torch_runtime(backend, precision)
+    if runtime is not None:
         return _torch_vector_facet_face_contributions(
             face_indices=face_indices,
             centroids=centroids,
@@ -1157,13 +1514,17 @@ def vector_facet_face_contributions(
             frequency_hz=frequency_hz,
             material=material,
             weights=weights,
-            precision=precision,
+            runtime=runtime,
+            polarization_axis=polarization_axis,
+            polarizations=polarizations,
         )
 
     wavelength_m = c / frequency_hz
     k0 = 2.0 * pi / wavelength_m
-    eta0 = 1.0 / (c * epsilon_0)
-    preferred_axis = np.array([0.0, 0.0, 1.0], dtype=float_dtype)
+    preferred_axis = np.asarray(
+        [0.0, 0.0, 1.0] if polarization_axis is None else polarization_axis,
+        dtype=float_dtype,
+    )
 
     c_sel = np.asarray(centroids, dtype=float_dtype)[face_indices]
     n_sel = np.asarray(normals, dtype=float_dtype)[face_indices]
@@ -1185,11 +1546,10 @@ def vector_facet_face_contributions(
     contributions = np.zeros(face_indices.shape, dtype=complex_dtype)
 
     cos_inc = np.einsum("ij,ij->i", n_sel, tx_hat)
-    illum_mask = (weights > 0.0) & (cos_inc > 0.0)
+    illum_mask = (weights > 0.0) & ((cos_inc > 0.0) | (np.einsum("ij,ij->i", n_sel, rx_hat) > 0.0))
     if not np.any(illum_mask):
         return contributions, delays_s.astype(float_dtype)
 
-    c_vis = c_sel[illum_mask]
     n_vis = n_sel[illum_mask]
     a_vis = a_sel[illum_mask]
     w_vis = weights[illum_mask]
@@ -1197,75 +1557,34 @@ def vector_facet_face_contributions(
     rx_hat_vis = rx_hat[illum_mask]
     tx_dist_vis = tx_dist[illum_mask]
     rx_dist_vis = rx_dist[illum_mask]
-    cos_inc_vis = cos_inc[illum_mask]
 
-    r_te, r_tm = fresnel_coefficients(
-        cos_theta=cos_inc_vis,
-        material=material,
-        frequency_hz=frequency_hz,
+    if polarizations is None:
+        tx_pol = _transverse_polarizations(-tx_hat_vis, preferred_axis)
+        rx_pol = _transverse_polarizations(rx_hat_vis, preferred_axis)
+    else:
+        tx_pol, rx_pol = (p[illum_mask] for p in polarizations)
+    kernel = _reciprocal_facet_kernel(
+        tx_hat_vis,
+        rx_hat_vis,
+        n_vis,
+        tx_pol,
+        rx_pol,
+        material,
+        frequency_hz,
+        preferred_axis,
     )
-    attenuation = coherent_surface_attenuation(
-        cos_theta=cos_inc_vis,
-        material=material,
-        frequency_hz=frequency_hz,
-    )
-    r_te = r_te * attenuation
-    r_tm = r_tm * attenuation
-
-    k_hat_inc = -tx_hat_vis
-    k_hat_refl = k_hat_inc - 2.0 * np.einsum(
-        "ij,ij->i", k_hat_inc, n_vis
-    )[:, None] * n_vis
-    te_hat, tm_inc_hat = _local_incidence_bases(
-        k_hat_inc=k_hat_inc,
-        normals=n_vis,
-        preferred_axis=preferred_axis,
-    )
-    tm_ref_hat = _normalize_rows(
-        np.cross(te_hat, k_hat_refl),
-        fallback=tm_inc_hat,
-    )
-
-    tx_pol = _transverse_polarizations(k_hat_inc, preferred_axis=preferred_axis)
-    rx_pol = _transverse_polarizations(rx_hat_vis,
-                                       preferred_axis=preferred_axis)
-
-    e_te = np.einsum("ij,ij->i", tx_pol, te_hat)
-    e_tm = np.einsum("ij,ij->i", tx_pol, tm_inc_hat)
-    e_ref = (
-        (r_te * e_te)[:, None] * te_hat
-        + (r_tm * e_tm)[:, None] * tm_ref_hat
-    )
-    h_ref = np.cross(k_hat_refl, e_ref) / eta0
-
-    electric_current = np.cross(n_vis, h_ref)
-    magnetic_current = -np.cross(n_vis, e_ref)
-    radiation_kernel = (
-        eta0 * np.cross(rx_hat_vis, np.cross(rx_hat_vis, electric_current))
-        + np.cross(rx_hat_vis, magnetic_current)
-    )
-
-    # Path coefficients use the dechirped tx(t)*conj(rx(t)) ADC convention:
-    # increasing path length must produce a positive slow-time phase slope.
-    phase = np.exp(1j * k0 * (tx_dist_vis + rx_dist_vis))
-    scattering_amplitude = (
-        (-1j * k0)
-        * a_vis[:, None]
-        * w_vis[:, None]
-        * radiation_kernel
-        / (4.0 * pi)
-    )
-    channel_faces = (
+    # e^(j omega t): the outgoing Green function gives +jk times this kernel.
+    phase = np.exp(-1j * k0 * (tx_dist_vis + rx_dist_vis))
+    contributions[illum_mask] = (
         wavelength_m
-        * phase[:, None]
-        * scattering_amplitude
-        / ((4.0 * pi) * np.maximum(tx_dist_vis * rx_dist_vis, 1e-18))[:, None]
-    )
-    contributions[illum_mask] = np.einsum(
-        "ij,ij->i",
-        rx_pol.conjugate(),
-        channel_faces,
+        * phase
+        * (1j * k0)
+        * a_vis
+        * w_vis
+        * kernel
+        / (16.0 * pi**2 * np.maximum(tx_dist_vis * rx_dist_vis, 1e-18))
     ).astype(complex_dtype)
+
     return contributions, delays_s.astype(float_dtype)
 
 
@@ -1303,7 +1622,6 @@ def vector_facet_face_contributions_for_pairs(
 
     wavelength_m = c / frequency_hz
     k0 = 2.0 * pi / wavelength_m
-    eta0 = 1.0 / (c * epsilon_0)
     preferred_axis = np.array([0.0, 0.0, 1.0], dtype=float_dtype)
 
     c_sel = np.asarray(centroids, dtype=float_dtype)[face_indices]
@@ -1326,7 +1644,9 @@ def vector_facet_face_contributions_for_pairs(
     contributions = np.zeros((num_pairs, face_indices.size), dtype=complex_dtype)
 
     cos_inc = np.einsum("fn,pfn->pf", n_sel, tx_hat)
-    illum_mask = (weights[None, :] > 0.0) & (cos_inc > 0.0)
+    illum_mask = (weights[None, :] > 0.0) & (
+        (cos_inc > 0.0) | (np.einsum("fn,pfn->pf", n_sel, rx_hat) > 0.0)
+    )
     if not np.any(illum_mask):
         return contributions, delays_s.astype(float_dtype)
 
@@ -1338,74 +1658,30 @@ def vector_facet_face_contributions_for_pairs(
     rx_hat_vis = rx_hat[pair_indices, local_face_indices]
     tx_dist_vis = tx_dist[pair_indices, local_face_indices]
     rx_dist_vis = rx_dist[pair_indices, local_face_indices]
-    cos_inc_vis = cos_inc[pair_indices, local_face_indices]
 
-    r_te, r_tm = fresnel_coefficients(
-        cos_theta=cos_inc_vis,
-        material=material,
-        frequency_hz=frequency_hz,
+    tx_pol = _transverse_polarizations(-tx_hat_vis, preferred_axis)
+    rx_pol = _transverse_polarizations(rx_hat_vis, preferred_axis)
+    kernel = _reciprocal_facet_kernel(
+        tx_hat_vis,
+        rx_hat_vis,
+        n_vis,
+        tx_pol,
+        rx_pol,
+        material,
+        frequency_hz,
+        preferred_axis,
     )
-    attenuation = coherent_surface_attenuation(
-        cos_theta=cos_inc_vis,
-        material=material,
-        frequency_hz=frequency_hz,
-    )
-    r_te = r_te * attenuation
-    r_tm = r_tm * attenuation
-
-    k_hat_inc = -tx_hat_vis
-    k_hat_refl = k_hat_inc - 2.0 * np.einsum(
-        "ij,ij->i", k_hat_inc, n_vis
-    )[:, None] * n_vis
-    te_hat, tm_inc_hat = _local_incidence_bases(
-        k_hat_inc=k_hat_inc,
-        normals=n_vis,
-        preferred_axis=preferred_axis,
-    )
-    tm_ref_hat = _normalize_rows(
-        np.cross(te_hat, k_hat_refl),
-        fallback=tm_inc_hat,
-    )
-
-    tx_pol = _transverse_polarizations(k_hat_inc, preferred_axis=preferred_axis)
-    rx_pol = _transverse_polarizations(rx_hat_vis, preferred_axis=preferred_axis)
-
-    e_te = np.einsum("ij,ij->i", tx_pol, te_hat)
-    e_tm = np.einsum("ij,ij->i", tx_pol, tm_inc_hat)
-    e_ref = (
-        (r_te * e_te)[:, None] * te_hat
-        + (r_tm * e_tm)[:, None] * tm_ref_hat
-    )
-    h_ref = np.cross(k_hat_refl, e_ref) / eta0
-
-    electric_current = np.cross(n_vis, h_ref)
-    magnetic_current = -np.cross(n_vis, e_ref)
-    radiation_kernel = (
-        eta0 * np.cross(rx_hat_vis, np.cross(rx_hat_vis, electric_current))
-        + np.cross(rx_hat_vis, magnetic_current)
-    )
-
-    # Path coefficients use the dechirped tx(t)*conj(rx(t)) ADC convention:
-    # increasing path length must produce a positive slow-time phase slope.
-    phase = np.exp(1j * k0 * (tx_dist_vis + rx_dist_vis))
-    scattering_amplitude = (
-        (-1j * k0)
-        * a_vis[:, None]
-        * w_vis[:, None]
-        * radiation_kernel
-        / (4.0 * pi)
-    )
-    channel_faces = (
+    phase = np.exp(-1j * k0 * (tx_dist_vis + rx_dist_vis))
+    contributions[pair_indices, local_face_indices] = (
         wavelength_m
-        * phase[:, None]
-        * scattering_amplitude
-        / ((4.0 * pi) * np.maximum(tx_dist_vis * rx_dist_vis, 1e-18))[:, None]
-    )
-    contributions[pair_indices, local_face_indices] = np.einsum(
-        "ij,ij->i",
-        rx_pol.conjugate(),
-        channel_faces,
+        * phase
+        * (1j * k0)
+        * a_vis
+        * w_vis
+        * kernel
+        / (16.0 * pi**2 * np.maximum(tx_dist_vis * rx_dist_vis, 1e-18))
     ).astype(complex_dtype)
+
     return contributions, delays_s.astype(float_dtype)
 
 
@@ -1487,97 +1763,12 @@ def project_phase_center_contributions_to_virtual_channels(
     # This is a virtual-array approximation: do not recompute PO currents for
     # each Tx/Rx pair, but keep per-VC carrier phase, spreading, and tau_vc.
     k0 = 2.0 * pi * frequency_hz / c
-    # Match the dechirped ADC convention used by synthesize_adc_from_paths:
-    # positive phase slope maps to positive range rate in Doppler processing.
-    phase = np.exp(1j * k0 * (path_lengths - center_lengths[None, :]))
+    # Retain the physical channel's negative phase when changing path length.
+    phase = np.exp(-1j * k0 * (path_lengths - center_lengths[None, :]))
     spreading = center_spreads[None, :] / np.maximum(spreads, 1e-18)
-    coefficients = (
-        phase_center_contributions[None, :] * phase * spreading
-    ).astype(complex_dtype)
+    coefficients = (phase_center_contributions[None, :] * phase * spreading).astype(complex_dtype)
     delays_s = (path_lengths / c).astype(float_dtype)
     return coefficients, delays_s, path_lengths, spreads
-
-
-def _numpy_dtypes_for_precision(
-    precision: ComputePrecision,
-) -> tuple[np.dtype, np.dtype]:
-    """Maps compute precision names to NumPy real and complex dtypes."""
-
-    if precision == "float64":
-        return np.dtype(np.float64), np.dtype(np.complex128)
-    if precision == "float32":
-        return np.dtype(np.float32), np.dtype(np.complex64)
-    raise ValueError("precision must be 'float64' or 'float32'")
-
-
-def _torch_cuda_is_available(torch) -> bool:
-    """Returns whether CUDA can be queried and used without raising."""
-
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore")
-        try:
-            return bool(torch.cuda.is_available())
-        except (AssertionError, RuntimeError):
-            return False
-
-
-def _use_torch_backend(
-    backend: ComputeBackend,
-    precision: ComputePrecision = "float64",
-) -> bool:
-    """Decides whether vector PO should run on a Torch device."""
-
-    if backend == "numpy":
-        _numpy_dtypes_for_precision(precision)
-        return False
-    if backend not in ("auto", "torch"):
-        raise ValueError("backend must be 'auto', 'numpy', or 'torch'")
-    try:
-        import torch  # pylint: disable=import-outside-toplevel
-    except ImportError:
-        if backend == "torch":
-            raise
-        return False
-    _numpy_dtypes_for_precision(precision)
-    if backend == "torch":
-        return True
-    if _torch_cuda_is_available(torch):
-        return True
-    return _torch_mps_available_for_precision(torch, precision)
-
-
-def _torch_mps_available_for_precision(torch, precision: ComputePrecision) -> bool:
-    """Checks whether MPS supports the complex vector ops used by PO."""
-
-    if precision != "float32":
-        return False
-    mps_backend = getattr(torch.backends, "mps", None)
-    if mps_backend is None or not mps_backend.is_available():
-        return False
-    try:
-        probe = torch.ones((2, 3), dtype=torch.complex64, device="mps")
-        torch.exp(probe[:, 0])
-        torch.linalg.cross(probe, probe, dim=1)
-    except (RuntimeError, TypeError, NotImplementedError):
-        return False
-    return True
-
-
-def _torch_device_and_dtypes(precision: ComputePrecision):
-    """Selects a Torch device and matching Torch/NumPy dtypes."""
-
-    import torch  # pylint: disable=import-outside-toplevel
-
-    float_dtype, complex_dtype = _numpy_dtypes_for_precision(precision)
-    dtype = torch.float64 if precision == "float64" else torch.float32
-    cdtype = torch.complex128 if precision == "float64" else torch.complex64
-    if _torch_cuda_is_available(torch):
-        device = torch.device("cuda")
-    elif _torch_mps_available_for_precision(torch, precision):
-        device = torch.device("mps")
-    else:
-        device = torch.device("cpu")
-    return device, dtype, cdtype, float_dtype, complex_dtype
 
 
 def _torch_vector_facet_face_contributions(
@@ -1591,7 +1782,9 @@ def _torch_vector_facet_face_contributions(
     material: PhysicalOpticsMaterial,
     *,
     weights: np.ndarray | None = None,
-    precision: ComputePrecision = "float64",
+    runtime: TorchRuntime,
+    polarization_axis: np.ndarray | None = None,
+    polarizations: tuple[np.ndarray, np.ndarray] | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Torch implementation of per-face PO contributions.
 
@@ -1602,9 +1795,8 @@ def _torch_vector_facet_face_contributions(
 
     import torch  # pylint: disable=import-outside-toplevel
 
-    device, dtype, cdtype, float_dtype, complex_dtype = _torch_device_and_dtypes(
-        precision
-    )
+    device, dtype, cdtype = runtime.device, runtime.float_dtype, runtime.complex_dtype
+    float_dtype, complex_dtype = runtime.numpy_float_dtype, runtime.numpy_complex_dtype
 
     face_indices = np.asarray(face_indices, dtype=np.int64).reshape(-1)
     c_sel = torch.as_tensor(
@@ -1650,7 +1842,7 @@ def _torch_vector_facet_face_contributions(
     contributions = torch.zeros((face_indices.size,), dtype=cdtype, device=device)
 
     cos_inc = torch.sum(n_sel * tx_hat, dim=1)
-    illum_mask = (w_sel > 0.0) & (cos_inc > 0.0)
+    illum_mask = (w_sel > 0.0) & ((cos_inc > 0.0) | (torch.sum(n_sel * rx_hat, dim=1) > 0.0))
     if not bool(torch.any(illum_mask).item()):
         return (
             contributions.cpu().numpy().astype(complex_dtype),
@@ -1664,95 +1856,71 @@ def _torch_vector_facet_face_contributions(
     rx_hat_vis = rx_hat[illum_mask]
     tx_dist_vis = tx_dist[illum_mask]
     rx_dist_vis = rx_dist[illum_mask]
-    cos_inc_vis = cos_inc[illum_mask]
 
     wavelength_m = c / frequency_hz
     k0 = 2.0 * pi / wavelength_m
     eta0 = 1.0 / (c * epsilon_0)
-    preferred_axis = torch.tensor([0.0, 0.0, 1.0], dtype=dtype, device=device)
-
-    r_te, r_tm = _torch_fresnel_coefficients(
-        cos_theta=cos_inc_vis,
-        material=material,
-        frequency_hz=frequency_hz,
-        wavelength_m=wavelength_m,
-        cdtype=cdtype,
-    )
-    attenuation = _torch_coherent_surface_attenuation(
-        cos_theta=cos_inc_vis,
-        material=material,
-        frequency_hz=frequency_hz,
+    preferred_axis = torch.as_tensor(
+        [0.0, 0.0, 1.0] if polarization_axis is None else polarization_axis,
         dtype=dtype,
-        cdtype=cdtype,
-    )
-    r_te = r_te * attenuation.to(cdtype)
-    r_tm = r_tm * attenuation.to(cdtype)
-
-    k_hat_inc = -tx_hat_vis
-    k_hat_refl = k_hat_inc - 2.0 * torch.sum(
-        k_hat_inc * n_vis, dim=1
-    )[:, None] * n_vis
-    te_hat, tm_inc_hat = _torch_local_incidence_bases(
-        k_hat_inc=k_hat_inc,
-        normals=n_vis,
-        preferred_axis=preferred_axis,
-    )
-    tm_ref_hat = _torch_normalize_rows(
-        torch.linalg.cross(te_hat, k_hat_refl, dim=1),
-        fallback=tm_inc_hat,
+        device=device,
     )
 
-    tx_pol = _torch_transverse_polarizations(
-        k_hat_inc,
-        preferred_axis=preferred_axis,
-    )
-    rx_pol = _torch_transverse_polarizations(
-        rx_hat_vis,
-        preferred_axis=preferred_axis,
-    )
-
-    e_te = torch.sum(tx_pol * te_hat, dim=1).to(cdtype)
-    e_tm = torch.sum(tx_pol * tm_inc_hat, dim=1).to(cdtype)
-    e_ref = (
-        (r_te * e_te)[:, None] * te_hat.to(cdtype)
-        + (r_tm * e_tm)[:, None] * tm_ref_hat.to(cdtype)
-    )
-    h_ref = torch.linalg.cross(k_hat_refl.to(cdtype), e_ref, dim=1) / eta0
-
-    electric_current = torch.linalg.cross(n_vis.to(cdtype), h_ref, dim=1)
-    magnetic_current = -torch.linalg.cross(n_vis.to(cdtype), e_ref, dim=1)
-    rx_hat_c = rx_hat_vis.to(cdtype)
-    radiation_kernel = (
-        eta0
-        * torch.linalg.cross(
-            rx_hat_c,
-            torch.linalg.cross(rx_hat_c, electric_current, dim=1),
-            dim=1,
+    if polarizations is None:
+        tx_pol = _torch_transverse_polarizations(-tx_hat_vis, preferred_axis).to(cdtype)
+        rx_pol = _torch_transverse_polarizations(rx_hat_vis, preferred_axis).to(cdtype)
+    else:
+        tx_pol, rx_pol = (
+            torch.as_tensor(p, dtype=cdtype, device=device)[illum_mask] for p in polarizations
         )
-        + torch.linalg.cross(rx_hat_c, magnetic_current, dim=1)
+    kernel = torch.zeros_like(tx_dist_vis, dtype=cdtype)
+    for source, observer, incident, receive in (
+        (tx_hat_vis, rx_hat_vis, tx_pol, rx_pol),
+        (rx_hat_vis, tx_hat_vis, rx_pol.conj(), tx_pol.conj()),
+    ):
+        cosine = torch.sum(n_vis * source, dim=1)
+        r_te, r_tm = _torch_fresnel_coefficients(
+            cosine,
+            material,
+            frequency_hz,
+            wavelength_m,
+            cdtype,
+        )
+        attenuation = _torch_coherent_surface_attenuation(
+            cosine,
+            material,
+            frequency_hz,
+            dtype,
+            cdtype,
+        )
+        k_inc = -source
+        k_ref = k_inc - 2.0 * torch.sum(k_inc * n_vis, dim=1)[:, None] * n_vis
+        te, tm_inc = _torch_local_incidence_bases(k_inc, n_vis, preferred_axis)
+        tm_ref = _torch_normalize_rows(torch_vector_cross(te, k_ref, dim=1), fallback=tm_inc)
+        e_ref = attenuation[:, None] * (
+            (r_te * torch.sum(incident * te, dim=1))[:, None] * te
+            + (r_tm * torch.sum(incident * tm_inc, dim=1))[:, None] * tm_ref
+        )
+        n_c, k_c, o_c = n_vis.to(cdtype), k_ref.to(cdtype), observer.to(cdtype)
+        j = torch_vector_cross(n_c, torch_vector_cross(k_c, e_ref, dim=1) / eta0, dim=1)
+        m = -torch_vector_cross(n_c, e_ref, dim=1)
+        radiation = eta0 * torch_vector_cross(
+            o_c, torch_vector_cross(o_c, j, dim=1), dim=1
+        ) + torch_vector_cross(o_c, m, dim=1)
+        kernel += 0.5 * (cosine > 0.0) * torch.sum(receive.conj() * radiation, dim=1)
+    phase = torch.exp(
+        -1j * torch.as_tensor(k0, dtype=dtype, device=device) * (tx_dist_vis + rx_dist_vis)
+    ).to(cdtype)
+    contributions[illum_mask] = (
+        wavelength_m
+        * phase
+        * (1j * k0)
+        * a_vis
+        * w_vis
+        * kernel
+        / (16.0 * pi**2 * torch.clamp(tx_dist_vis * rx_dist_vis, min=1e-18))
     )
 
-    path_length = tx_dist_vis + rx_dist_vis
-    phase_arg = torch.as_tensor(-k0, dtype=dtype, device=device) * path_length
-    phase = torch.exp(1j * phase_arg).to(cdtype)
-    scattering_amplitude = (
-        torch.as_tensor(-1j * k0, dtype=cdtype, device=device)
-        * a_vis[:, None].to(cdtype)
-        * w_vis[:, None].to(cdtype)
-        * radiation_kernel
-        / (4.0 * pi)
-    )
-    spreading = torch.clamp(tx_dist_vis * rx_dist_vis, min=1e-18)
-    channel_faces = (
-        wavelength_m
-        * phase[:, None]
-        * scattering_amplitude
-        / ((4.0 * pi) * spreading)[:, None].to(cdtype)
-    )
-    contributions[illum_mask] = torch.sum(
-        torch.conj(rx_pol.to(cdtype)) * channel_faces,
-        dim=1,
-    )
     return (
         contributions.cpu().numpy().astype(complex_dtype),
         delays_s.cpu().numpy().astype(float_dtype),
@@ -1865,22 +2033,22 @@ def _torch_transverse_polarizations(propagation_hats, preferred_axis):
         min=1e-18,
     )
     polarization = preferred_axis[None, :] - (
-        torch.sum(propagation_hats * preferred_axis[None, :], dim=1)[:, None]
-        * propagation_hats
+        torch.sum(propagation_hats * preferred_axis[None, :], dim=1)[:, None] * propagation_hats
     )
     norms = torch.linalg.norm(polarization, dim=1)
     for alt in (
-        torch.tensor([0.0, 1.0, 0.0], dtype=propagation_hats.dtype,
-                     device=propagation_hats.device),
-        torch.tensor([1.0, 0.0, 0.0], dtype=propagation_hats.dtype,
-                     device=propagation_hats.device),
+        torch.tensor(
+            [0.0, 1.0, 0.0], dtype=propagation_hats.dtype, device=propagation_hats.device
+        ),
+        torch.tensor(
+            [1.0, 0.0, 0.0], dtype=propagation_hats.dtype, device=propagation_hats.device
+        ),
     ):
         missing = norms <= 1e-18
         if not bool(torch.any(missing).item()):
             break
         alt_pol = alt[None, :] - (
-            torch.sum(propagation_hats * alt[None, :], dim=1)[:, None]
-            * propagation_hats
+            torch.sum(propagation_hats * alt[None, :], dim=1)[:, None] * propagation_hats
         )
         polarization = torch.where(missing[:, None], alt_pol, polarization)
         norms = torch.linalg.norm(polarization, dim=1)
@@ -1892,9 +2060,11 @@ def _torch_local_incidence_bases(k_hat_inc, normals, preferred_axis):
 
     import torch  # pylint: disable=import-outside-toplevel
 
-    te_hat = torch.linalg.cross(k_hat_inc, normals, dim=1)
+    te_hat = torch_vector_cross(k_hat_inc, normals, dim=1)
     te_norms = torch.linalg.norm(te_hat, dim=1)
-    singular = te_norms <= 1e-18
+    # TE/TM are degenerate at normal incidence. Avoid amplifying roundoff in
+    # the almost-zero cross product when the entire scene is rotated.
+    singular = te_norms <= math.sqrt(torch.finfo(k_hat_inc.dtype).eps)
     if bool(torch.any(singular).item()):
         fallback_te = _torch_transverse_polarizations(
             k_hat_inc,
@@ -1903,7 +2073,7 @@ def _torch_local_incidence_bases(k_hat_inc, normals, preferred_axis):
         te_hat = torch.where(singular[:, None], fallback_te, te_hat)
         te_norms = torch.linalg.norm(te_hat, dim=1)
     te_hat = te_hat / torch.clamp(te_norms[:, None], min=1e-18)
-    tm_hat = torch.linalg.cross(te_hat, k_hat_inc, dim=1)
+    tm_hat = torch_vector_cross(te_hat, k_hat_inc, dim=1)
     tm_hat = _torch_normalize_rows(tm_hat, fallback=normals)
     return te_hat, tm_hat
 
@@ -1929,10 +2099,12 @@ class HumanVisibilityScene:
         mesh_params["faces"] = mi.UInt(self._faces.reshape(-1))
         mesh_params.update()
 
-        self._scene = mi.load_dict({
-            "type": "scene",
-            self._name: self._mesh,
-        })
+        self._scene = mi.load_dict(
+            {
+                "type": "scene",
+                self._name: self._mesh,
+            }
+        )
         self._scene_params = mi.traverse(self._scene)
 
     @property
@@ -1971,303 +2143,458 @@ def po_channel(
     visibility_state: FaceVisibilityState | None = None,
     visibility_scene: HumanVisibilityScene | None = None,
     static_visibility_scene=None,
-    visibility_samples_per_face: int = 4,
-    visibility_fade_chirps: int = 8,
-    visibility_use_phase_center: bool = True,
-    adaptive_visibility_sampling: bool = False,
-    adaptive_visibility_edge_margin: float = 0.15,
+    po_visibility_samples_per_face: int = 4,
+    visibility_fade_steps: int = 1,
+    visibility_fade_advance: bool = True,
+    po_adaptive_visibility_sampling: bool = True,
+    po_adaptive_visibility_edge_margin: float = 0.15,
     precomputed_raw_fractional_visibility: np.ndarray | None = None,
     precomputed_visible_sample_counts: np.ndarray | None = None,
     po_integration_mode: POIntegrationMode = "face_centroid",
-    po_quadrature_phase_span_scale_rad: float = 1.0,
+    po_quadrature_phase_span_scale_rad: float | None = None,
+    po_curvature_error_rad: float = 0.005,
     po_quadrature_max_refinement_depth: int = 16,
     po_quadrature_max_subfaces_per_parent: int = 0,
     progress_callback: Callable[[dict], None] | None = None,
     compute_backend: ComputeBackend = "numpy",
     compute_precision: ComputePrecision = "float64",
+    polarization_axis: np.ndarray | None = None,
+    max_frequency_offset_hz: float | None = None,
+    receiver_fmcw=None,
 ) -> POChannelResult:
     """Evaluates a human-only PO virtual channel over one chirp."""
-
-    float_dtype, complex_dtype = _numpy_dtypes_for_precision(compute_precision)
-    vertices = np.asarray(vertices, dtype=np.float64)
-    faces = np.asarray(faces, dtype=np.uint32)
-    tx_positions = np.asarray(tx_positions, dtype=np.float64)
-    rx_positions = np.asarray(rx_positions, dtype=np.float64)
-    if vertices.ndim != 2 or vertices.shape[1] != 3:
-        raise ValueError("vertices must have shape [num_vertices, 3]")
-    if faces.ndim != 2 or faces.shape[1] != 3:
-        raise ValueError("faces must have shape [num_faces, 3]")
-    if tx_positions.ndim != 2 or tx_positions.shape[1] != 3:
-        raise ValueError("tx_positions must have shape [num_tx, 3]")
-    if rx_positions.ndim != 2 or rx_positions.shape[1] != 3:
-        raise ValueError("rx_positions must have shape [num_rx, 3]")
-    if visibility_samples_per_face <= 0:
-        raise ValueError("visibility_samples_per_face must be positive")
-    if visibility_fade_chirps <= 0:
-        raise ValueError("visibility_fade_chirps must be positive")
-    if not visibility_use_phase_center:
-        raise NotImplementedError(
-            "Per-element visibility is not implemented in the Phase 1 PO mode"
-        )
-    if po_integration_mode not in (
-        "face_centroid",
-        "parent_face_quadrature",
-        "parent_face_far_field_analytic",
-    ):
-        raise ValueError(
-            "po_integration_mode must be 'face_centroid', "
-            "'parent_face_quadrature', or "
-            "'parent_face_far_field_analytic'"
-        )
-    if po_quadrature_phase_span_scale_rad <= 0.0:
-        raise ValueError("po_quadrature_phase_span_scale_rad must be positive")
-    if po_quadrature_max_refinement_depth < 0:
-        raise ValueError("po_quadrature_max_refinement_depth must be non-negative")
-    if po_quadrature_max_subfaces_per_parent < 0:
-        raise ValueError(
-            "po_quadrature_max_subfaces_per_parent must be non-negative"
-        )
-
-    po_material = _coerce_material(material)
-    centroids, normals, areas = face_geometry(vertices, faces)
-
-    num_faces = faces.shape[0]
-    raw_visibility = np.ones(num_faces, dtype=np.float64)
-    visible_sample_counts = np.full(
-        num_faces,
-        int(visibility_samples_per_face),
-        dtype=np.int64,
+    return evaluate_po_channel(
+        vertices,
+        faces,
+        settings=POChannelSettings(
+            array=POArraySettings(
+                tx_positions=tx_positions,
+                rx_positions=rx_positions,
+                frequency_hz=frequency_hz,
+                material=material,
+                virtual_channel_tx_indices=virtual_channel_tx_indices,
+                virtual_channel_rx_indices=virtual_channel_rx_indices,
+                virtual_channel_order=virtual_channel_order,
+                polarization_axis=polarization_axis,
+                max_frequency_offset_hz=max_frequency_offset_hz,
+                receiver_fmcw=receiver_fmcw,
+            ),
+            visibility=POVisibilitySettings(
+                visibility=visibility,
+                visibility_state=visibility_state,
+                visibility_scene=visibility_scene,
+                static_visibility_scene=static_visibility_scene,
+                po_visibility_samples_per_face=po_visibility_samples_per_face,
+                visibility_fade_steps=visibility_fade_steps,
+                visibility_fade_advance=visibility_fade_advance,
+                po_adaptive_visibility_sampling=po_adaptive_visibility_sampling,
+                po_adaptive_visibility_edge_margin=po_adaptive_visibility_edge_margin,
+                precomputed_raw_fractional_visibility=precomputed_raw_fractional_visibility,
+                precomputed_visible_sample_counts=precomputed_visible_sample_counts,
+            ),
+            integration=POIntegrationSettings(
+                po_integration_mode=po_integration_mode,
+                po_quadrature_phase_span_scale_rad=po_quadrature_phase_span_scale_rad,
+                po_curvature_error_rad=po_curvature_error_rad,
+                po_quadrature_max_refinement_depth=po_quadrature_max_refinement_depth,
+                po_quadrature_max_subfaces_per_parent=po_quadrature_max_subfaces_per_parent,
+            ),
+            compute=POComputeSettings(
+                progress_callback=progress_callback,
+                compute_backend=compute_backend,
+                compute_precision=compute_precision,
+            ),
+        ),
     )
-    if precomputed_raw_fractional_visibility is not None:
-        raw_visibility = np.asarray(
-            precomputed_raw_fractional_visibility,
-            dtype=np.float64,
-        ).reshape(-1)
-        if raw_visibility.shape != (num_faces,):
+
+
+def evaluate_po_channel(
+    vertices: np.ndarray, faces: np.ndarray, *, settings: POChannelSettings
+) -> POChannelResult:
+    """Run with grouped settings; the legacy keyword entry point remains supported."""
+    if not isinstance(settings, POChannelSettings):
+        raise TypeError("settings must be a POChannelSettings")
+    return _POChannelSolve(settings, vertices, faces).run()
+
+
+class _POChannelSolve:
+    """Per-run preparation, solver passes and result construction."""
+
+    def __init__(self, settings: POChannelSettings, vertices, faces):
+        self.settings = settings
+        self.po_quadrature_phase_span_scale_rad = (
+            self.settings.integration.po_quadrature_phase_span_scale_rad
+        )
+        self.rx_positions = self.settings.array.rx_positions
+        self.tx_positions = self.settings.array.tx_positions
+        self.visibility_scene = self.settings.visibility.visibility_scene
+        self.vertices = vertices
+        self.faces = faces
+        self.frequency_hz = self.settings.array.frequency_hz
+        self.po_visibility_samples_per_face = (
+            self.settings.visibility.po_visibility_samples_per_face
+        )
+        self.visibility_fade_steps = self.settings.visibility.visibility_fade_steps
+        self.po_integration_mode = self.settings.integration.po_integration_mode
+        self.po_curvature_error_rad = self.settings.integration.po_curvature_error_rad
+        self.po_quadrature_max_refinement_depth = (
+            self.settings.integration.po_quadrature_max_refinement_depth
+        )
+        self.po_quadrature_max_subfaces_per_parent = (
+            self.settings.integration.po_quadrature_max_subfaces_per_parent
+        )
+        self.compute_backend = self.settings.compute.compute_backend
+        self.compute_precision = self.settings.compute.compute_precision
+
+    def _stage_prepare(self):
+        """Prepare this run using its settings and prior stage outputs."""
+        validate_compute_backend(self.compute_backend)
+        self.float_dtype, complex_dtype = _numpy_dtypes_for_precision(self.compute_precision)
+        self.vertices = np.asarray(self.vertices, dtype=np.float64)
+        self.faces = np.asarray(self.faces, dtype=np.uint32)
+        self.tx_positions = np.asarray(self.tx_positions, dtype=np.float64)
+        self.rx_positions = np.asarray(self.rx_positions, dtype=np.float64)
+        if self.vertices.ndim != 2 or self.vertices.shape[1] != 3:
+            raise ValueError("vertices must have shape [num_vertices, 3]")
+        if self.faces.ndim != 2 or self.faces.shape[1] != 3:
+            raise ValueError("faces must have shape [num_faces, 3]")
+        if self.tx_positions.ndim != 2 or self.tx_positions.shape[1] != 3:
+            raise ValueError("tx_positions must have shape [num_tx, 3]")
+        if self.rx_positions.ndim != 2 or self.rx_positions.shape[1] != 3:
+            raise ValueError("rx_positions must have shape [num_rx, 3]")
+        if self.po_visibility_samples_per_face <= 0:
+            raise ValueError("po_visibility_samples_per_face must be positive")
+        if self.visibility_fade_steps <= 0:
+            raise ValueError("visibility_fade_steps must be positive")
+        if self.po_integration_mode not in (
+            "face_centroid",
+            "parent_face_quadrature",
+            "parent_face_adaptive_analytic",
+            "parent_face_far_field_analytic",
+        ):
             raise ValueError(
-                "precomputed_raw_fractional_visibility must have one entry per face"
+                "po_integration_mode must be 'face_centroid', "
+                "'parent_face_quadrature', 'parent_face_adaptive_analytic', or "
+                "'parent_face_far_field_analytic'"
             )
-        if not np.all(np.isfinite(raw_visibility)):
-            raise ValueError("precomputed_raw_fractional_visibility must be finite")
-        raw_visibility = np.clip(raw_visibility, 0.0, 1.0)
-        if precomputed_visible_sample_counts is None:
-            visible_sample_counts = np.rint(
-                raw_visibility * int(visibility_samples_per_face)
-            ).astype(np.int64)
-        else:
-            visible_sample_counts = np.asarray(
-                precomputed_visible_sample_counts,
-                dtype=np.int64,
+        if self.po_quadrature_phase_span_scale_rad is None:
+            self.po_quadrature_phase_span_scale_rad = default_phase_span_scale_rad(
+                self.po_integration_mode
+            )
+        if self.po_quadrature_phase_span_scale_rad <= 0.0:
+            raise ValueError("po_quadrature_phase_span_scale_rad must be positive")
+        if not np.isfinite(self.po_curvature_error_rad) or self.po_curvature_error_rad <= 0.0:
+            raise ValueError("po_curvature_error_rad must be finite and positive")
+        if self.po_quadrature_max_refinement_depth < 0:
+            raise ValueError("po_quadrature_max_refinement_depth must be non-negative")
+        if self.po_quadrature_max_subfaces_per_parent < 0:
+            raise ValueError("po_quadrature_max_subfaces_per_parent must be non-negative")
+
+        self.po_material = _coerce_material(self.settings.array.material)
+        self.centroids, self.normals, self.areas = face_geometry(self.vertices, self.faces)
+
+    def _stage_visibility(self):
+        """Visibility this run using its settings and prior stage outputs."""
+        num_faces = self.faces.shape[0]
+        self.raw_visibility = np.ones(num_faces, dtype=np.float64)
+        self.visible_sample_counts = np.full(
+            num_faces,
+            int(self.po_visibility_samples_per_face),
+            dtype=np.int64,
+        )
+        if self.settings.visibility.precomputed_raw_fractional_visibility is not None:
+            self.raw_visibility = np.asarray(
+                self.settings.visibility.precomputed_raw_fractional_visibility,
+                dtype=np.float64,
             ).reshape(-1)
-            if visible_sample_counts.shape != (num_faces,):
+            if self.raw_visibility.shape != (num_faces,):
                 raise ValueError(
-                    "precomputed_visible_sample_counts must have one entry per face"
+                    "precomputed_raw_fractional_visibility must have one entry per face"
                 )
-    elif visibility == "fractional_shadow_fade":
-        if visibility_scene is None:
-            visibility_scene = HumanVisibilityScene(
-                faces=faces,
-                vertices=vertices,
-                name="human-po-visibility",
+            if not np.all(np.isfinite(self.raw_visibility)):
+                raise ValueError("precomputed_raw_fractional_visibility must be finite")
+            self.raw_visibility = np.clip(self.raw_visibility, 0.0, 1.0)
+            if self.settings.visibility.precomputed_visible_sample_counts is None:
+                self.visible_sample_counts = np.rint(
+                    self.raw_visibility * int(self.po_visibility_samples_per_face)
+                ).astype(np.int64)
+            else:
+                self.visible_sample_counts = np.asarray(
+                    self.settings.visibility.precomputed_visible_sample_counts,
+                    dtype=np.int64,
+                ).reshape(-1)
+                if self.visible_sample_counts.shape != (num_faces,):
+                    raise ValueError(
+                        "precomputed_visible_sample_counts must have one entry per face"
+                    )
+        elif self.settings.visibility.visibility == "fractional_shadow_fade":
+            if self.visibility_scene is None:
+                self.visibility_scene = HumanVisibilityScene(
+                    faces=self.faces,
+                    vertices=self.vertices,
+                    name="human-po-visibility",
+                )
+            else:
+                self.visibility_scene.update_vertices(self.vertices)
+            self.tx_phase_center = np.mean(self.tx_positions, axis=0)
+            self.rx_phase_center = np.mean(self.rx_positions, axis=0)
+            self.raw_visibility, self.visible_sample_counts = _fractional_face_visibility(
+                vertices=self.vertices,
+                faces=self.faces,
+                face_normals=self.normals,
+                tx_position=self.tx_phase_center,
+                rx_position=self.rx_phase_center,
+                visibility_scene=self.visibility_scene,
+                static_visibility_scene=self.settings.visibility.static_visibility_scene,
+                samples_per_face=self.po_visibility_samples_per_face,
+                adaptive_edge_sampling=self.settings.visibility.po_adaptive_visibility_sampling,
+                edge_front_margin=self.settings.visibility.po_adaptive_visibility_edge_margin,
             )
-        else:
-            visibility_scene.update_vertices(vertices)
-        tx_phase_center = np.mean(tx_positions, axis=0)
-        rx_phase_center = np.mean(rx_positions, axis=0)
-        raw_visibility, visible_sample_counts = _fractional_face_visibility(
-            vertices=vertices,
-            faces=faces,
-            face_normals=normals,
-            tx_position=tx_phase_center,
-            rx_position=rx_phase_center,
-            visibility_scene=visibility_scene,
-            static_visibility_scene=static_visibility_scene,
-            samples_per_face=visibility_samples_per_face,
-            adaptive_edge_sampling=adaptive_visibility_sampling,
-            edge_front_margin=adaptive_visibility_edge_margin,
-        )
-    elif visibility != "none":
-        raise ValueError(
-            "visibility must be 'fractional_shadow_fade' or 'none'"
-        )
+        elif self.settings.visibility.visibility != "none":
+            raise ValueError("visibility must be 'fractional_shadow_fade' or 'none'")
 
-    fade_weights, latched_visibility = _update_visibility_state(
-        raw_fractional_visibility=raw_visibility,
-        state=visibility_state,
-        fade_chirps=visibility_fade_chirps,
-    )
-    effective_weights = latched_visibility * fade_weights
+        self.fade_weights, self.latched_visibility = _update_visibility_state(
+            raw_fractional_visibility=self.raw_visibility,
+            state=self.settings.visibility.visibility_state,
+            fade_chirps=self.visibility_fade_steps,
+            advance=self.settings.visibility.visibility_fade_advance,
+        )
+        self.effective_weights = self.latched_visibility * self.fade_weights
 
-    selected_face_indices = np.flatnonzero(effective_weights > 0.0)
-    tx_phase_center = np.mean(tx_positions, axis=0)
-    rx_phase_center = np.mean(rx_positions, axis=0)
-    far_field_max_edge_m = None
-    far_field_nearest_distance_m = None
-    if po_integration_mode == "parent_face_quadrature":
-        (
-            quadrature_centroids,
-            quadrature_normals,
-            quadrature_areas,
-            quadrature_parent_indices,
-        ) = parent_face_quadrature_geometry(
-            vertices=vertices,
-            faces=faces,
-            selected_parent_indices=selected_face_indices,
-            tx_positions=tx_positions,
-            rx_positions=rx_positions,
-            frequency_hz=frequency_hz,
-            phase_span_scale_rad=po_quadrature_phase_span_scale_rad,
-            max_refinement_depth=po_quadrature_max_refinement_depth,
-            max_subfaces_per_parent=po_quadrature_max_subfaces_per_parent,
-            progress_callback=progress_callback,
-        )
-        path_face_indices = selected_face_indices
-        integration_centroids = centroids[selected_face_indices]
-        integration_normals = normals[selected_face_indices]
-        integration_areas = areas[selected_face_indices]
-        phase_center_contrib = _aggregate_parent_face_quadrature_contributions(
-            selected_parent_indices=selected_face_indices,
-            integration_centroids=quadrature_centroids,
-            integration_normals=quadrature_normals,
-            integration_areas=quadrature_areas,
-            path_face_indices=quadrature_parent_indices,
-            effective_weights=effective_weights,
-            tx_phase_center=tx_phase_center,
-            rx_phase_center=rx_phase_center,
-            frequency_hz=frequency_hz,
-            material=po_material,
-            backend=compute_backend,
-            precision=compute_precision,
-            progress_callback=progress_callback,
-        )
-        phase_center_delays_s = _phase_center_delays_for_centroids(
-            integration_centroids,
-            tx_phase_center,
-            rx_phase_center,
-            compute_precision,
-        )
-    elif po_integration_mode == "parent_face_far_field_analytic":
-        (
-            far_field_centroids,
-            far_field_normals,
-            far_field_areas,
-            far_field_parent_indices,
-            far_field_triangles,
-            far_field_max_edge_m,
-            far_field_nearest_distance_m,
-        ) = parent_face_far_field_analytic_geometry(
-            vertices=vertices,
-            faces=faces,
-            selected_parent_indices=selected_face_indices,
-            tx_positions=tx_positions,
-            rx_positions=rx_positions,
-            frequency_hz=frequency_hz,
-            max_refinement_depth=po_quadrature_max_refinement_depth,
-            max_subfaces_per_parent=po_quadrature_max_subfaces_per_parent,
-            progress_callback=progress_callback,
-        )
-        path_face_indices = selected_face_indices
-        integration_centroids = centroids[selected_face_indices]
-        integration_normals = normals[selected_face_indices]
-        integration_areas = areas[selected_face_indices]
-        phase_center_contrib = (
-            _aggregate_parent_face_far_field_analytic_contributions(
+    def _stage_integrate(self):
+        """Integrate this run using its settings and prior stage outputs."""
+        selected_face_indices = np.flatnonzero(self.effective_weights > 0.0)
+        self.tx_phase_center = np.mean(self.tx_positions, axis=0)
+        self.rx_phase_center = np.mean(self.rx_positions, axis=0)
+        self.delay_response = None
+        if (
+            self.settings.array.max_frequency_offset_hz is not None
+            and self.po_integration_mode != "face_centroid"
+        ):
+            self.delay_response = PODelayResponse.for_mesh(
+                self.vertices,
+                self.faces,
+                selected_face_indices.size,
+                self.settings.array.max_frequency_offset_hz,
+                compute_precision=self.compute_precision,
+                receiver_fmcw=self.settings.array.receiver_fmcw,
+                channel_delay_margin_s=(
+                    np.max(np.linalg.norm(self.tx_positions - self.tx_phase_center, axis=1))
+                    + np.max(np.linalg.norm(self.rx_positions - self.rx_phase_center, axis=1))
+                )
+                / c,
+            )
+            self.delay_response.set_reference(
+                np.arange(selected_face_indices.size),
+                self.centroids[selected_face_indices],
+                self.tx_phase_center,
+                self.rx_phase_center,
+            )
+        self.far_field_max_edge_m = None
+        self.far_field_nearest_distance_m = None
+        if self.po_integration_mode == "parent_face_quadrature":
+            (
+                quadrature_centroids,
+                quadrature_normals,
+                quadrature_areas,
+                quadrature_parent_indices,
+            ) = parent_face_quadrature_geometry(
+                vertices=self.vertices,
+                faces=self.faces,
+                selected_parent_indices=selected_face_indices,
+                tx_positions=self.tx_positions,
+                rx_positions=self.rx_positions,
+                frequency_hz=self.frequency_hz,
+                phase_span_scale_rad=self.po_quadrature_phase_span_scale_rad,
+                max_refinement_depth=self.po_quadrature_max_refinement_depth,
+                max_subfaces_per_parent=self.po_quadrature_max_subfaces_per_parent,
+                progress_callback=self.settings.compute.progress_callback,
+            )
+            self.path_face_indices = selected_face_indices
+            self.integration_centroids = self.centroids[selected_face_indices]
+            self.integration_normals = self.normals[selected_face_indices]
+            self.integration_areas = self.areas[selected_face_indices]
+            self.phase_center_contrib = _aggregate_parent_face_quadrature_contributions(
+                selected_parent_indices=selected_face_indices,
+                integration_centroids=quadrature_centroids,
+                integration_normals=quadrature_normals,
+                integration_areas=quadrature_areas,
+                path_face_indices=quadrature_parent_indices,
+                effective_weights=self.effective_weights,
+                tx_phase_center=self.tx_phase_center,
+                rx_phase_center=self.rx_phase_center,
+                frequency_hz=self.frequency_hz,
+                material=self.po_material,
+                backend=self.compute_backend,
+                precision=self.compute_precision,
+                progress_callback=self.settings.compute.progress_callback,
+                polarization_axis=self.settings.array.polarization_axis,
+                delay_response=self.delay_response,
+            )
+            self.phase_center_delays_s = _phase_center_delays_for_centroids(
+                self.integration_centroids,
+                self.tx_phase_center,
+                self.rx_phase_center,
+                self.compute_precision,
+            )
+        elif self.po_integration_mode in (
+            "parent_face_adaptive_analytic",
+            "parent_face_far_field_analytic",
+        ):
+            geometry_kwargs = dict(
+                vertices=self.vertices,
+                faces=self.faces,
+                selected_parent_indices=selected_face_indices,
+                tx_positions=self.tx_positions,
+                rx_positions=self.rx_positions,
+                frequency_hz=self.frequency_hz,
+                max_refinement_depth=self.po_quadrature_max_refinement_depth,
+                max_subfaces_per_parent=self.po_quadrature_max_subfaces_per_parent,
+                progress_callback=self.settings.compute.progress_callback,
+            )
+            if self.po_integration_mode == "parent_face_adaptive_analytic":
+                (
+                    far_field_centroids,
+                    far_field_normals,
+                    far_field_areas,
+                    far_field_parent_indices,
+                    far_field_triangles,
+                ) = parent_face_adaptive_analytic_geometry(
+                    **geometry_kwargs,
+                    phase_span_scale_rad=self.po_quadrature_phase_span_scale_rad,
+                    curvature_error_rad=self.po_curvature_error_rad,
+                )
+            else:
+                (
+                    far_field_centroids,
+                    far_field_normals,
+                    far_field_areas,
+                    far_field_parent_indices,
+                    far_field_triangles,
+                    self.far_field_max_edge_m,
+                    self.far_field_nearest_distance_m,
+                ) = parent_face_far_field_analytic_geometry(**geometry_kwargs)
+            self.path_face_indices = selected_face_indices
+            self.integration_centroids = self.centroids[selected_face_indices]
+            self.integration_normals = self.normals[selected_face_indices]
+            self.integration_areas = self.areas[selected_face_indices]
+            self.phase_center_contrib = _aggregate_parent_face_far_field_analytic_contributions(
                 selected_parent_indices=selected_face_indices,
                 integration_triangles=far_field_triangles,
                 integration_centroids=far_field_centroids,
                 integration_normals=far_field_normals,
                 integration_areas=far_field_areas,
                 path_face_indices=far_field_parent_indices,
-                effective_weights=effective_weights,
-                tx_phase_center=tx_phase_center,
-                rx_phase_center=rx_phase_center,
-                frequency_hz=frequency_hz,
-                material=po_material,
-                backend=compute_backend,
-                precision=compute_precision,
-                progress_callback=progress_callback,
+                effective_weights=self.effective_weights,
+                tx_phase_center=self.tx_phase_center,
+                rx_phase_center=self.rx_phase_center,
+                frequency_hz=self.frequency_hz,
+                material=self.po_material,
+                backend=self.compute_backend,
+                precision=self.compute_precision,
+                progress_callback=self.settings.compute.progress_callback,
+                polarization_axis=self.settings.array.polarization_axis,
+                delay_response=self.delay_response,
             )
-        )
-        phase_center_delays_s = _phase_center_delays_for_centroids(
-            integration_centroids,
-            tx_phase_center,
-            rx_phase_center,
-            compute_precision,
-        )
-    else:
-        path_face_indices = selected_face_indices
-        integration_centroids = centroids[selected_face_indices]
-        integration_normals = normals[selected_face_indices]
-        integration_areas = areas[selected_face_indices]
-
-        local_indices = np.arange(path_face_indices.size, dtype=np.int64)
-        phase_center_contrib, phase_center_delays_s = (
-            vector_facet_face_contributions(
-                face_indices=local_indices,
-                centroids=integration_centroids,
-                normals=integration_normals,
-                areas=integration_areas,
-                tx_position=tx_phase_center,
-                rx_position=rx_phase_center,
-                frequency_hz=frequency_hz,
-                material=po_material,
-                weights=effective_weights[path_face_indices],
-                backend=compute_backend,
-                precision=compute_precision,
+            self.phase_center_delays_s = _phase_center_delays_for_centroids(
+                self.integration_centroids,
+                self.tx_phase_center,
+                self.rx_phase_center,
+                self.compute_precision,
             )
-        )
-    # Approximation: full PO is evaluated at the Tx/Rx phase center only.
-    # The virtual array response below is a geometric projection that preserves
-    # per-channel carrier phase, spreading, and delay.
-    coefficients, delays_s, _, _ = (
-        project_phase_center_contributions_to_virtual_channels(
-            phase_center_contrib,
-            integration_centroids,
-            tx_positions,
-            rx_positions,
-            frequency_hz,
-            virtual_channel_tx_indices=virtual_channel_tx_indices,
-            virtual_channel_rx_indices=virtual_channel_rx_indices,
-            virtual_channel_order=virtual_channel_order,
-            precision=compute_precision,
-        )
-    )
-    if coefficients.shape[0] == 1:
-        delays_s = np.asarray(phase_center_delays_s, dtype=float_dtype).reshape(-1)
+        else:
+            self.path_face_indices = selected_face_indices
+            self.integration_centroids = self.centroids[selected_face_indices]
+            self.integration_normals = self.normals[selected_face_indices]
+            self.integration_areas = self.areas[selected_face_indices]
 
-    state_out = FaceVisibilityState(
-        was_visible=raw_visibility > 0.0,
-        fade_weights=fade_weights.copy(),
-        latched_fractional_visibility=latched_visibility.copy(),
-    )
-    total_area = float(np.sum(areas))
-    if total_area > 0.0:
-        effective_visible_area_fraction = float(
-            np.sum(areas * effective_weights) / total_area
+            local_indices = np.arange(self.path_face_indices.size, dtype=np.int64)
+            self.phase_center_contrib, self.phase_center_delays_s = (
+                vector_facet_face_contributions(
+                    face_indices=local_indices,
+                    centroids=self.integration_centroids,
+                    normals=self.integration_normals,
+                    areas=self.integration_areas,
+                    tx_position=self.tx_phase_center,
+                    rx_position=self.rx_phase_center,
+                    frequency_hz=self.frequency_hz,
+                    material=self.po_material,
+                    weights=self.effective_weights[self.path_face_indices],
+                    backend=self.compute_backend,
+                    precision=self.compute_precision,
+                    polarization_axis=self.settings.array.polarization_axis,
+                )
+            )
+
+    def _stage_result(self):
+        """Result this run using its settings and prior stage outputs."""
+        coefficients, delays_s, _, _ = project_phase_center_contributions_to_virtual_channels(
+            self.phase_center_contrib,
+            self.integration_centroids,
+            self.tx_positions,
+            self.rx_positions,
+            self.frequency_hz,
+            virtual_channel_tx_indices=self.settings.array.virtual_channel_tx_indices,
+            virtual_channel_rx_indices=self.settings.array.virtual_channel_rx_indices,
+            virtual_channel_order=self.settings.array.virtual_channel_order,
+            precision=self.compute_precision,
         )
-    else:
-        effective_visible_area_fraction = 0.0
-    return POChannelResult(
-        coefficients=coefficients,
-        delays_s=delays_s,
-        face_indices=path_face_indices.astype(np.int64),
-        face_centroids=integration_centroids.copy(),
-        face_normals=integration_normals.copy(),
-        face_areas=integration_areas.copy(),
-        total_area=total_area,
-        effective_visible_area_fraction=effective_visible_area_fraction,
-        raw_fractional_visibility=raw_visibility,
-        latched_fractional_visibility=latched_visibility,
-        temporal_fade_weights=fade_weights,
-        effective_weights=effective_weights,
-        visible_sample_counts=visible_sample_counts,
-        sample_count_per_face=int(visibility_samples_per_face),
-        phase_center_contributions=phase_center_contrib,
-        phase_center_channel=complex(np.sum(phase_center_contrib)),
-        visibility_state=state_out,
-        far_field_max_edge_m=far_field_max_edge_m,
-        far_field_nearest_distance_m=far_field_nearest_distance_m,
-    )
+        if coefficients.shape[0] == 1:
+            delays_s = np.asarray(self.phase_center_delays_s, dtype=self.float_dtype).reshape(-1)
+
+        if self.delay_response is not None:
+            gains, _, _, _ = project_phase_center_contributions_to_virtual_channels(
+                np.ones(self.path_face_indices.size, complex),
+                self.integration_centroids,
+                self.tx_positions,
+                self.rx_positions,
+                self.frequency_hz,
+                virtual_channel_tx_indices=self.settings.array.virtual_channel_tx_indices,
+                virtual_channel_rx_indices=self.settings.array.virtual_channel_rx_indices,
+                virtual_channel_order=self.settings.array.virtual_channel_order,
+                precision=self.compute_precision,
+            )
+            self.delay_response = self.delay_response.with_channel_gains(gains)
+        state_out = FaceVisibilityState(
+            was_visible=self.raw_visibility > 0.0,
+            fade_weights=self.fade_weights.copy(),
+            latched_fractional_visibility=self.latched_visibility.copy(),
+        )
+        total_area = float(np.sum(self.areas))
+        if total_area > 0.0:
+            effective_visible_area_fraction = float(
+                np.sum(self.areas * self.effective_weights) / total_area
+            )
+        else:
+            effective_visible_area_fraction = 0.0
+        return POChannelResult(
+            coefficients=coefficients,
+            delays_s=delays_s,
+            face_indices=self.path_face_indices.astype(np.int64),
+            face_centroids=self.integration_centroids.copy(),
+            face_normals=self.integration_normals.copy(),
+            face_areas=self.integration_areas.copy(),
+            total_area=total_area,
+            effective_visible_area_fraction=effective_visible_area_fraction,
+            raw_fractional_visibility=self.raw_visibility,
+            latched_fractional_visibility=self.latched_visibility,
+            temporal_fade_weights=self.fade_weights,
+            effective_weights=self.effective_weights,
+            visible_sample_counts=self.visible_sample_counts,
+            sample_count_per_face=int(self.po_visibility_samples_per_face),
+            phase_center_contributions=self.phase_center_contrib,
+            phase_center_channel=complex(np.sum(self.phase_center_contrib)),
+            visibility_state=state_out,
+            far_field_max_edge_m=self.far_field_max_edge_m,
+            far_field_nearest_distance_m=self.far_field_nearest_distance_m,
+            delay_response=self.delay_response,
+        )
+
+    def run(self):
+        self._stage_prepare()
+        self._stage_visibility()
+        self._stage_integrate()
+        return self._stage_result()
 
 
 def _coerce_material(material) -> PhysicalOpticsMaterial:
@@ -2276,24 +2603,23 @@ def _coerce_material(material) -> PhysicalOpticsMaterial:
     if isinstance(material, PhysicalOpticsMaterial):
         return material
 
-    if all(hasattr(material, attr) for attr in (
-        "relative_permittivity",
-        "conductivity",
-        "thickness",
-    )):
+    if all(
+        hasattr(material, attr)
+        for attr in (
+            "relative_permittivity",
+            "conductivity",
+            "thickness",
+        )
+    ):
         return PhysicalOpticsMaterial(
-            relative_permittivity=float(np.asarray(
-                material.relative_permittivity).reshape(-1)[0]),
-            conductivity_s_per_m=float(np.asarray(
-                material.conductivity).reshape(-1)[0]),
+            relative_permittivity=float(np.asarray(material.relative_permittivity).reshape(-1)[0]),
+            conductivity_s_per_m=float(np.asarray(material.conductivity).reshape(-1)[0]),
             thickness_m=float(np.asarray(material.thickness).reshape(-1)[0]),
             model="slab",
             surface_attenuation_thickness_m=0.0,
         )
 
-    raise TypeError(
-        "material must be a PhysicalOpticsMaterial or a RadioMaterial-like object"
-    )
+    raise TypeError("material must be a PhysicalOpticsMaterial or a RadioMaterial-like object")
 
 
 def _normalize_rows(
@@ -2330,8 +2656,7 @@ def _transverse_polarizations(
     preferred_axis = preferred_axis / max(np.linalg.norm(preferred_axis), 1e-18)
 
     polarization = preferred_axis[None, :] - (
-        np.einsum("ij,j->i", propagation_hats, preferred_axis)[:, None]
-        * propagation_hats
+        np.einsum("ij,j->i", propagation_hats, preferred_axis)[:, None] * propagation_hats
     )
     norms = np.linalg.norm(polarization, axis=1)
 
@@ -2361,7 +2686,9 @@ def _local_incidence_bases(
 
     te_hat = np.cross(k_hat_inc, normals)
     te_norms = np.linalg.norm(te_hat, axis=1)
-    singular = te_norms <= 1e-18
+    # Near normal incidence both polarizations have the same physical action;
+    # use a stable transverse basis instead of normalizing cancellation noise.
+    singular = te_norms <= np.sqrt(np.finfo(np.asarray(k_hat_inc).dtype).eps)
     if np.any(singular):
         te_hat[singular] = _transverse_polarizations(
             k_hat_inc[singular],
@@ -2479,9 +2806,7 @@ def _fractional_face_visibility(
                 scene=visibility_scene.scene,
                 static_scene=static_visibility_scene,
             )
-            counts[candidate_indices] += (visible_tx & visible_rx).astype(
-                np.int64
-            )
+            counts[candidate_indices] += (visible_tx & visible_rx).astype(np.int64)
             sample_totals[candidate_indices] += 1
         return counts / np.maximum(sample_totals, 1), counts
 
@@ -2650,12 +2975,16 @@ def _update_visibility_state(
     raw_fractional_visibility: np.ndarray,
     state: FaceVisibilityState | None,
     fade_chirps: int,
+    advance: bool = True,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Updates visibility fade weights and latched fractional visibility."""
+    """Updates visibility fade weights and latched fractional visibility.
 
-    raw_fractional_visibility = np.asarray(
-        raw_fractional_visibility, dtype=np.float64
-    ).reshape(-1)
+    Each call with ``advance`` moves fading facets one step of
+    ``1/fade_chirps``. With ``advance`` false the previous weights are held,
+    so visibility stays constant within a frame.
+    """
+
+    raw_fractional_visibility = np.asarray(raw_fractional_visibility, dtype=np.float64).reshape(-1)
     raw_visible = raw_fractional_visibility > 0.0
     if state is None:
         fade_weights = raw_visible.astype(np.float64)
@@ -2674,6 +3003,9 @@ def _update_visibility_state(
     ):
         raise ValueError("visibility state shape mismatch")
 
+    if not advance:
+        return prev_fade.copy(), prev_latched.copy()
+
     step = 1.0 / float(fade_chirps)
     fade_weights = prev_fade.copy()
     latched = prev_latched.copy()
@@ -2683,11 +3015,7 @@ def _update_visibility_state(
     latched[fading_out & (prev_fade <= 0.0)] = 0.0
 
     currently_visible = raw_visible
-    continuing_visible = (
-        currently_visible
-        & prev_visible
-        & (prev_fade >= 1.0 - 1e-12)
-    )
+    continuing_visible = currently_visible & prev_visible & (prev_fade >= 1.0 - 1e-12)
     fade_weights[continuing_visible] = 1.0
     ramp_visible = currently_visible & ~continuing_visible
     fade_weights[ramp_visible] = np.minimum(prev_fade[ramp_visible] + step, 1.0)

@@ -14,14 +14,17 @@ import json
 from pathlib import Path
 from types import SimpleNamespace
 import threading
+import xml.etree.ElementTree as ET
 import zipfile
+
+from validation import simulation as _validation_simulation
 
 import numpy as np
 import param
 import pytest
 from bokeh.document import Document
+from bokeh.core.validation import check_integrity
 from panel.models.reactive_html import DOMEvent
-
 
 pn = pytest.importorskip("panel")
 go = pytest.importorskip("plotly.graph_objects")
@@ -36,6 +39,8 @@ from mmWaveRadar.gui.app import (  # noqa: E402
     _angle_map_figure,
     _default_human_mesh_path,
     _dynamic_scene_interaction_component,
+    _human_floor_overlay_data,
+    _human_position_bounds,
     _human_room_export,
     _human_room_profile_figure,
     _human_room_results_view,
@@ -44,6 +49,7 @@ from mmWaveRadar.gui.app import (  # noqa: E402
     _human_room_window_values,
     _lock_widget_disabled_states,
     _bundle_primary_label,
+    _bundle_range_profile_comparison_figure,
     _bundle_scene_boxes,
     _bundle_scene_figure,
     _cache_theme_comparison,
@@ -82,7 +88,19 @@ from mmWaveRadar.experiments import (  # noqa: E402
     run_static_target_experiment,
 )
 from mmWaveRadar.targets import MeshSequence  # noqa: E402
-from mmWaveRadar.measurements import load_bundle  # noqa: E402
+from mmWaveRadar.measurements import compute_radar_products, load_bundle  # noqa: E402
+
+
+def _callback_scope(callback):
+    """Inspect legacy closures and explicitly injected workflow contexts."""
+    owner = getattr(callback, "__self__", None)
+    if owner is not None and hasattr(owner, "context"):
+        context = owner.context
+        values = {
+            name: getattr(context, name) for name in context.__slots__ if hasattr(context, name)
+        }
+        return inspect.ClosureVars(values, {}, {}, set())
+    return inspect.getclosurevars(callback)
 
 
 def test_gui_defaults_to_public_smpl_model_directory(monkeypatch):
@@ -111,16 +129,22 @@ def test_gui_launcher_treats_other_bind_addresses_as_remote(address):
 
 
 def test_remote_smpl_directory_ignores_browser_value():
-    assert gui_app_module._effective_smpl_model_dir(
-        "/browser/chosen/pickles",
-        "/operator/configured/models",
-        remote_access=True,
-    ) == "/operator/configured/models"
-    assert gui_app_module._effective_smpl_model_dir(
-        "/local/chosen/models",
-        "/operator/configured/models",
-        remote_access=False,
-    ) == "/local/chosen/models"
+    assert (
+        gui_app_module._effective_smpl_model_dir(
+            "/browser/chosen/pickles",
+            "/operator/configured/models",
+            remote_access=True,
+        )
+        == "/operator/configured/models"
+    )
+    assert (
+        gui_app_module._effective_smpl_model_dir(
+            "/local/chosen/models",
+            "/operator/configured/models",
+            remote_access=False,
+        )
+        == "/local/chosen/models"
+    )
 
 
 @pytest.mark.parametrize(
@@ -179,6 +203,377 @@ def test_gui_motion_preflight_caps_optional_strings_and_faces():
         gui_app_module._preflight_gui_motion_npz(payload.getvalue())
 
 
+def test_gui_upload_accepts_mesh_motion_without_a_body_model(monkeypatch, tmp_path):
+    monkeypatch.setattr(
+        gui_app_module, "_default_smpl_model_dir", lambda: tmp_path / "missing-model"
+    )
+    payload = BytesIO()
+    vertices = np.asarray(
+        [
+            [[0.0, -0.1, 0.0], [0.0, 0.1, 0.0], [0.0, 0.0, 2.0]],
+            [[0.1, -0.1, 0.0], [0.1, 0.1, 0.0], [0.1, 0.0, 2.0]],
+        ],
+        dtype=np.float32,
+    ) + np.asarray([2.4, 0.6, -1.035], dtype=np.float32)
+    np.savez(
+        payload,
+        vertices=vertices,
+        faces=np.asarray([[0, 1, 2]], dtype=np.int32),
+        times=np.asarray([20.0, 20.1]),
+    )
+    application = build_app()
+    tabs = application.main[0]
+    preset = next(
+        widget
+        for widget in tabs.select(pn.widgets.Select)
+        if widget.label == "Prepared scene fallback"
+    )
+    position_mode = next(
+        widget for widget in tabs.select(pn.widgets.Select) if widget.label == "Human position"
+    )
+    assert preset.value == "empty_room"
+    assert position_mode.value == "file"
+    interaction = next(
+        component
+        for component in tabs.select(pn.reactive.ReactiveHTML)
+        if component.name == "Dynamic scene camera interaction"
+    )
+    scene = interaction.children[0]
+    assert not {"Bed", "Nightstand", "Wardrobe"} & {trace.name for trace in scene.object.data}
+    floor = next(trace for trace in scene.object.data if trace.name == "Floor")
+    assert max(floor.z) == pytest.approx(-1.035)
+    upload = next(
+        widget
+        for widget in tabs.select(pn.widgets.FileInput)
+        if widget.label == "AMASS-like human motion (.npz)"
+    )
+    upload._process_events(  # pylint: disable=protected-access
+        {
+            "filename": "evaluated-motion.npz",
+            "value": base64.b64encode(payload.getvalue()).decode("ascii"),
+        }
+    )
+
+    assert f"{gui_app_module._MAX_MOTION_UPLOAD_BYTES // 1024**2} MiB" in upload.description
+    ready = next(
+        pane for pane in tabs.select(pn.pane.Markdown) if "READY TO RUN" in str(pane.object)
+    )
+    assert "evaluated-motion.npz" in ready.object
+    assert "2 motion frame(s)" in ready.object
+    assert "3 vertices" in ready.object
+    human = next(trace for trace in scene.object.data if trace.name == "Human mesh")
+    np.testing.assert_allclose(np.column_stack([human.x, human.y, human.z]), vertices[0])
+    assert any(
+        "No floor penetration" in str(pane.object) for pane in tabs.select(pn.pane.Markdown)
+    )
+
+
+def test_preview_seconds_interpolate_and_track_timestamped_playback(monkeypatch):
+    monkeypatch.setattr(gui_app_module, "_default_amass_motion_path", lambda: None)
+    application = build_app()
+    tabs = application.main[0]
+    times = np.array([0.0, 0.125, 0.375, 0.75])
+    initial = np.array([[1.6, -0.1, 0.0], [1.6, 0.1, 0.0], [1.6, 0.0, 0.5]])
+    vertices = initial[None] + np.stack([2 * times, 0 * times, 0 * times], axis=-1)[:, None]
+    payload = BytesIO()
+    np.savez(payload, vertices=vertices, faces=[[0, 1, 2]], times=2.0**30 + times)
+    upload = next(
+        w for w in tabs.select(pn.widgets.FileInput) if w.label == "AMASS-like human motion (.npz)"
+    )
+    upload._process_events(
+        {
+            "filename": "timestamped.npz",
+            "value": base64.b64encode(payload.getvalue()).decode("ascii"),
+        }
+    )
+    preview_time = next(
+        w for w in tabs.select(pn.widgets.FloatInput) if w.label.startswith("Preview [s]")
+    )
+    player = next(w for w in tabs.select(pn.widgets.Player) if w.label == "Motion playback")
+    interaction = next(
+        c
+        for c in tabs.select(pn.reactive.ReactiveHTML)
+        if c.name == "Dynamic scene camera interaction"
+    )
+    scene = interaction.children[0]
+    storage = next(
+        c
+        for c in application.header[0].select(pn.reactive.ReactiveHTML)
+        if "loaded_uploads" in c.param
+    )
+    assert preview_time.label == "Preview [s] (max 0.750)"
+    assert (preview_time.start, preview_time.end) == (0.0, 0.75)
+    assert not preview_time.disabled
+    assert player.end == 3
+
+    # Entering seconds evaluates the motion between irregular source samples;
+    # epoch timestamps are relative to the first pose, as in simulation.
+    preview_time.value = 0.25
+    human = next(t for t in scene.object.data if t.name == "Human mesh")
+    np.testing.assert_allclose(human.x, initial[:, 0] + 0.5)
+    assert preview_time.value == 0.25
+    assert "t = 0.250 s" in scene.object.layout.title.text
+    assert storage.saved_state["dynamic_preview_time_s"] == 0.25
+    saved = dict(storage.saved_state)
+    uploads = dict(storage.saved_uploads)
+
+    buttons = {
+        w.label: w
+        for w in tabs.select(pn.widgets.Button)
+        if w.label in {"Prev", "Next", "Play", "Reverse", "Fast forward", "Fast reverse"}
+    }
+    play = buttons["Play"]
+    player.value = 2
+    assert preview_time.value == 0.375
+    buttons["Fast forward"].clicks += 1
+    assert player.direction == 1 and player.step > 1 and play.label == "Pause"
+    player.direction = 0
+    assert player.step == 1 and play.label == "Play"
+    buttons["Fast reverse"].clicks += 1
+    assert player.direction == -1 and player.step > 1
+    play.clicks += 1
+    assert player.direction == 0 and player.step == 1
+    buttons["Prev"].clicks += 1
+    assert player.value == 1 and preview_time.value == 0.125
+    buttons["Reverse"].clicks += 1
+    assert player.direction == -1 and player.step == 1
+    play.clicks += 1
+    assert player.direction == 0
+    play.clicks += 1
+    assert player.direction == 1
+    play.clicks += 1
+    buttons["Next"].clicks += 1
+    assert player.value == 2 and preview_time.value == 0.375
+    player.direction = 1
+    preview_time.value = 0.5
+    assert player.direction == 0 and play.label == "Play"
+    human = next(t for t in scene.object.data if t.name == "Human mesh")
+    np.testing.assert_allclose(human.x, initial[:, 0] + 1.0)
+
+    # Theme/session restoration preserves sub-pose times and migrates an older
+    # saved source-frame index using that motion's actual timestamps.
+    storage.loaded_state = saved
+    storage.loaded_uploads = uploads
+    assert preview_time.value == 0.25
+    human = next(t for t in scene.object.data if t.name == "Human mesh")
+    np.testing.assert_allclose(human.x, initial[:, 0] + 0.5)
+    legacy = {key: value for key, value in saved.items() if key != "dynamic_preview_time_s"}
+    legacy["dynamic_frame"] = 2
+    storage.loaded_state = legacy
+    storage.param.trigger("loaded_uploads")
+    assert preview_time.value == 0.375
+
+
+def test_gui_mesh_motion_preflight_rejects_mismatched_timing():
+    payload = BytesIO()
+    np.savez(
+        payload,
+        vertices=np.zeros((2, 3, 3), dtype=np.float32),
+        faces=np.asarray([[0, 1, 2]], dtype=np.int32),
+        times=np.asarray([0.0]),
+    )
+    with pytest.raises(ValueError, match="match its frame count"):
+        gui_app_module._preflight_gui_motion_npz(payload.getvalue())
+
+
+def test_motion_frame_settings_update_preview_and_simulation_arguments(monkeypatch):
+    payload = BytesIO()
+    np.savez(
+        payload,
+        vertices=np.asarray(
+            [
+                [[0, 0, 0], [0.4, 0, 0], [0, 2, 0]],
+                [[0, 0, 0.1], [0.4, 0, 0.1], [0, 2, 0.1]],
+            ],
+            dtype=np.float32,
+        ),
+        faces=np.asarray([[0, 1, 2]], dtype=np.int32),
+        times=np.asarray([0.0, 0.1]),
+    )
+    app = build_app()
+    tabs = app.main[0]
+    settings = {widget.label: widget for widget in app.modal[0].select(pn.widgets.Select)}
+    mode = settings["Motion coordinate mapping"]
+    up = settings["Source up axis"]
+    forward = settings["Source forward axis"]
+    assert up.disabled and forward.disabled
+    upload = next(
+        widget
+        for widget in tabs.select(pn.widgets.FileInput)
+        if widget.label == "AMASS-like human motion (.npz)"
+    )
+    upload._process_events(
+        {  # pylint: disable=protected-access
+            "filename": "y-up.npz",
+            "value": base64.b64encode(payload.getvalue()).decode("ascii"),
+        }
+    )
+    interaction = next(
+        component
+        for component in tabs.select(pn.reactive.ReactiveHTML)
+        if component.name == "Dynamic scene camera interaction"
+    )
+    pane = interaction.children[0]
+    human = next(trace for trace in pane.object.data if trace.name == "Human mesh")
+    assert np.ptp(human.z) == 0.0
+
+    gear = next(w for w in app.header[0].select(pn.widgets.Button) if w.icon == "settings")
+    cancel = next(w for w in app.modal[0].select(pn.widgets.Button) if w.label == "Cancel")
+    apply = next(w for w in app.modal[0].select(pn.widgets.Button) if w.label == "Apply")
+    storage = next(
+        c for c in app.header[0].select(pn.reactive.ReactiveHTML) if "loaded_state" in c.param
+    )
+    gear.clicks += 1
+    mode.value = "manual"
+    up.value = "+y"
+    forward.value = "+z"
+    assert not up.disabled and not forward.disabled
+    assert all(value[-1] != "y" for value in forward.options.values())
+    assert storage.saved_state["dynamic_controls"]["motion_axes_mode"] == "file"
+    human = next(trace for trace in pane.object.data if trace.name == "Human mesh")
+    assert np.ptp(human.z) == 0.0
+    cancel.clicks += 1
+    assert mode.value == "file"
+    assert up.value == "+z"
+    assert forward.value == "+x"
+    assert up.disabled and forward.disabled
+
+    gear.clicks += 1
+    mode.value = "manual"
+    up.value = "+y"
+    forward.value = "+z"
+    apply.clicks += 1
+    assert storage.saved_state["dynamic_controls"]["motion_up_axis"] == "+y"
+    human = next(trace for trace in pane.object.data if trace.name == "Human mesh")
+    assert np.ptp(human.z) == pytest.approx(2.0)
+
+    arguments = {}
+    solver_inputs = {widget.label: widget for widget in app.modal[0].select(pn.widgets.Widget)}
+    solver_inputs["Image-source power cutoff [dB relative to strongest]"].value = -30.0
+    solver_inputs["Image-source maximum count"].value = 2
+    solver_inputs["PO curvature tolerance [rad]"].value = 0.02
+    solver_inputs["RT retrace every N frames (0 = every chirp)"].value = 0
+    solver_inputs["PO visibility fade [frames] (0 = step)"].value = 2
+    solver_inputs["RT human bounces"].value = "any"
+
+    def capture_run(**kwargs):
+        arguments.update(kwargs)
+        raise InterruptedError("test run stopped")
+
+    monkeypatch.setattr(gui_app_module, "run_human_room_experiment", capture_run)
+    run = next(widget for widget in tabs.select(pn.widgets.Button) if widget.label == "Start")
+    callback = next(
+        watcher.fn
+        for watcher in run.param.watchers["clicks"]["value"]
+        if getattr(watcher.fn, "__name__", "") == "on_run_human_room"
+    )
+    asyncio.run(callback(None))
+    assert arguments["motion_source_up_axis"] == "+y"
+    assert arguments["human_position_m"] is None
+    assert arguments["room_preset"] == "empty_room"
+    assert arguments["motion_source_forward_axis"] == "+z"
+    assert arguments["motion_source_handedness"] == "right"
+    assert arguments["motion_source_length_unit"] == "m"
+    assert arguments["hybrid_reflector_cutoff_db"] == -30.0
+    assert arguments["hybrid_max_reflectors"] == 2
+    assert arguments["hybrid_coupling"] is True
+    assert arguments["hybrid_calibration"] == "rt_first_pose"
+    assert arguments["rt_refresh_frames"] == 0
+    assert arguments["rt_visibility_refresh_frames"] == 1
+    assert arguments["po_refresh_frames"] == 1
+    assert arguments["po_visibility_fade_frames"] == 2
+    assert arguments["rt_human_bounces"] == "any"
+    assert arguments["tx_schedule"] == "simultaneous"
+    assert arguments["array_model"] == "phase_center"
+    assert arguments["solver"] == "hybrid_po"
+    assert arguments["po_integration_mode"] == "parent_face_adaptive_analytic"
+    assert arguments["po_quadrature_phase_span_scale_rad"] == 6.0
+    assert arguments["po_curvature_error_rad"] == 0.02
+
+    mode.value = "file"
+    human = next(trace for trace in pane.object.data if trace.name == "Human mesh")
+    assert np.ptp(human.z) == 0.0
+
+
+def test_motion_frame_settings_restore_across_theme_reload():
+    app = build_app()
+    settings = {widget.label: widget for widget in app.modal[0].select(pn.widgets.Select)}
+    storage = next(
+        component
+        for component in app.header[0].select(pn.reactive.ReactiveHTML)
+        if "loaded_state" in component.param
+    )
+    storage.loaded_state = {
+        "schema_version": 2,
+        "dynamic_controls": {
+            "motion_axes_mode": "manual",
+            "motion_up_axis": "+y",
+            "motion_forward_axis": "+z",
+            "motion_handedness": "left",
+            "motion_length_unit": "cm",
+        },
+        "has_uploads": False,
+    }
+    assert settings["Motion coordinate mapping"].value == "manual"
+    assert settings["Source up axis"].value == "+y"
+    assert settings["Source forward axis"].value == "+z"
+    assert settings["Source handedness"].value == "left"
+    assert settings["Evaluated mesh units"].value == "cm"
+    assert not settings["Source up axis"].disabled
+    assert (
+        settings["Source forward axis"].value in settings["Source forward axis"].options.values()
+    )
+
+
+@pytest.mark.parametrize(
+    ("controls", "preset", "mode"),
+    [
+        ({"room_preset": "tutorial_bedroom", "human_x": 2.2}, "empty_room", "file"),
+        (
+            {"room_preset": "tutorial_bedroom", "position_mode": "manual"},
+            "tutorial_bedroom",
+            "manual",
+        ),
+    ],
+)
+def test_room_defaults_migrate_and_explicit_choices_restore(monkeypatch, controls, preset, mode):
+    monkeypatch.setattr(gui_app_module, "_default_amass_motion_path", lambda: None)
+    app = build_app()
+    tabs = app.main[0]
+    storage = next(
+        component
+        for component in app.header[0].select(pn.reactive.ReactiveHTML)
+        if "loaded_state" in component.param
+    )
+    storage.loaded_state = {
+        "schema_version": 2,
+        "dynamic_controls": controls,
+        "has_uploads": False,
+    }
+    selector = next(
+        widget
+        for widget in tabs.select(pn.widgets.Select)
+        if widget.label == "Prepared scene fallback"
+    )
+    position_mode = next(
+        widget for widget in tabs.select(pn.widgets.Select) if widget.label == "Human position"
+    )
+    position_row = next(
+        row for row in tabs.select(pn.Row) if "hermes-dynamic-position" in row.css_classes
+    )
+    assert selector.value == preset
+    assert position_mode.value == mode
+    assert position_row.visible == (mode == "manual")
+    interaction = next(
+        component
+        for component in tabs.select(pn.reactive.ReactiveHTML)
+        if component.name == "Dynamic scene camera interaction"
+    )
+    assert ("Bed" in {trace.name for trace in interaction.children[0].object.data}) == (
+        preset == "tutorial_bedroom"
+    )
+
+
 def test_gui_obj_preflight_caps_vertices_and_fan_expansion(monkeypatch):
     obj = b"v 0 0 0\nv 1 0 0\nv 1 1 0\nv 0 1 0\nf 1 2 3 4\n"
     monkeypatch.setattr(gui_app_module, "_MAX_GUI_OBJ_VERTICES", 3)
@@ -200,13 +595,25 @@ def _scene_pane(tabs):
     return interaction.children[0]
 
 
+def _result_banner(tabs, page):
+    """Return the stale-result banner shown in one page's run bar."""
+
+    return next(
+        column for column in tabs.select(pn.Column) if column.name == f"{page} result settings"
+    )
+
+
+def _numeric_controls(tabs, group):
+    row = next(row for row in tabs.select(pn.Row) if f"hermes-{group}" in row.css_classes)
+    return {widget.label: widget for widget in row.select(pn.widgets.FloatInput)}
+
+
 def _range_profile_pane(tabs):
     return next(
         pane
         for pane in tabs.select(pn.pane.Plotly)
         if pane.object is not None
-        and [trace.name for trace in pane.object.data]
-        == ["Physical optics (PO)", "Ray tracing (RT)"]
+        and str(pane.object.layout.title.text).startswith("RT and PO range profiles")
     )
 
 
@@ -265,14 +672,10 @@ def test_gui_builds_with_three_public_workflows_and_settings(monkeypatch):
     assert all(button.icon_size == "30px" for button in header_buttons)
     settings_storage = next(
         component
-        for component in application.header[0].select(
-            pn.reactive.ReactiveHTML
-        )
+        for component in application.header[0].select(pn.reactive.ReactiveHTML)
         if "loaded_settings" in component.param
     )
-    storage_render_script = settings_storage._scripts[  # pylint: disable=protected-access
-        "render"
-    ]
+    storage_render_script = settings_storage._scripts["render"]  # pylint: disable=protected-access
     storage_save_script = settings_storage._scripts[  # pylint: disable=protected-access
         "saved_settings"
     ]
@@ -280,37 +683,38 @@ def test_gui_builds_with_three_public_workflows_and_settings(monkeypatch):
     assert "window.localStorage.setItem" in storage_save_script
     gui_storage = next(
         component
-        for component in application.header[0].select(
-            pn.reactive.ReactiveHTML
-        )
-        if "loaded_state" in component.param
-        and "loaded_uploads" in component.param
+        for component in application.header[0].select(pn.reactive.ReactiveHTML)
+        if "loaded_state" in component.param and "loaded_uploads" in component.param
     )
-    assert "window.sessionStorage.getItem" in gui_storage._scripts[  # pylint: disable=protected-access
-        "render"
-    ]
-    assert "window.indexedDB.open" in gui_storage._scripts[  # pylint: disable=protected-access
-        "render"
-    ]
-    assert "window.sessionStorage.setItem" in gui_storage._scripts[  # pylint: disable=protected-access
-        "saved_state"
-    ]
-    assert "store.put" in gui_storage._scripts[  # pylint: disable=protected-access
-        "saved_uploads"
-    ]
+    assert (
+        "window.sessionStorage.getItem"
+        in gui_storage._scripts["render"]  # pylint: disable=protected-access
+    )
+    assert (
+        "window.indexedDB.open"
+        in gui_storage._scripts["render"]  # pylint: disable=protected-access
+    )
+    assert (
+        "window.sessionStorage.setItem"
+        in gui_storage._scripts["saved_state"]  # pylint: disable=protected-access
+    )
+    assert "store.put" in gui_storage._scripts["saved_uploads"]  # pylint: disable=protected-access
     dynamic_view_tabs = next(
         nested
         for nested in tabs.select(pn.Tabs)
-        if nested._names == [  # pylint: disable=protected-access
+        if nested._names
+        == [  # pylint: disable=protected-access
             "Scene and motion",
             "Simulation results",
         ]
     )
     assert dynamic_view_tabs.dynamic is False
+    assert dynamic_view_tabs.active == 0
     measurement_view_tabs = next(
         nested
         for nested in tabs.select(pn.Tabs)
-        if nested._names == [  # pylint: disable=protected-access
+        if nested._names
+        == [  # pylint: disable=protected-access
             "Scene",
             "ADC",
             "Range profile",
@@ -328,9 +732,7 @@ def test_gui_builds_with_three_public_workflows_and_settings(monkeypatch):
         "Report",
     ]
     assert measurement_view_tabs.dynamic is False
-    assert not any(
-        card.title == "Bundle report" for card in tabs.select(pn.Card)
-    )
+    assert not any(card.title == "Bundle report" for card in tabs.select(pn.Card))
     gui_storage.loaded_state = {
         "schema_version": 1,
         "top_tab": 1,
@@ -340,41 +742,66 @@ def test_gui_builds_with_three_public_workflows_and_settings(monkeypatch):
         "load_sequence": 1,
     }
     assert tabs.active == 1
-    assert dynamic_view_tabs.active == 1
+    assert dynamic_view_tabs.active == 0
     assert measurement_view_tabs.active == 5
     assert len(application.modal) == 1
     settings = application.modal[0]
     assert settings.width is None
-    assert settings.min_width == 680
+    assert settings.min_width == 0
     assert settings.max_width == 980
     assert settings.sizing_mode == "stretch_width"
     settings_tabs = next(
         component
         for component in settings.select(pn.Tabs)
-        if component._names == [  # pylint: disable=protected-access
+        if component._names
+        == [  # pylint: disable=protected-access
             "Radar configuration",
             "Solver settings",
+            "Motion coordinates",
         ]
     )
     assert settings_tabs._names == [  # pylint: disable=protected-access
         "Radar configuration",
         "Solver settings",
+        "Motion coordinates",
     ]
-    assert next(
-        widget
-        for widget in settings.select(pn.widgets.Select)
-        if widget.label == "PO facet integration"
-    ).value == "parent_face_quadrature"
-    assert next(
-        widget
-        for widget in settings.select(pn.widgets.IntInput)
-        if widget.label == "RT ray samples per source"
-    ).value == 100_000
-    assert next(
-        widget
-        for widget in settings.select(pn.widgets.IntInput)
-        if widget.label == "RT maximum paths per source"
-    ).value == 5_000
+    # Apply/Cancel share one footer; only the active settings tab is shown.
+    footer = next(
+        row for row in settings.select(pn.Row) if "hermes-settings-footer" in row.css_classes
+    )
+    assert [
+        widget.label
+        for widget in footer.objects
+        if isinstance(widget, (pn.widgets.Button, pn.widgets.Checkbox))
+    ] == ["Apply & rerun this page", "Cancel", "Apply"]
+    assert [pane.visible for pane in settings_tabs] == [True, False, False]
+    settings_tabs.active = 2
+    assert [pane.visible for pane in settings_tabs] == [False, False, True]
+    settings_tabs.active = 0
+    assert (
+        next(
+            widget
+            for widget in settings.select(pn.widgets.Select)
+            if widget.label == "PO facet integration"
+        ).value
+        == "parent_face_adaptive_analytic"
+    )
+    assert (
+        next(
+            widget
+            for widget in settings.select(pn.widgets.IntInput)
+            if widget.label == "RT ray samples per source"
+        ).value
+        == 100_000
+    )
+    assert (
+        next(
+            widget
+            for widget in settings.select(pn.widgets.IntInput)
+            if widget.label == "RT maximum paths per source"
+        ).value
+        == 5_000
+    )
     rt_help = {
         widget.label: widget.description
         for widget in settings.select(pn.widgets.IntInput)
@@ -393,13 +820,9 @@ def test_gui_builds_with_three_public_workflows_and_settings(monkeypatch):
     assert "rays launched" in rt_help["RT ray samples per source"]
     assert "paths retained" in rt_help["RT maximum paths per source"]
     assert "scene interactions" in rt_help["RT maximum path depth"]
+    assert any(button.label == "Apply" for button in settings.select(pn.widgets.Button))
     assert any(
-        button.label == "Apply and recompute"
-        for button in settings.select(pn.widgets.Button)
-    )
-    assert any(
-        "saved in this browser" in str(pane.object)
-        for pane in settings.select(pn.pane.Markdown)
+        "saved in this browser" in str(pane.object) for pane in settings.select(pn.pane.Markdown)
     )
 
     scene_pane = _scene_pane(tabs)
@@ -410,133 +833,120 @@ def test_gui_builds_with_three_public_workflows_and_settings(monkeypatch):
         for button in tabs.select(pn.widgets.Button)
         if button.label == "Recompute at higher fidelity"
     )
-    assert any(
-        selector.label == "Static object"
-        for selector in tabs.select(pn.widgets.Select)
-    )
-    assert not any(
-        card.title == "Reproducibility" for card in tabs.select(pn.Card)
-    )
+    assert any(selector.label == "Target type" for selector in tabs.select(pn.widgets.Select))
+    assert not any(card.title == "Reproducibility" for card in tabs.select(pn.Card))
     range_figure = range_profile_pane.object
-    assert [trace.name for trace in range_figure.data] == [
+    assert [trace.name for trace in range_figure.data if trace.showlegend] == [
         "Physical optics (PO)",
         "Ray tracing (RT)",
     ]
     assert range_figure.data[1].line.dash == "solid"
     assert "absolute simulated power" in range_figure.layout.title.text
-    assert (
-        range_figure.layout.yaxis.title.text
-        == "Power [dB, simulator units]"
-    )
+    assert range_figure.layout.yaxis.title.text == "Power [dB, simulator units]"
     assert tuple(range_figure.layout.yaxis.range) != (-80, 2)
     scene_figure = scene_pane.object
-    radar_trace = next(
-        trace for trace in scene_figure.data if trace.name == "Radar"
-    )
+    radar_trace = next(trace for trace in scene_figure.data if trace.name == "Radar")
     assert tuple(radar_trace.x) == (0.0,)
     assert tuple(radar_trace.y) == (0.0,)
     assert tuple(radar_trace.z) == (0.0,)
-    boresight_trace = next(
-        trace for trace in scene_figure.data if trace.name == "Radar boresight"
-    )
-    local_up_trace = next(
-        trace for trace in scene_figure.data if trace.name == "Radar local up"
-    )
+    boresight_trace = next(trace for trace in scene_figure.data if trace.name == "Radar boresight")
+    local_up_trace = next(trace for trace in scene_figure.data if trace.name == "Radar local up")
     assert boresight_trace.x[-1] > 0.0
     assert boresight_trace.y[-1] == pytest.approx(0.0)
     assert local_up_trace.z[-1] > 0.0
     assert scene_figure.layout.scene.dragmode == "orbit"
     assert scene_figure.layout.scene.aspectmode == "manual"
     aspect_ratio = scene_figure.layout.scene.aspectratio
-    assert (
-        aspect_ratio.x * aspect_ratio.y * aspect_ratio.z
-    ) == pytest.approx(1.0)
+    assert (aspect_ratio.x * aspect_ratio.y * aspect_ratio.z) == pytest.approx(1.0)
     assert scene_figure.layout.scene.camera.up.z == pytest.approx(1.0)
     assert scene_figure.layout.scene.xaxis.range[0] < 0.0
-    assert scene_figure.layout.scene.xaxis.title.text == "x · range forward [m]"
-    assert (
-        scene_figure.layout.scene.yaxis.title.text
-        == "y · lateral, radar-left [m]"
-    )
-    assert scene_figure.layout.scene.zaxis.title.text == "z · vertical, up [m]"
+    assert scene_figure.layout.scene.xaxis.title.text == "x [m]"
+    assert scene_figure.layout.scene.yaxis.title.text == "y [m]"
+    assert scene_figure.layout.scene.zaxis.title.text == "z [m]"
     assert scene_figure.layout.scene.camera.eye.y < 0.0
     assert scene_pane.config["scrollZoom"] is True
-    assert scene_pane.config["modeBarButtonsToRemove"] == [
-        "resetCameraDefault3d"
-    ]
+    assert scene_pane.config["modeBarButtonsToRemove"] == ["resetCameraDefault3d"]
     assert any(
-        "shift + drag" in str(pane.object).lower()
-        for pane in tabs.select(pn.pane.Markdown)
+        "shift + drag" in str(pane.object).lower() for pane in tabs.select(pn.pane.Markdown)
     )
     assert scene_figure.layout.uirevision == "hermes-scene-camera"
     assert not any(
-        nested._names == ["Physics Microscope", "Human-in-Room"]
-        for nested in tabs.select(pn.Tabs)
+        nested._names == ["Physics Microscope", "Human-in-Room"] for nested in tabs.select(pn.Tabs)
     )
-    physics_controls_card = next(
-        card
-        for card in tabs.select(pn.Card)
-        if card.title == "Static target controls"
+    static_controls = next(
+        column
+        for column in tabs.select(pn.Column)
+        if "hermes-static-controls" in column.css_classes
     )
-    dynamic_controls_card = next(
-        card
-        for card in tabs.select(pn.Card)
-        if card.title == "Dynamic scene controls"
+    dynamic_controls = next(
+        column
+        for column in tabs.select(pn.Column)
+        if "hermes-dynamic-controls" in column.css_classes
     )
-    simulation_controls = physics_controls_card[0]
     material_selector = next(
-        widget
-        for widget in tabs.select(pn.widgets.Select)
-        if widget.label == "Material preset"
+        widget for widget in tabs.select(pn.widgets.Select) if widget.label == "Material preset"
     )
-    static_radar_yaw = next(
-        widget
-        for widget in physics_controls_card.select(pn.widgets.FloatSlider)
-        if widget.label == "Radar yaw [deg]"
-    )
-    dynamic_radar_yaw = next(
-        widget
-        for widget in dynamic_controls_card.select(pn.widgets.FloatSlider)
-        if widget.label == "Radar yaw [deg]"
-    )
-    assert material_selector in simulation_controls
-    assert static_radar_yaw in simulation_controls
-    assert dynamic_radar_yaw not in simulation_controls
+    static_radar_yaw = _numeric_controls(tabs, "static-radar-orientation")["Yaw [deg]"]
+    dynamic_radar_yaw = _numeric_controls(tabs, "dynamic-radar-orientation")["Yaw [deg]"]
+    assert material_selector in static_controls.select(pn.widgets.Widget)
+    assert static_radar_yaw in static_controls.select(pn.widgets.Widget)
+    assert dynamic_radar_yaw not in static_controls.select(pn.widgets.Widget)
     assert not settings.select(pn.widgets.FloatSlider)
-    assert material_selector.options[
-        "PEC · ideal PO, rough/diffuse RT"
-    ] == "pec"
+    assert material_selector.options["PEC · ideal PO, rough/diffuse RT"] == "pec"
     assert any(
         "RT diffuse scattering coefficient:** `0.20`" in str(pane.object)
-        for pane in simulation_controls.select(pn.pane.Markdown)
+        for pane in static_controls.select(pn.pane.Markdown)
     )
-    headings = [
-        str(pane.object)
-        for pane in simulation_controls.objects
-        if isinstance(pane, pn.pane.Markdown)
+    # The control rail is a jump bar over always-visible groups; no cards.
+    assert "hermes-rail" in static_controls.css_classes
+    assert not static_controls.select(pn.Card)
+    assert [
+        group.name for group in static_controls.objects if "hermes-group" in group.css_classes
+    ] == [
+        "Target",
+        "Target orientation",
+        "Material and surface",
+        "Radar orientation",
+        "Export",
     ]
-    assert "## Target" in headings
-    assert "## Radar orientation" in headings
-    assert refine not in physics_controls_card.select(pn.widgets.Button)
-    refine_toolbar = next(
-        row
-        for row in tabs.select(pn.Row)
-        if refine in row.objects
-    )
+    assert static_controls.objects[0].items == [
+        ["target", "Target"],
+        ["orientation", "Orientation"],
+        ["material", "Material"],
+        ["radar", "Radar"],
+    ]
+    assert refine not in static_controls.select(pn.widgets.Button)
+    refine_toolbar = next(row for row in tabs.select(pn.Row) if refine in row.objects)
+    assert "hermes-runbar-status" in refine_toolbar.css_classes
     assert refine_toolbar.objects[-1] is refine
-    assert isinstance(refine_toolbar.objects[0], pn.Spacer)
+    assert "hermes-status" in refine_toolbar.objects[0].css_classes
     assert refine.width == 250
     assert refine.height == 40
     assert refine.sizing_mode == "fixed"
-    controls_card = physics_controls_card
+    controls_card = static_controls
     assert controls_card.sizing_mode == "stretch_width"
     assert controls_card.width is None
-    assert controls_card.max_width == 440
-    assert next(
+    assert controls_card.min_width == controls_card.max_width == 380
+    assert (
+        next(
+            widget
+            for widget in settings.select(pn.widgets.Select)
+            if widget.label == "Tx schedule"
+        ).value
+        == "simultaneous"
+    )
+    array_model_select = next(
         widget
-        for widget in settings.select(pn.widgets.Checkbox)
-        if widget.label == "Enable TDM-MIMO"
-    ).value is False
+        for widget in application.modal[0].select(pn.widgets.Select)
+        if widget.label == "MIMO array model"
+    )
+    assert list(array_model_select.options.values()) == ["phase_center", "subarray"]
+    assert array_model_select.disabled_options == []
+    assert {
+        widget.label
+        for widget in application.modal[0].select(pn.widgets.TextInput)
+        if widget.label in ("Tx groups", "Rx groups")
+    } == {"Tx groups", "Rx groups"}
     tx_selector = next(
         widget
         for widget in settings.select(pn.widgets.MultiChoice)
@@ -549,27 +959,13 @@ def test_gui_builds_with_three_public_workflows_and_settings(monkeypatch):
     )
     assert tx_selector.value == [0, 1, 2]
     assert rx_selector.value == [0, 1, 2, 3]
-    for label, value in (
-        ("Target x / range-forward [m]", 2.0),
-        ("Target y / lateral-left [m]", 0.0),
-        ("Target z / vertical-up [m]", 0.0),
-    ):
-        assert next(
-            widget
-            for widget in tabs.select(pn.widgets.FloatSlider)
-            if widget.label == label
-        ).value == pytest.approx(value)
-    for label in ("Radar yaw [deg]", "Radar pitch [deg]", "Radar roll [deg]"):
-        orientation_controls = [
-            widget
-            for widget in tabs.select(pn.widgets.FloatSlider)
-            if widget.label == label
-        ]
-        assert len(orientation_controls) == 2
-        assert all(
-            widget.value == pytest.approx(0.0)
-            for widget in orientation_controls
-        )
+    static_positions = _numeric_controls(tabs, "static-position")
+    for label, value in (("X [m]", 2.0), ("Y [m]", 0.0), ("Z [m]", 0.0)):
+        assert static_positions[label].value == pytest.approx(value)
+    for group in ("static-radar-orientation", "dynamic-radar-orientation"):
+        orientation_controls = _numeric_controls(tabs, group)
+        assert list(orientation_controls) == ["Yaw [deg]", "Pitch [deg]", "Roll [deg]"]
+        assert all(widget.value == pytest.approx(0.0) for widget in orientation_controls.values())
     antenna_pattern = next(
         widget
         for widget in settings.select(pn.widgets.Select)
@@ -599,12 +995,15 @@ def test_gui_builds_with_three_public_workflows_and_settings(monkeypatch):
         if widget.label == "Carrier frequency [GHz]"
     )
     assert carrier.value == 60.0
-    assert carrier.format == "0.000"
-    assert next(
-        widget
-        for widget in settings.select(pn.widgets.IntInput)
-        if widget.label == "ADC samples per chirp"
-    ).value == 225
+    assert carrier.format == "0.[000]"
+    assert (
+        next(
+            widget
+            for widget in settings.select(pn.widgets.IntInput)
+            if widget.label == "ADC samples per chirp"
+        ).value
+        == 225
+    )
     angle_bins = next(
         widget
         for widget in tabs.select(pn.widgets.IntRangeSlider)
@@ -614,21 +1013,12 @@ def test_gui_builds_with_three_public_workflows_and_settings(monkeypatch):
     assert angle_bins.value[0] > 0
     angle_figure = _angle_map_pane(tabs).object
     assert len(angle_figure.data) == 2
-    assert angle_figure.layout.xaxis.title.text == (
-        "Horizontal direction cosine u"
-    )
-    assert angle_figure.layout.yaxis.title.text == (
-        "Vertical direction cosine v"
-    )
+    assert angle_figure.layout.xaxis.title.text == ("Horizontal direction cosine u")
+    assert angle_figure.layout.yaxis.title.text == ("Vertical direction cosine v")
     assert np.asarray(angle_figure.data[0].z).shape == (64, 128)
-    assert any(
-        button.label == "Start"
-        for button in tabs.select(pn.widgets.Button)
-    )
+    assert any(button.label == "Start" for button in tabs.select(pn.widgets.Button))
     stop_button = next(
-        button
-        for button in tabs.select(pn.widgets.Button)
-        if button.label == "Stop"
+        button for button in tabs.select(pn.widgets.Button) if button.label == "Stop"
     )
     assert stop_button.disabled is True
     rt_overlay = next(
@@ -637,15 +1027,9 @@ def test_gui_builds_with_three_public_workflows_and_settings(monkeypatch):
         if toggle.label == "Show" and toggle.icon == "route"
     )
     static_top_rt_paths = next(
-        widget
-        for widget in tabs.select(pn.widgets.IntInput)
-        if widget.label == "Top RT paths"
+        widget for widget in tabs.select(pn.widgets.IntInput) if widget.label == "Top RT paths"
     )
-    static_rt_row = next(
-        row
-        for row in tabs.select(pn.Row)
-        if rt_overlay in row.objects
-    )
+    static_rt_row = next(row for row in tabs.select(pn.Row) if rt_overlay in row.objects)
     assert static_rt_row.objects == [static_top_rt_paths, rt_overlay]
     assert static_top_rt_paths.width == 135
     assert rt_overlay.width == 100
@@ -666,47 +1050,34 @@ def test_gui_builds_with_three_public_workflows_and_settings(monkeypatch):
         if component.name == "Dynamic scene camera interaction"
     )
     human_scene = human_scene_interaction.children[0]
-    human_radar = next(
-        trace for trace in human_scene.object.data if trace.name == "Radar"
-    )
+    human_radar = next(trace for trace in human_scene.object.data if trace.name == "Radar")
     assert tuple(human_radar.x) == (0.0,)
     assert tuple(human_radar.y) == (0.0,)
     assert tuple(human_radar.z) == (0.0,)
-    motion_frame = next(
+    motion_time = next(
         widget
-        for widget in tabs.select(pn.widgets.IntInput)
-        if widget.label.startswith("Displayed frame (max ")
+        for widget in tabs.select(pn.widgets.FloatInput)
+        if widget.label.startswith("Preview [s] (max ")
     )
+    assert motion_time.end == 0.0
+    assert motion_time.disabled
     top_rt_rays = next(
-        widget
-        for widget in tabs.select(pn.widgets.IntInput)
-        if widget.label == "Top RT rays"
+        widget for widget in tabs.select(pn.widgets.IntInput) if widget.label == "Top RT rays"
     )
     overlay_button = next(
         widget
         for widget in tabs.select(pn.widgets.Button)
         if widget.label == "Show" and widget.icon == "route"
     )
-    compact_frame_row = next(
-        row
-        for row in tabs.select(pn.Row)
-        if motion_frame in row.objects
-    )
-    assert compact_frame_row.objects == [
-        motion_frame,
-        top_rt_rays,
-        overlay_button,
-    ]
+    dynamic_rt_row = next(row for row in tabs.select(pn.Row) if overlay_button in row.objects)
+    assert dynamic_rt_row.objects == [motion_time, top_rt_rays, overlay_button]
     motion_player = next(
-        widget
-        for widget in tabs.select(pn.widgets.Player)
-        if widget.label == "Motion playback"
+        widget for widget in tabs.select(pn.widgets.Player) if widget.label == "Motion playback"
     )
     scene_motion_column = next(
         column
         for column in tabs.select(pn.Column)
-        if human_scene_interaction in column.objects
-        and motion_player in column.objects
+        if human_scene_interaction in column.objects and motion_player in column.objects
     )
     assert scene_motion_column.objects.index(motion_player) > (
         scene_motion_column.objects.index(human_scene_interaction)
@@ -719,18 +1090,14 @@ def test_gui_builds_with_three_public_workflows_and_settings(monkeypatch):
     assert motion_player.visible_buttons == []
     transport_labels = [
         "Prev",
-        "Reverse",
         "Fast reverse",
+        "Reverse",
         "Play",
         "Fast forward",
         "Next",
     ]
     transport_buttons = [
-        next(
-            widget
-            for widget in tabs.select(pn.widgets.Button)
-            if widget.label == label
-        )
+        next(widget for widget in tabs.select(pn.widgets.Button) if widget.label == label)
         for label in transport_labels
     ]
     transport_row = next(
@@ -739,149 +1106,67 @@ def test_gui_builds_with_three_public_workflows_and_settings(monkeypatch):
         if all(button in row.objects for button in transport_buttons)
     )
     assert [
-        item.label
-        for item in transport_row.objects
-        if isinstance(item, pn.widgets.Button)
+        item.label for item in transport_row.objects if isinstance(item, pn.widgets.Button)
     ] == transport_labels
     fast_reverse = next(
-        widget
-        for widget in tabs.select(pn.widgets.Button)
-        if widget.label == "Fast reverse"
+        widget for widget in tabs.select(pn.widgets.Button) if widget.label == "Fast reverse"
     )
     fast_forward = next(
-        widget
-        for widget in tabs.select(pn.widgets.Button)
-        if widget.label == "Fast forward"
+        widget for widget in tabs.select(pn.widgets.Button) if widget.label == "Fast forward"
     )
     assert fast_reverse.disabled is True
     assert fast_forward.disabled is True
+    assert transport_buttons[2].icon == transport_buttons[3].icon == "player-play"
     for button in transport_buttons:
         assert button.disabled is True
-        assert button.description is None
-        button.disabled = False
-    motion_player.end = 3
-    motion_player.disabled = False
-    motion_frame.end = 3
-    motion_frame.disabled = False
-    motion_player.value = 2
-    assert motion_frame.value == 2
-    fast_forward.clicks += 1
-    assert motion_player.value == 2
-    assert motion_player.direction == 1
-    assert motion_player.step > 1
-    assert transport_buttons[3].label == "Pause"
-    motion_player.direction = 0
-    assert motion_player.step == 1
-    assert transport_buttons[3].label == "Play"
-    fast_reverse.clicks += 1
-    assert motion_player.value == 2
-    assert motion_player.direction == -1
-    assert motion_player.step > 1
-    transport_buttons[3].clicks += 1
-    assert motion_player.direction == 0
-    assert motion_player.step == 1
-    assert transport_buttons[3].label == "Play"
-    transport_buttons[0].clicks += 1
-    assert motion_player.value == 1
-    transport_buttons[1].clicks += 1
-    assert motion_player.value == 1
-    assert motion_player.direction == -1
-    assert motion_player.step == 1
-    assert transport_buttons[3].label == "Pause"
-    transport_buttons[3].clicks += 1
-    assert motion_player.direction == 0
-    assert transport_buttons[3].label == "Play"
-    transport_buttons[3].clicks += 1
-    assert motion_player.value == 1
-    assert motion_player.direction == 1
-    assert transport_buttons[3].label == "Pause"
-    transport_buttons[3].clicks += 1
-    transport_buttons[5].clicks += 1
-    assert motion_player.value == 2
-    assert motion_player.direction == 0
-    motion_player.direction = 1
-    motion_frame.value = 1
-    frame_callback = next(
-        watcher.fn
-        for watcher in motion_frame.param.watchers["value"]["value"]
-        if getattr(watcher.fn, "__name__", "") == "on_human_room_frame"
+        assert button.description == button.label
+    start_time = next(
+        widget for widget in tabs.select(pn.widgets.FloatInput) if widget.label == "Start [s]"
     )
-    frame_callback(SimpleNamespace(new=1))
-    assert motion_player.value == 1
-    assert motion_player.direction == 0
-    begin_frame = next(
+    end_time = next(
         widget
-        for widget in tabs.select(pn.widgets.IntInput)
-        if widget.label == "Begin frame (inclusive)"
+        for widget in tabs.select(pn.widgets.FloatInput)
+        if widget.label.startswith("End [s] (max ")
     )
-    end_frame = next(
-        widget
-        for widget in tabs.select(pn.widgets.IntInput)
-        if widget.label.startswith("End frame (max ")
-    )
-    assert end_frame.label == "End frame (max 0)"
-    assert begin_frame.value == end_frame.value == 0
-    assert begin_frame.end == end_frame.end == 0
-    assert begin_frame.disabled is True
-    assert end_frame.disabled is True
+    assert end_time.label == "End [s] (max 0.050)"
+    assert start_time.value == 0.0
+    assert end_time.value == pytest.approx(0.05)
+    assert start_time.disabled is True
+    assert end_time.disabled is True
     assert not any(
-        widget.label == "Radar frames to simulate"
-        for widget in tabs.select(pn.widgets.IntInput)
+        widget.label == "Radar frames to simulate" for widget in tabs.select(pn.widgets.IntInput)
     )
-    begin_frame.end = 3
-    end_frame.end = 3
-    begin_frame.disabled = False
-    end_frame.disabled = False
-    begin_frame.value = 2
-    assert end_frame.value == 2
-    end_frame.value = 1
-    assert begin_frame.value == 1
+    start_time.end = 3.0
+    end_time.end = 3.0
+    start_time.disabled = False
+    end_time.disabled = False
+    # Crossing ends keep one radar frame period (50 ms) between them.
+    start_time.value = 2.0
+    assert end_time.value == pytest.approx(2.05)
+    end_time.value = 1.0
+    assert start_time.value == pytest.approx(0.95)
+    end_time.value = 2.0
+    # 50 ms frames with 1.04 ms of chirps starting at 0.95 s, 1.00 s, ..., 1.95 s.
+    assert any("**21** radar frames" in str(pane.object) for pane in tabs.select(pn.pane.Markdown))
     mode_checkboxes = {
         widget.label: widget
         for widget in tabs.select(pn.widgets.Checkbox)
-        if widget.label in {
-            "Full RT",
-            "Coherent RT",
-            "Human-only PO",
-            "Hybrid PO",
-        }
+        if widget.label in {"RT", "PO", "Hybrid PO"}
     }
-    assert set(mode_checkboxes) == {
-        "Full RT",
-        "Coherent RT",
-        "Human-only PO",
-        "Hybrid PO",
-    }
-    assert all(
-        isinstance(widget, pn.widgets.Checkbox)
-        for widget in mode_checkboxes.values()
-    )
+    assert set(mode_checkboxes) == {"RT", "PO", "Hybrid PO"}
+    assert all(isinstance(widget, pn.widgets.Checkbox) for widget in mode_checkboxes.values())
     assert mode_checkboxes["Hybrid PO"].value is True
     assert not any(
-        widget.value
-        for label, widget in mode_checkboxes.items()
-        if label != "Hybrid PO"
+        widget.value for label, widget in mode_checkboxes.items() if label != "Hybrid PO"
     )
-    mode_help = {
-        icon.value
-        for icon in tabs.select(pn.widgets.TooltipIcon)
-    }
-    assert {
-        "Full RT retraces every chirp.",
-        "Coherent RT updates a path bank between frame retraces.",
-        "Human-only PO excludes environment channels.",
-        (
-            "Hybrid PO includes blocking, coupling, and coherent-RT "
-            "sequence calibration."
-        ),
-    }.issubset(mode_help)
+    mode_help = {icon.value for icon in tabs.select(pn.widgets.TooltipIcon)}
+    assert set(gui_app_module._SOLVER_HELP.values()).issubset(mode_help)
     assert not any(
         widget.label == "Enable human ↔ environment coupling"
         for widget in tabs.select(pn.widgets.Checkbox)
     )
     assert any(
-        "Simulation results" in getattr(child, "_names", [])
-        for child in tabs.select(pn.Tabs)
+        "Simulation results" in getattr(child, "_names", []) for child in tabs.select(pn.Tabs)
     )
     motion_upload = next(
         widget
@@ -890,9 +1175,10 @@ def test_gui_builds_with_three_public_workflows_and_settings(monkeypatch):
     )
     assert motion_upload.accept == ".npz"
     assert motion_upload.description == (
-        "Upload a pickle-free AMASS-like pose archive with poses, trans, "
-        "betas, and timing. The configured SMPL model evaluates its mesh. "
-        "Browser uploads are limited to 64 MiB."
+        "Upload a pickle-free motion archive with vertices, faces, and times, "
+        "or AMASS-like poses, trans, betas, and timing. Supplied meshes are "
+        "used directly; pose-only archives need the configured SMPL model. "
+        f"Browser uploads are limited to {gui_app_module._MAX_MOTION_UPLOAD_BYTES // 1024**2} MiB."
     )
     assert any(
         "input[type=file].bk-input" in str(stylesheet)
@@ -903,15 +1189,9 @@ def test_gui_builds_with_three_public_workflows_and_settings(monkeypatch):
         and "width: 132px" in str(stylesheet)
         for stylesheet in motion_upload.stylesheets
     )
-    motion_upload_row = next(
-        row
-        for row in tabs.select(pn.Row)
-        if motion_upload in row.objects
-    )
+    motion_upload_row = next(row for row in tabs.select(pn.Row) if motion_upload in row.objects)
     motion_filename = next(
-        widget
-        for widget in motion_upload_row.objects
-        if isinstance(widget, pn.widgets.StaticText)
+        widget for widget in motion_upload_row.objects if isinstance(widget, pn.widgets.StaticText)
     )
     assert motion_upload.width == 132
     assert motion_upload.height == 40
@@ -929,74 +1209,73 @@ def test_gui_builds_with_three_public_workflows_and_settings(monkeypatch):
         SimpleNamespace(name="value", new=motion_upload.value),
         SimpleNamespace(name="filename", new=motion_upload.filename),
     )
-    assert gui_storage.saved_uploads["motion"]["filename"] == (
-        "selected_walk.npz"
-    )
-    assert base64.b64decode(
-        gui_storage.saved_uploads["motion"]["payload"]
-    ) == (
+    assert gui_storage.saved_uploads["motion"]["filename"] == ("selected_walk.npz")
+    assert base64.b64decode(gui_storage.saved_uploads["motion"]["payload"]) == (
         b"session motion bytes"
     )
     assert gui_storage.saved_state["has_motion"] is True
-    assert next(
-        widget
-        for widget in tabs.select(pn.widgets.FileInput)
-        if widget.label == "Static environment scene (.xml, optional)"
-    ).accept == ".xml"
+    assert (
+        next(
+            widget
+            for widget in tabs.select(pn.widgets.FileInput)
+            if widget.label == "Static environment scene (.xml, optional)"
+        ).accept
+        == ".xml"
+    )
     assert any(
         widget.label == "Licensed SMPL model directory"
         for widget in tabs.select(pn.widgets.TextInput)
     )
     dynamic_controls = next(
-        card
-        for card in tabs.select(pn.Card)
-        if card.title == "Dynamic scene controls"
+        column
+        for column in tabs.select(pn.Column)
+        if "hermes-dynamic-controls" in column.css_classes
     )
     run_button = next(
-        widget
-        for widget in dynamic_controls.select(pn.widgets.Button)
-        if widget.label == "Start"
+        widget for widget in tabs.select(pn.widgets.Button) if widget.label == "Start"
     )
     scene_upload = next(
         widget
         for widget in dynamic_controls.select(pn.widgets.FileInput)
         if widget.label == "Static environment scene (.xml, optional)"
     )
-    action_row = next(
-        row
-        for row in dynamic_controls.select(pn.Row)
-        if run_button in row.objects
-    )
-    assert dynamic_controls.objects.index(action_row) < (
-        dynamic_controls.objects.index(scene_upload)
-    )
+    # Start and Stop sit in the page's run bar beside the run status.
+    assert run_button not in dynamic_controls.select(pn.widgets.Button)
+    action_row = next(row for row in tabs.select(pn.Row) if run_button in row.objects)
+    assert "hermes-runbar-status" in action_row.css_classes
+    assert [
+        widget.label for widget in action_row.objects if isinstance(widget, pn.widgets.Button)
+    ] == ["Start", "Stop"]
+    dynamic_groups = [
+        group for group in dynamic_controls.objects if "hermes-group" in group.css_classes
+    ]
+    assert [group.name for group in dynamic_groups] == [
+        "Motion and scene",
+        "Simulation modes",
+        "Human placement",
+        "Radar orientation",
+        "Export",
+    ]
+    assert scene_upload in dynamic_groups[0].select(pn.widgets.FileInput)
     dynamic_copy = "\n".join(
-        str(pane.object)
-        for pane in dynamic_controls.select(pn.pane.Markdown)
+        str(pane.object) for pane in dynamic_controls.select(pn.pane.Markdown)
     )
-    assert "### Simulation modes" in dynamic_copy
     assert "Run simulation" not in dynamic_copy
     assert "Use the prepared room or upload a static-environment XML." not in dynamic_copy
-    assert (
-        "The radar phase center is fixed at **(0, 0, 0)** for this run."
-        not in dynamic_copy
-    )
+    assert "The radar phase center is fixed at **(0, 0, 0)** for this run." not in dynamic_copy
     assert "Without an uploaded XML" not in dynamic_copy
     assert "**Motion input:**" not in dynamic_copy
     assert not any(
-        "Load a bundle, then choose an embedded solver result or external ADC."
-        in str(pane.object)
+        "Load a bundle, then choose an embedded solver result or external ADC." in str(pane.object)
         for pane in tabs.select(pn.pane.Markdown)
     )
     comparison_source = next(
-        widget
-        for widget in tabs.select(pn.widgets.Select)
-        if widget.label == "Comparison source"
+        widget for widget in tabs.select(pn.widgets.Select) if widget.label == "Comparison source"
     )
     comparison_modes = next(
         widget
         for widget in tabs.select(pn.widgets.MultiChoice)
-        if widget.label == "Bundle simulation modes"
+        if widget.label == "Bundle solvers"
     )
     assert comparison_source.options == {
         "Run simulation from loaded bundle": "run",
@@ -1004,17 +1283,13 @@ def test_gui_builds_with_three_public_workflows_and_settings(monkeypatch):
     }
     assert comparison_source.value == "run"
     assert comparison_modes.visible is True
-    assert comparison_modes.value == ["human_only_po"]
+    assert comparison_modes.value == ["po"]
     channel_zero = next(
-        widget
-        for widget in tabs.select(pn.widgets.Checkbox)
-        if widget.label == "Channel 0 only"
+        widget for widget in tabs.select(pn.widgets.Checkbox) if widget.label == "Channel 0 only"
     )
     assert channel_zero.visible is True
     compare_button = next(
-        button
-        for button in tabs.select(pn.widgets.Button)
-        if button.label == "Run simulation"
+        button for button in tabs.select(pn.widgets.Button) if button.label == "Run simulation"
     )
     simulated_download = next(
         widget
@@ -1029,18 +1304,15 @@ def test_gui_builds_with_three_public_workflows_and_settings(monkeypatch):
     comparison_action_row = next(
         column
         for column in tabs.select(pn.Column)
-        if channel_download_row in column.objects
-        and compare_button in column.objects
+        if channel_download_row in column.objects and compare_button in column.objects
     )
-    assert comparison_action_row.margin == (2, 0)
+    assert comparison_action_row.margin == (2, 10)
     assert comparison_action_row.objects[0] is channel_download_row
     assert channel_download_row.objects[0] is channel_zero
     assert isinstance(channel_download_row.objects[1], pn.Spacer)
     assert channel_download_row.objects[2] is simulated_download
     dependency_hint = comparison_action_row.objects[2]
-    assert "Load and validate a primary bundle" in str(
-        dependency_hint.object
-    )
+    assert "Load and validate a primary bundle" in str(dependency_hint.object)
     assert dependency_hint.visible is True
     assert comparison_action_row.objects[3] is compare_button
     assert compare_button.sizing_mode == "stretch_width"
@@ -1048,25 +1320,21 @@ def test_gui_builds_with_three_public_workflows_and_settings(monkeypatch):
     assert compare_button.height == 46
     assert compare_button.margin == 0
     assert compare_button.disabled is True
-    panel_row = next(
-        layout
-        for layout in tabs.select(pn.FlexBox)
-        if {
-            card.title
-            for card in layout.objects
-            if isinstance(card, pn.Card)
-        }
-        == {"Step 1 · Primary bundle", "Step 2 · Bundle comparison"}
+    bundle_rail = next(
+        column for column in tabs.select(pn.Column) if "hermes-bundle-panels" in column.css_classes
     )
-    assert panel_row.flex_direction == "row"
-    assert panel_row.flex_wrap == "wrap"
-    assert panel_row.gap == "20px"
+    assert "hermes-rail" in bundle_rail.css_classes
+    assert not bundle_rail.select(pn.Card)
+    assert [
+        group.name for group in bundle_rail.objects if "hermes-group" in group.css_classes
+    ] == ["Step 1 · Primary bundle", "Step 2 · Bundle comparison"]
+    assert compare_button in bundle_rail.objects[2].select(pn.widgets.Button)
     compare_callback = next(
         watcher.fn
         for watcher in compare_button.param.watchers["clicks"]["value"]
         if getattr(watcher.fn, "__name__", "") == "on_compare"
     )
-    comparison_closure = inspect.getclosurevars(compare_callback)
+    comparison_closure = _callback_scope(compare_callback)
     comparison_status = next(
         pane
         for pane in tabs.select(pn.pane.Markdown)
@@ -1083,13 +1351,9 @@ def test_gui_builds_with_three_public_workflows_and_settings(monkeypatch):
         "color: #e7eef8 !important" in str(stylesheet)
         for stylesheet in comparison_metrics.stylesheets
     )
-    assert comparison_metrics in measurement_view_tabs.objects[5].select(
-        pn.pane.JSON
-    )
+    assert comparison_metrics in measurement_view_tabs.objects[5].select(pn.pane.JSON)
     assert "smpl_model_dir" not in comparison_closure.unbound
-    assert comparison_closure.nonlocals[
-        "human_room_smpl_model_dir"
-    ] is next(
+    assert comparison_closure.nonlocals["human_room_smpl_model_dir"] is next(
         widget
         for widget in tabs.select(pn.widgets.TextInput)
         if widget.label == "Licensed SMPL model directory"
@@ -1115,7 +1379,7 @@ def test_gui_builds_with_three_public_workflows_and_settings(monkeypatch):
     assert "Bundle loaded and validated" in str(bundle_status.object)
     assert "Frames `1`" in str(bundle_status.object)
     assert "ADC shape `(1, 64, 256, 192)`" in str(bundle_status.object)
-    assert "fingerprint `" in str(bundle_status.object)
+    assert "fingerprint <code>" in str(bundle_status.object)
     comparison_source.value = "saved"
     assert compare_button.disabled is True
     assert "Drop a saved ADC file or bundle" in str(dependency_hint.object)
@@ -1132,15 +1396,10 @@ def test_gui_builds_with_three_public_workflows_and_settings(monkeypatch):
         if pane.object is not None
     ]
     assert len(scene_figures) == 1
-    assert scene_figures[0].layout.title.text.startswith(
-        "Primary bundle scene"
-    )
-    assert any(
-        "Material: wood" in str(trace.hovertemplate)
-        for trace in scene_figures[0].data
-    )
-    adc_row = measurement_view_tabs.objects[1]
-    profile_plot = measurement_view_tabs.objects[2]
+    assert scene_figures[0].layout.title.text.startswith("Primary bundle scene")
+    assert any("Material: wood" in str(trace.hovertemplate) for trace in scene_figures[0].data)
+    adc_row = measurement_view_tabs.objects[1][-1]
+    profile_plot = measurement_view_tabs.objects[2].select(pn.pane.Plotly)[0]
     range_time_row = measurement_view_tabs.objects[3]
     range_doppler_row = measurement_view_tabs.objects[4]
     report_column = measurement_view_tabs.objects[5]
@@ -1150,7 +1409,9 @@ def test_gui_builds_with_three_public_workflows_and_settings(monkeypatch):
     assert isinstance(range_doppler_row, pn.Row)
     assert isinstance(report_column, pn.Column)
     assert profile_plot.object is not None
+    assert len([trace for trace in profile_plot.object.data if trace.showlegend]) == 1
     assert len(profile_plot.object.data) == 1
+    assert not any(widget.label == "Channel panels" for widget in tabs.select(pn.widgets.Select))
     candidate_results = (
         adc_row.objects[1],
         range_time_row.objects[1],
@@ -1168,29 +1429,22 @@ def test_gui_builds_with_three_public_workflows_and_settings(monkeypatch):
     assert simulated_download.sizing_mode == "fixed"
     assert simulated_download.width == 44
     assert simulated_download.height == 40
-    assert not simulated_download.stylesheets
+    assert simulated_download.color == "primary"
+    assert simulated_download.variant == "solid"
     assert simulated_download.visible is True
     assert simulated_download.disabled is True
 
     import validation.runner as validation_runner
 
-    comparison_state = inspect.getclosurevars(compare_callback).nonlocals[
-        "measurement_state"
-    ]
-    expected_simulated = np.asarray(
-        comparison_state["bundle"].primary_adc
-    ).copy()
+    comparison_state = _callback_scope(compare_callback).nonlocals["measurement_state"]
+    expected_simulated = np.asarray(comparison_state["bundle"].primary_adc).copy()
 
     def simulate_immediately(_bundle, **kwargs):
         assert callable(kwargs["cancel_check"])
-        return (
-            expected_simulated[..., :1]
-            if kwargs["channel_zero_only"]
-            else expected_simulated
-        )
+        return expected_simulated[..., :1] if kwargs["channel_zero_only"] else expected_simulated
 
     monkeypatch.setattr(
-        validation_runner,
+        _validation_simulation,
         "simulate_bundle_adc",
         simulate_immediately,
     )
@@ -1198,16 +1452,14 @@ def test_gui_builds_with_three_public_workflows_and_settings(monkeypatch):
     for results in candidate_results:
         assert results.visible is True
         assert len(results.objects) == 1
-        assert results.objects[0].object.layout.title.text.startswith(
-            "Simulated "
-        )
+        assert results.objects[0].object.layout.title.text.startswith("Simulated ")
     assert profile_plot.object.layout.title.text == "Range profile comparison"
-    assert [trace.name for trace in profile_plot.object.data] == [
+    assert [trace.name for trace in profile_plot.object.data if trace.showlegend] == [
         "Measured",
-        "Simulated Human-only PO",
+        "Simulated PO",
     ]
     assert simulated_download.disabled is False
-    assert simulated_download.filename == "simulated_adc_human_only_po.npz"
+    assert simulated_download.filename == "simulated_adc_po.npz"
     assert "Comparison complete" in str(comparison_status.object)
     assert {
         "range_time_correlation",
@@ -1219,28 +1471,30 @@ def test_gui_builds_with_three_public_workflows_and_settings(monkeypatch):
     with np.load(simulated_download.callback(), allow_pickle=False) as archive:
         assert np.array_equal(archive["adc"], expected_simulated)
 
-    comparison_modes.value = ["human_only_po", "rt_coherent_bank"]
-    assert comparison_state["comparisons"] == {}
-    assert comparison_state["simulated_adcs"] == {}
+    comparison_modes.value = ["po", "rt"]
+    assert set(comparison_state["comparisons"]) == {"po"}
+    assert set(comparison_state["simulated_adcs"]) == {"po"}
+    assert tabs._names[2] == "Bundle Comparison •"
+    assert all(results.visible for results in candidate_results)
     assert simulated_download.disabled is True
     assert simulated_download.callback().getvalue() == b""
     channel_zero.value = True
     asyncio.run(compare_callback(None))
     for results in candidate_results:
         assert len(results.objects) == 2
-    assert [trace.name for trace in profile_plot.object.data] == [
+    assert [trace.name for trace in profile_plot.object.data if trace.showlegend] == [
         "Measured",
-        "Simulated Human-only PO",
-        "Simulated Coherent RT",
+        "Simulated PO",
+        "Simulated RT",
     ]
     assert simulated_download.filename == "simulated_adc_results.zip"
     with zipfile.ZipFile(simulated_download.callback()) as archive:
         assert set(archive.namelist()) == {
-            "simulated_adc_human_only_po.npz",
-            "simulated_adc_rt_coherent_bank.npz",
+            "simulated_adc_po.npz",
+            "simulated_adc_rt.npz",
         }
         with np.load(
-            BytesIO(archive.read("simulated_adc_human_only_po.npz")),
+            BytesIO(archive.read("simulated_adc_po.npz")),
             allow_pickle=False,
         ) as exported:
             assert exported["adc"].shape[-1] == 1
@@ -1255,7 +1509,7 @@ def test_gui_builds_with_three_public_workflows_and_settings(monkeypatch):
         raise InterruptedError("Simulation cancelled by user")
 
     monkeypatch.setattr(
-        validation_runner,
+        _validation_simulation,
         "simulate_bundle_adc",
         simulate_until_cancelled,
     )
@@ -1291,25 +1545,15 @@ def test_gui_builds_with_three_public_workflows_and_settings(monkeypatch):
     assert "Simulation stopped" in str(comparison_status.object)
     assert simulated_download.disabled is True
     assert not tabs.select(pn.widgets.FileSelector)
-    assert not any(
-        button.label == "File explorer"
-        for button in tabs.select(pn.widgets.Button)
-    )
-    file_droppers = {
-        dropper.label: dropper
-        for dropper in tabs.select(pn.widgets.FileDropper)
-    }
+    assert not any(button.label == "File explorer" for button in tabs.select(pn.widgets.Button))
+    file_droppers = {dropper.label: dropper for dropper in tabs.select(pn.widgets.FileDropper)}
     assert set(file_droppers) == {
         "Drop primary bundle ZIP or folder",
         "Drop simulated ADC, bundle ZIP, or folder",
     }
     assert all(dropper.multiple for dropper in file_droppers.values())
-    measurement_dropper = file_droppers[
-        "Drop primary bundle ZIP or folder"
-    ]
-    simulated_dropper = file_droppers[
-        "Drop simulated ADC, bundle ZIP, or folder"
-    ]
+    measurement_dropper = file_droppers["Drop primary bundle ZIP or folder"]
+    simulated_dropper = file_droppers["Drop simulated ADC, bundle ZIP, or folder"]
     assert simulated_dropper.visible is False
     measurement_source = next(
         widget
@@ -1328,16 +1572,302 @@ def test_gui_builds_with_three_public_workflows_and_settings(monkeypatch):
     measurement_dropper.value = {"dropped-bundle.zip": b"zip bytes"}
     assert any(
         "Bundle upload ready" in str(pane.object)
-        and "`dropped-bundle.zip`" in str(pane.object)
+        and "<code>dropped-bundle.zip</code>" in str(pane.object)
         for pane in tabs.select(pn.pane.Markdown)
     )
-    included_fixture = next(
-        value for value in measurement_source.options.values() if value
-    )
+    included_fixture = next(value for value in measurement_source.options.values() if value)
     measurement_source.value = included_fixture
     assert measurement_dropper.visible is False
     measurement_source.value = ""
     assert measurement_dropper.visible is True
+
+
+def test_settings_dialog_stages_cancels_applies_and_reruns(monkeypatch):
+    app = build_app()
+    tabs = app.main[0]
+    widgets = {w.label: w for w in app.modal[0].select(pn.widgets.Widget) if w.label}
+    gear = next(w for w in app.header[0].select(pn.widgets.Button) if w.icon == "settings")
+    storage = next(
+        c for c in app.header[0].select(pn.reactive.ReactiveHTML) if "loaded_state" in c.param
+    )
+    solver_storage = next(
+        c for c in app.header[0].select(pn.reactive.ReactiveHTML) if "loaded_settings" in c.param
+    )
+    carrier = widgets["Carrier frequency [GHz]"]
+    rays = widgets["RT ray samples per source"]
+    cancel = widgets["Cancel"]
+    apply = widgets["Apply"]
+    original = (carrier.value, rays.value)
+    saved = dict(storage.saved_state)
+    width = next(w for w in tabs.select(pn.widgets.FloatInput) if w.label == "Width [m]")
+    control_callback = next(
+        w.fn
+        for w in width.param.watchers["value"]["value"]
+        if getattr(w.fn, "__name__", "") == "on_physics_control_change"
+    )
+    update = _callback_scope(control_callback).nonlocals["update_physics"]
+    physics_state = _callback_scope(update).nonlocals["physics_state"]
+    original_result = physics_state["result"]
+    runs = []
+
+    def run(**kwargs):
+        runs.append(kwargs)
+        return original_result
+
+    monkeypatch.setattr(gui_app_module, "run_static_target_experiment", run)
+    gear.clicks += 1
+    carrier.value = original[0] + 1
+    rays.value = 600
+    widgets["PO facet integration"].value = "parent_face_quadrature"
+    widgets["PO subdivision phase span [rad]"].value = 0.75
+    assert storage.saved_state == saved
+    assert physics_state["result"] is original_result
+    assert tabs._names[0] == "Static Target"
+    cancel.clicks += 1
+    assert (carrier.value, rays.value) == original
+    assert widgets["PO facet integration"].value == "parent_face_adaptive_analytic"
+    assert widgets["PO subdivision phase span [rad]"].value == 6
+    assert runs == []
+
+    gear.clicks += 1
+    carrier.value = original[0] + 1
+    rays.value = 600
+    apply.clicks += 1
+    assert runs == []
+    assert tabs._names[0] == "Static Target •"
+    assert storage.saved_state["radar_controls"]["carrier_frequency"] == original[0] + 1
+    assert solver_storage.saved_settings["settings"]["rt_samples_per_source"] == 600
+
+    gear.clicks += 1
+    rays.value = 700
+    widgets["Apply & rerun this page"].value = True
+    apply.clicks += 1
+    assert len(runs) == 1
+    assert runs[0]["carrier_frequency_hz"] == (original[0] + 1) * 1e9
+    assert runs[0]["rt_samples_per_source"] == 700
+    assert tabs._names[0] == "Static Target"
+
+
+def test_dynamic_failure_clears_progress_and_renders_error_once(monkeypatch):
+    app = build_app()
+    tabs = app.main[0]
+    start = next(w for w in tabs.select(pn.widgets.Button) if w.label == "Start")
+    run = next(
+        w.fn
+        for w in start.param.watchers["clicks"]["value"]
+        if getattr(w.fn, "__name__", "") == "on_run_human_room"
+    )
+    closure = _callback_scope(run).nonlocals
+    upload = next(
+        w for w in tabs.select(pn.widgets.FileInput) if w.label == "AMASS-like human motion (.npz)"
+    )
+    motion = BytesIO()
+    np.savez(motion, vertices=np.zeros((1, 3, 3)), faces=np.array([[0, 1, 2]]), times=[0.0])
+    with param.parameterized.discard_events(upload):
+        upload.filename = "tiny.npz"
+        upload.value = motion.getvalue()
+    monkeypatch.setattr(gui_app_module, "load_amass_motion", lambda *_a, **_kw: object())
+
+    def fail(**_kwargs):
+        raise ValueError("expected x < y & z")
+
+    monkeypatch.setattr(gui_app_module, "run_human_room_experiment", fail)
+    asyncio.run(run(None))
+    assert closure["human_room_state"]["running"] is False
+    assert closure["human_room_results"].loading is False
+    assert "in progress" not in str(closure["human_room_results"][0].object)
+    model = closure["human_room_status"]._get_model(Document())
+    assert "&amp;lt;" in model.text
+    assert "&amp;amp;lt;" not in model.text
+    assert closure["stop_human_room"].disabled is True
+    assert closure["stop_human_room"].color == "light"
+
+
+@pytest.mark.parametrize("has_previous_result", [False, True])
+def test_stopping_dynamic_run_clears_progress_and_keeps_previous_products(
+    monkeypatch,
+    has_previous_result,
+):
+    app = build_app()
+    tabs = app.main[0]
+    start = next(w for w in tabs.select(pn.widgets.Button) if w.label == "Start")
+    run = next(
+        w.fn
+        for w in start.param.watchers["clicks"]["value"]
+        if getattr(w.fn, "__name__", "") == "on_run_human_room"
+    )
+    closure = _callback_scope(run).nonlocals
+    state = closure["human_room_state"]
+    results = closure["human_room_results"]
+    upload = next(
+        w for w in tabs.select(pn.widgets.FileInput) if w.label == "AMASS-like human motion (.npz)"
+    )
+    motion = BytesIO()
+    np.savez(motion, vertices=np.zeros((1, 3, 3)), faces=np.array([[0, 1, 2]]), times=[0.0])
+    with param.parameterized.discard_events(upload):
+        upload.filename = "tiny.npz"
+        upload.value = motion.getvalue()
+    monkeypatch.setattr(gui_app_module, "load_amass_motion", lambda *_a, **_kw: object())
+    previous_view = pn.pane.Markdown("Previous completed products")
+    if has_previous_result:
+        state["result"] = SimpleNamespace(solver="hybrid_po")
+        state["results"] = {"hybrid_po": state["result"]}
+        results.objects = [previous_view]
+        closure["remember_result_settings"]("dynamic")
+
+    def stop(**_kwargs):
+        raise InterruptedError("test run stopped")
+
+    monkeypatch.setattr(gui_app_module, "run_human_room_experiment", stop)
+    asyncio.run(run(None))
+
+    assert state["running"] is False
+    assert results.loading is False
+    assert "STOPPED" in str(closure["human_room_status"].object)
+    assert "in progress" not in str(results[0].object)
+    if has_previous_result:
+        assert results[0] is previous_view
+        assert state["result"] is not None
+    else:
+        assert "stopped before any mode completed" in str(results[0].object)
+        assert state["result"] is None
+
+
+def test_dynamic_overlays_keep_start_disabled_and_reject_overlapping_runs(monkeypatch):
+    app = build_app()
+    tabs = app.main[0]
+    start = next(w for w in tabs.select(pn.widgets.Button) if w.label == "Start")
+    run = next(
+        w.fn
+        for w in start.param.watchers["clicks"]["value"]
+        if getattr(w.fn, "__name__", "") == "on_run_human_room"
+    )
+    closure = _callback_scope(run).nonlocals
+    state = closure["human_room_state"]
+    show = closure["run_human_room_diagnostics_button"]
+    diagnose = next(
+        w.fn
+        for w in show.param.watchers["clicks"]["value"]
+        if getattr(w.fn, "__name__", "") == "on_run_human_room_diagnostics"
+    )
+    upload = next(
+        w for w in tabs.select(pn.widgets.FileInput) if w.label == "AMASS-like human motion (.npz)"
+    )
+    motion = BytesIO()
+    np.savez(motion, vertices=np.zeros((1, 3, 3)), faces=np.array([[0, 1, 2]]), times=[0.0])
+    with param.parameterized.discard_events(upload):
+        upload.filename = "tiny.npz"
+        upload.value = motion.getvalue()
+    monkeypatch.setattr(gui_app_module, "load_amass_motion", lambda *_a, **_kw: object())
+    state["loaded_motion"] = object()
+    state["preview"] = SimpleNamespace(
+        mesh_sequence=SimpleNamespace(times=np.asarray([0.0])),
+    )
+    state["result"] = SimpleNamespace(
+        adc=np.zeros((1, 1, 1, 1), dtype=np.complex64),
+        manifest=SimpleNamespace(
+            scene=SimpleNamespace(
+                parameters={
+                    "motion_start_s": 0.0,
+                    "motion_end_s": 0.05,
+                }
+            ),
+            radar=SimpleNamespace(parameters={"frame_period_s": 0.05}),
+        ),
+    )
+    state["results"] = {"hybrid_po": state["result"]}
+    closure["remember_result_settings"]("dynamic")
+    closure["refresh_result_validity"]()
+    assert start.disabled is False
+    started = threading.Event()
+    release = threading.Event()
+    diagnostic_calls = []
+    simulation_calls = []
+
+    def diagnostic_worker(*_args, **_kwargs):
+        diagnostic_calls.append(True)
+        started.set()
+        assert release.wait(timeout=5.0)
+        raise InterruptedError("test overlays stopped")
+
+    def simulation_worker(**kwargs):
+        simulation_calls.append(kwargs)
+        raise InterruptedError("unexpected simulation")
+
+    monkeypatch.setattr(gui_app_module, "run_human_room_diagnostics", diagnostic_worker)
+    monkeypatch.setattr(gui_app_module, "run_human_room_experiment", simulation_worker)
+
+    async def exercise_overlays():
+        task = asyncio.create_task(diagnose(None))
+        try:
+            assert await asyncio.to_thread(started.wait, 5.0)
+            assert start.disabled is True
+            closure["refresh_result_validity"]()
+            assert start.disabled is True
+            await run(None)
+            await asyncio.wait_for(diagnose(None), timeout=1.0)
+            assert simulation_calls == []
+            assert len(diagnostic_calls) == 1
+            assert state["diagnostic_cancel_event"] is not None
+        finally:
+            release.set()
+            await asyncio.wait_for(task, timeout=5.0)
+
+    asyncio.run(exercise_overlays())
+    assert start.disabled is False
+    assert state["diagnostic_cancel_event"] is None
+
+
+def test_adc_trace_selection_addresses_frame_chirp_and_channel():
+    adc = np.arange(2 * 3 * 8 * 2).reshape(2, 3, 8, 2).astype(complex)
+    adc += 1j * adc.real * 2
+    figure = gui_app_module._adc_trace_figure(
+        SimpleNamespace(adc=adc),
+        go,
+        title="Selected ADC",
+        plot_template="plotly_dark",
+        frame_index=1,
+        chirp_index=2,
+        channel_index=1,
+    )
+    np.testing.assert_array_equal(figure.data[0].y, adc[1, 2, :, 1].real)
+    np.testing.assert_array_equal(figure.data[1].y, adc[1, 2, :, 1].imag)
+    missing = gui_app_module._adc_trace_figure(
+        SimpleNamespace(adc=adc[..., :1]),
+        go,
+        title="Candidate ADC",
+        plot_template="plotly_white",
+        channel_index=1,
+    )
+    assert len(missing.data) == 0
+    assert "unavailable" in missing.layout.annotations[0].text
+
+
+def test_radar_summary_uses_the_sampled_bandwidth():
+    app = build_app()
+    summary = next(
+        p for p in app.modal[0].select(pn.pane.Markdown) if "Sampled bandwidth" in str(p.object)
+    )
+    assert "3.400 GHz" in summary.object
+    assert "4.41 cm" in summary.object
+
+
+def test_runtime_stage_table_sorts_and_filters():
+    table = gui_app_module._runtime_stage_table(
+        {
+            "assembly": 0.2,
+            "hybrid_total": 5.0,
+            "rt_baseline_trace": 2.0,
+            "negligible_stage": 0.00001,
+            "invalid_stage": float("nan"),
+        }
+    )
+    assert table.index("Hybrid total") < table.index("RT baseline trace") < table.index("Assembly")
+    assert "Negligible" not in table
+    assert "Invalid" not in table
+    assert "| 5.000 |" in table
+    assert "not additive" in table
+    assert gui_app_module._runtime_stage_table({"zero": 0.0}) == ""
 
 
 def test_gui_template_initializes_server_document_resources():
@@ -1347,6 +1877,7 @@ def test_gui_template_initializes_server_document_resources():
     application.server_doc(document)
 
     assert "template_resources" in document.template_variables
+    assert not [issue for issue in check_integrity(document.models).error if issue.code == 1021]
 
 
 def test_bundle_comparison_state_restores_across_theme_reload():
@@ -1354,9 +1885,7 @@ def test_bundle_comparison_state_restores_across_theme_reload():
     tabs = application.main[0]
     storage = next(
         component
-        for component in application.header[0].select(
-            pn.reactive.ReactiveHTML
-        )
+        for component in application.header[0].select(pn.reactive.ReactiveHTML)
         if "loaded_state" in component.param
     )
     fixture = next(
@@ -1374,45 +1903,35 @@ def test_bundle_comparison_state_restores_across_theme_reload():
         for watcher in load_button.param.watchers["clicks"]["value"]
         if getattr(watcher.fn, "__name__", "") == "on_load_bundle"
     )
-    bundle_path = inspect.getclosurevars(load_callback).nonlocals["bundle_path"]
+    bundle_path = _callback_scope(load_callback).nonlocals["bundle_path"]
     background = next(
         widget
         for widget in tabs.select(pn.widgets.Checkbox)
         if widget.label == "Background subtraction"
     )
     clutter = next(
-        widget
-        for widget in tabs.select(pn.widgets.Select)
-        if widget.label == "Clutter removal"
+        widget for widget in tabs.select(pn.widgets.Select) if widget.label == "Clutter removal"
     )
     comparison_source = next(
-        widget
-        for widget in tabs.select(pn.widgets.Select)
-        if widget.label == "Comparison source"
+        widget for widget in tabs.select(pn.widgets.Select) if widget.label == "Comparison source"
     )
     comparison_modes = next(
         widget
         for widget in tabs.select(pn.widgets.MultiChoice)
-        if widget.label == "Bundle simulation modes"
+        if widget.label == "Bundle solvers"
     )
     channel_zero = next(
-        widget
-        for widget in tabs.select(pn.widgets.Checkbox)
-        if widget.label == "Channel 0 only"
+        widget for widget in tabs.select(pn.widgets.Checkbox) if widget.label == "Channel 0 only"
     )
     compare_button = next(
-        widget
-        for widget in tabs.select(pn.widgets.Button)
-        if widget.label == "Run simulation"
+        widget for widget in tabs.select(pn.widgets.Button) if widget.label == "Run simulation"
     )
     compare_callback = next(
         watcher.fn
         for watcher in compare_button.param.watchers["clicks"]["value"]
         if getattr(watcher.fn, "__name__", "") == "on_compare"
     )
-    simulated_path = inspect.getclosurevars(compare_callback).nonlocals[
-        "simulated_path"
-    ]
+    simulated_path = _callback_scope(compare_callback).nonlocals["simulated_path"]
     included_fixture = next(value for value in fixture.options.values() if value)
     cached_bundle = load_bundle(included_fixture)
     comparison_cache_key = _cache_theme_comparison(
@@ -1436,9 +1955,7 @@ def test_bundle_comparison_state_restores_across_theme_reload():
         for watcher in storage.param.watchers["loaded_state"]["value"]
         if getattr(watcher.fn, "__name__", "") == "restore_gui_session"
     )
-    restore_state = inspect.getclosurevars(restore_callback).nonlocals[
-        "gui_session_state"
-    ]
+    restore_state = _callback_scope(restore_callback).nonlocals["gui_session_state"]
 
     async def restore_state_and_bundle():
         storage.loaded_state = {
@@ -1452,10 +1969,7 @@ def test_bundle_comparison_state_restores_across_theme_reload():
             "background_subtraction": False,
             "clutter_removal": "mean",
             "comparison_source": "saved",
-            "comparison_simulation_modes": [
-                "human_only_po",
-                "rt_coherent_bank",
-            ],
+            "comparison_solvers": ["po", "rt"],
             "comparison_channel_zero": True,
             "simulated_path": "/tmp/persisted-candidate.npz",
             "comparison_completed": True,
@@ -1476,12 +1990,10 @@ def test_bundle_comparison_state_restores_across_theme_reload():
     assert background.value is False
     assert clutter.value == "mean"
     assert comparison_source.value == "saved"
-    assert comparison_modes.value == ["human_only_po", "rt_coherent_bank"]
+    assert comparison_modes.value == ["po", "rt"]
     assert channel_zero.value is True
     assert simulated_path.value == "/tmp/persisted-candidate.npz"
-    measurement_state = inspect.getclosurevars(restore_callback).nonlocals[
-        "measurement_state"
-    ]
+    measurement_state = _callback_scope(restore_callback).nonlocals["measurement_state"]
     assert measurement_state["bundle"] is not None
     assert measurement_state["comparison_cache_key"] == comparison_cache_key
     assert set(measurement_state["comparisons"]) == {"saved"}
@@ -1489,12 +2001,60 @@ def test_bundle_comparison_state_restores_across_theme_reload():
 
     channel_zero.value = False
     assert storage.saved_state["comparison_channel_zero"] is False
-    assert storage.saved_state["comparison_simulation_modes"] == [
-        "human_only_po",
-        "rt_coherent_bank",
-    ]
+    assert storage.saved_state["comparison_solvers"] == ["po", "rt"]
     background.value = True
     assert storage.saved_state["background_subtraction"] is True
+
+
+def test_bundle_adc_selection_persists_immediately_and_restores():
+    app = build_app()
+    tabs = app.main[0]
+    storage = next(
+        c for c in app.header[0].select(pn.reactive.ReactiveHTML) if "loaded_state" in c.param
+    )
+    load = next(w for w in tabs.select(pn.widgets.Button) if w.label == "Load and validate bundle")
+    load_callback = next(
+        w.fn
+        for w in load.param.watchers["clicks"]["value"]
+        if getattr(w.fn, "__name__", "") == "on_load_bundle"
+    )
+    asyncio.run(load_callback(None))
+    selectors = {
+        name: next(w for w in tabs.select(pn.widgets.IntInput) if w.label == f"ADC {name}")
+        for name in ("frame", "chirp", "channel")
+    }
+    expected = {}
+    for name, selector in selectors.items():
+        assert selector.disabled is False
+        expected[name] = min(1, selector.end)
+        selector.value = expected[name]
+        assert storage.saved_state["adc_selection"][name] == expected[name]
+    assert expected["chirp"] == 1
+    assert expected["channel"] == 1
+    saved = json.loads(json.dumps(storage.saved_state))
+
+    restored = build_app()
+    restored_storage = next(
+        c for c in restored.header[0].select(pn.reactive.ReactiveHTML) if "loaded_state" in c.param
+    )
+    restore = next(
+        w.fn
+        for w in restored_storage.param.watchers["loaded_state"]["value"]
+        if getattr(w.fn, "__name__", "") == "restore_gui_session"
+    )
+    restore_state = _callback_scope(restore).nonlocals["gui_session_state"]
+
+    async def restore_bundle():
+        restored_storage.loaded_state = saved
+        await restore_state["bundle_restore_task"]
+
+    asyncio.run(restore_bundle())
+    for name, value in expected.items():
+        selector = next(
+            w for w in restored.main[0].select(pn.widgets.IntInput) if w.label == f"ADC {name}"
+        )
+        assert selector.value == value
+    assert restored_storage.saved_state["adc_selection"] == expected
 
 
 def test_stale_bundle_load_cannot_commit_after_selection_changes(monkeypatch):
@@ -1510,7 +2070,7 @@ def test_stale_bundle_load_cannot_commit_after_selection_changes(monkeypatch):
         for watcher in load_button.param.watchers["clicks"]["value"]
         if getattr(watcher.fn, "__name__", "") == "on_load_bundle"
     )
-    closure = inspect.getclosurevars(load_callback).nonlocals
+    closure = _callback_scope(load_callback).nonlocals
     bundle_path = closure["bundle_path"]
     measurement_state = closure["measurement_state"]
     original_bundle = load_bundle(bundle_path.value)
@@ -1543,38 +2103,24 @@ def test_static_dynamic_controls_and_uploads_restore_across_theme_reload():
     tabs = application.main[0]
     storage = next(
         component
-        for component in application.header[0].select(
-            pn.reactive.ReactiveHTML
-        )
+        for component in application.header[0].select(pn.reactive.ReactiveHTML)
         if "loaded_uploads" in component.param
     )
     all_widgets = [
         *tabs.select(pn.widgets.Widget),
         *application.modal[0].select(pn.widgets.Widget),
     ]
-    widgets = {
-        widget.label: widget
-        for widget in all_widgets
-        if getattr(widget, "label", "")
-    }
-    static_range = widgets["Target x / range-forward [m]"]
+    widgets = {widget.label: widget for widget in all_widgets if getattr(widget, "label", "")}
+    static_range = _numeric_controls(tabs, "static-position")["X [m]"]
     static_material = widgets["Material preset"]
-    static_radar_yaw = next(
-        widget
-        for widget in tabs.select(pn.widgets.FloatSlider)
-        if widget.label == "Radar yaw [deg]"
-    )
-    dynamic_radar_yaw = [
-        widget
-        for widget in tabs.select(pn.widgets.FloatSlider)
-        if widget.label == "Radar yaw [deg]"
-    ][1]
-    human_x = widgets["Human x / range-forward [m]"]
-    human_yaw = widgets["Human yaw [deg]"]
+    static_radar_yaw = _numeric_controls(tabs, "static-radar-orientation")["Yaw [deg]"]
+    dynamic_radar_yaw = _numeric_controls(tabs, "dynamic-radar-orientation")["Yaw [deg]"]
+    human_x = _numeric_controls(tabs, "dynamic-position")["X [m]"]
+    human_yaw = _numeric_controls(tabs, "dynamic-orientation")["Yaw [deg]"]
     smpl_dir = widgets["Licensed SMPL model directory"]
     tx_antennas = widgets["Active Tx antennas"]
     rt_samples = widgets["RT ray samples per source"]
-    full_rt = widgets["Full RT"]
+    rt_solver = widgets["RT"]
     hybrid_po = widgets["Hybrid PO"]
     static_upload = widgets["Human mesh (.obj or .npz)"]
     motion_upload = widgets["AMASS-like human motion (.npz)"]
@@ -1590,7 +2136,7 @@ def test_static_dynamic_controls_and_uploads_restore_across_theme_reload():
         smpl_dir: "/private/models/smpl",
         tx_antennas: [0],
         rt_samples: 600,
-        full_rt: True,
+        rt_solver: True,
         hybrid_po: False,
     }
     for widget, value in changed_values.items():
@@ -1619,16 +2165,13 @@ def test_static_dynamic_controls_and_uploads_restore_across_theme_reload():
     assert saved_state["radar_controls"]["tx_antennas"] == [0]
     assert saved_state["dynamic_controls"]["human_yaw"] == 35.0
     assert saved_state["solver_settings"]["rt_samples_per_source"] == 600
-    assert saved_state["dynamic_modes"] == {
-        "full_rt": True,
-        "coherent_rt": False,
-        "human_only_po": False,
+    assert saved_state["dynamic_solvers"] == {
+        "rt": True,
+        "po": False,
         "hybrid_po": False,
     }
     assert set(saved_uploads) == {"static_mesh", "motion", "scene_xml"}
-    assert _get_theme_gui_results(saved_state["gui_result_cache_key"])[
-        "static_result"
-    ] is not None
+    assert _get_theme_gui_results(saved_state["gui_result_cache_key"])["static_result"] is not None
 
     reset_values = {
         static_range: 1.0,
@@ -1640,7 +2183,7 @@ def test_static_dynamic_controls_and_uploads_restore_across_theme_reload():
         smpl_dir: "",
         tx_antennas: list(tx_antennas.options.values()),
         rt_samples: 100_000,
-        full_rt: False,
+        rt_solver: False,
         hybrid_po: True,
     }
     for widget, value in reset_values.items():
@@ -1663,7 +2206,7 @@ def test_static_dynamic_controls_and_uploads_restore_across_theme_reload():
     assert smpl_dir.value == "/private/models/smpl"
     assert tx_antennas.value == [0]
     assert rt_samples.value == 600
-    assert full_rt.value is True
+    assert rt_solver.value is True
     assert hybrid_po.value is False
     assert static_upload.filename == "subject.obj"
     assert static_upload.value == b"mesh bytes"
@@ -1673,17 +2216,18 @@ def test_static_dynamic_controls_and_uploads_restore_across_theme_reload():
     assert scene_upload.value == b'<scene version="3.0.0"/>'
 
 
-def test_completed_dynamic_results_restore_from_theme_cache(monkeypatch):
+@pytest.mark.parametrize(
+    "selection_version", [None, gui_app_module._IMAGE_SOURCE_SELECTION_VERSION]
+)
+def test_completed_dynamic_results_restore_from_theme_cache(monkeypatch, selection_version):
     application = build_app()
     tabs = application.main[0]
     storage = next(
         component
-        for component in application.header[0].select(
-            pn.reactive.ReactiveHTML
-        )
+        for component in application.header[0].select(pn.reactive.ReactiveHTML)
         if "loaded_uploads" in component.param
     )
-    fake_result = SimpleNamespace(simulation_mode="hybrid_po")
+    fake_result = SimpleNamespace(solver="hybrid_po")
     cache_key = _cache_theme_gui_results(
         dynamic_results={"hybrid_po": fake_result},
         dynamic_status="**SIMULATION READY** · restored",
@@ -1693,27 +2237,17 @@ def test_completed_dynamic_results_restore_from_theme_cache(monkeypatch):
     monkeypatch.setattr(
         gui_app_module,
         "_human_room_results_view",
-        lambda *_args, **_kwargs: pn.Column(
-            pn.pane.Markdown("restored dynamic products")
-        ),
+        lambda *_args, **_kwargs: pn.Column(pn.pane.Markdown("restored dynamic products")),
     )
     restore_callback = next(
         watcher.fn
         for watcher in storage.param.watchers["loaded_state"]["value"]
         if getattr(watcher.fn, "__name__", "") == "restore_gui_session"
     )
-    human_room_state = inspect.getclosurevars(restore_callback).nonlocals[
-        "human_room_state"
-    ]
-    full_rt = next(
-        widget
-        for widget in tabs.select(pn.widgets.Checkbox)
-        if widget.label == "Full RT"
-    )
+    human_room_state = _callback_scope(restore_callback).nonlocals["human_room_state"]
+    rt_solver = next(widget for widget in tabs.select(pn.widgets.Checkbox) if widget.label == "RT")
     hybrid_po = next(
-        widget
-        for widget in tabs.select(pn.widgets.Checkbox)
-        if widget.label == "Hybrid PO"
+        widget for widget in tabs.select(pn.widgets.Checkbox) if widget.label == "Hybrid PO"
     )
     rt_samples = next(
         widget
@@ -1721,12 +2255,13 @@ def test_completed_dynamic_results_restore_from_theme_cache(monkeypatch):
         if widget.label == "RT ray samples per source"
     )
     mode_events = []
-    full_rt.param.watch(lambda event: mode_events.append(event.new), "value")
+    rt_solver.param.watch(lambda event: mode_events.append(event.new), "value")
     dynamic_tabs = next(
         component
         for component in tabs.select(pn.Tabs)
         if component._names == ["Scene and motion", "Simulation results"]
     )
+    dynamic_tabs.active = 1
     navigation_events = []
     dynamic_tabs.param.watch(
         lambda event: navigation_events.append(event.new),
@@ -1735,6 +2270,8 @@ def test_completed_dynamic_results_restore_from_theme_cache(monkeypatch):
 
     storage.loaded_state = {
         "schema_version": 2,
+        "po_defaults_version": gui_app_module._PO_DEFAULTS_VERSION,
+        "image_source_selection_version": selection_version,
         "top_tab": 1,
         "dynamic_tab": 1,
         "measurement_tab": 0,
@@ -1748,43 +2285,39 @@ def test_completed_dynamic_results_restore_from_theme_cache(monkeypatch):
             "rt_max_paths_per_source": 5_000,
             "rt_max_depth": 3,
         },
-        "dynamic_modes": {
-            "full_rt": True,
-            "coherent_rt": False,
-            "human_only_po": False,
-            "hybrid_po": False,
-        },
+        "dynamic_solvers": {"rt": True, "po": False, "hybrid_po": False},
         "has_uploads": False,
         "bundle_loaded": False,
     }
 
+    if selection_version is None:
+        assert human_room_state["result"] is None
+        assert human_room_state["results"] == {}
+        return
     assert human_room_state["result"] is fake_result
     assert human_room_state["results"] == {"hybrid_po": fake_result}
-    assert full_rt.value is True
+    assert rt_solver.value is True
     assert hybrid_po.value is False
     assert rt_samples.value == 600
     assert mode_events == [True]
-    assert navigation_events == [1]
+    assert dynamic_tabs.active == 0
+    assert navigation_events == [0]
     solver_storage = next(
         component
-        for component in application.header[0].select(
-            pn.reactive.ReactiveHTML
-        )
+        for component in application.header[0].select(pn.reactive.ReactiveHTML)
         if "loaded_settings" in component.param
     )
     solver_restore = next(
         watcher.fn
-        for watcher in solver_storage.param.watchers["loaded_settings"][
-            "value"
-        ]
-        if getattr(watcher.fn, "__name__", "")
-        == "on_solver_settings_loaded"
+        for watcher in solver_storage.param.watchers["loaded_settings"]["value"]
+        if getattr(watcher.fn, "__name__", "") == "on_solver_settings_loaded"
     )
     asyncio.run(
         solver_restore(
             SimpleNamespace(
                 new={
-                    "schema_version": 1,
+                    "schema_version": gui_app_module._SOLVER_SETTINGS_SCHEMA_VERSION,
+                    "po_defaults_version": gui_app_module._PO_DEFAULTS_VERSION,
                     "settings": storage.loaded_state["solver_settings"],
                 }
             )
@@ -1792,8 +2325,7 @@ def test_completed_dynamic_results_restore_from_theme_cache(monkeypatch):
     )
     assert human_room_state["result"] is fake_result
     assert any(
-        "restored dynamic products" in str(pane.object)
-        for pane in tabs.select(pn.pane.Markdown)
+        "restored dynamic products" in str(pane.object) for pane in tabs.select(pn.pane.Markdown)
     )
     export_button = next(
         button
@@ -1803,36 +2335,184 @@ def test_completed_dynamic_results_restore_from_theme_cache(monkeypatch):
     )
     assert export_button.disabled is False
 
+    count = next(
+        widget
+        for widget in application.modal[0].select(pn.widgets.IntInput)
+        if widget.label == "Image-source maximum count"
+    )
+    count.value = 2
+    saved = storage.saved_state
+    assert saved["solver_settings"]["hybrid_max_reflectors"] == 2
+    cached = _get_theme_gui_results(saved["gui_result_cache_key"])
+    assert cached["dynamic_results"] == {"hybrid_po": fake_result}
+    assert cached["dynamic_settings"]["fingerprint"]
+    assert export_button.disabled is True
+    assert tabs._names[1] == "Dynamic Scenes •"
+    assert _result_banner(application.main[0], "Dynamic").visible is True
 
-def test_dynamic_run_locks_and_restores_every_input_widget(monkeypatch):
+    count.value = 4
+    assert human_room_state["result"] is fake_result
+    assert export_button.disabled is False
+    assert tabs._names[1] == "Dynamic Scenes"
+
+
+@pytest.mark.parametrize(
+    "key,new_value,affected_pages",
+    [
+        ("hybrid_calibration", "none", {"dynamic", "comparison"}),
+        ("hybrid_coupling", False, {"dynamic"}),
+        ("rt_refresh_frames", 2, {"static", "dynamic", "comparison"}),
+        ("po_refresh_on_phase_error_rad", 0.037, {"static", "dynamic", "comparison"}),
+    ],
+)
+def test_result_fingerprints_track_settings_used_by_each_page(key, new_value, affected_pages):
+    application = build_app()
+    storage = next(
+        c
+        for c in application.header[0].select(pn.reactive.ReactiveHTML)
+        if "loaded_state" in c.param
+    )
+    restore = next(
+        w.fn
+        for w in storage.param.watchers["loaded_state"]["value"]
+        if getattr(w.fn, "__name__", "") == "restore_gui_session"
+    )
+    cached_restore = _callback_scope(
+        _callback_scope(restore).nonlocals["restore_cached_gui_results"]
+    ).nonlocals
+    capture = _callback_scope(cached_restore["remember_result_settings"]).nonlocals[
+        "capture_result_settings"
+    ]
+    widgets = _callback_scope(capture).nonlocals["result_widgets"]
+    before = {page: capture(page)["fingerprint"] for page in widgets}
+    widgets["dynamic"][f"solver.{key}"].value = new_value
+    assert {
+        page for page in widgets if capture(page)["fingerprint"] != before[page]
+    } == affected_pages
+
+
+def test_theme_restore_keeps_stale_products_and_revert_restores_matching_settings(monkeypatch):
+    monkeypatch.setattr(gui_app_module, "_default_amass_motion_path", lambda: None)
+    monkeypatch.setattr(gui_app_module, "_default_smpl_model_dir", lambda: None)
+    monkeypatch.setattr(
+        gui_app_module,
+        "_human_room_results_view",
+        lambda *_args, **_kwargs: pn.Column(pn.pane.Markdown("retained products")),
+    )
+    application = build_app()
+    tabs = application.main[0]
+    storage = next(
+        c
+        for c in application.header[0].select(pn.reactive.ReactiveHTML)
+        if "loaded_state" in c.param
+    )
+    restore = next(
+        w.fn
+        for w in storage.param.watchers["loaded_state"]["value"]
+        if getattr(w.fn, "__name__", "") == "restore_gui_session"
+    )
+    restore_closure = _callback_scope(restore).nonlocals
+    cached_restore = _callback_scope(restore_closure["restore_cached_gui_results"]).nonlocals
+    remember = _callback_scope(cached_restore["remember_result_settings"]).nonlocals
+    snapshot = remember["capture_result_settings"]("dynamic")
+    fake_result = SimpleNamespace(solver="hybrid_po")
+    key = _cache_theme_gui_results(
+        dynamic_results={"hybrid_po": fake_result},
+        dynamic_settings=snapshot,
+        dynamic_status="**SIMULATION READY** · original run",
+    )
+    saved = dict(storage.saved_state)
+    saved["gui_result_cache_key"] = key
+    saved["solver_settings"] = {**saved["solver_settings"], "hybrid_max_reflectors": 2}
+    saved["top_tab"] = 1
+    storage.loaded_state = saved
+
+    state = restore_closure["human_room_state"]
+    banner = _result_banner(tabs, "Dynamic")
+    export = next(
+        w
+        for w in tabs.select(pn.widgets.FileDownload)
+        if w.filename == "hermes-human-room-bundle.zip"
+    )
+    assert state["result"] is None
+    assert banner.visible is True
+    assert "Image-source maximum count" in banner[0].object
+    assert tabs._names[1] == "Dynamic Scenes •"
+    assert export.disabled is True
+    assert any("retained products" in str(p.object) for p in tabs.select(pn.pane.Markdown))
+    assert (
+        _get_theme_gui_results(storage.saved_state["gui_result_cache_key"])["dynamic_settings"]
+        == snapshot
+    )
+
+    # A late localStorage event must not replace the session's restored values.
+    solver_storage = next(
+        c
+        for c in application.header[0].select(pn.reactive.ReactiveHTML)
+        if "loaded_settings" in c.param
+    )
+    solver_restore = next(
+        w.fn
+        for w in solver_storage.param.watchers["loaded_settings"]["value"]
+        if getattr(w.fn, "__name__", "") == "on_solver_settings_loaded"
+    )
+    asyncio.run(
+        solver_restore(
+            SimpleNamespace(
+                new={
+                    "schema_version": gui_app_module._SOLVER_SETTINGS_SCHEMA_VERSION,
+                    "po_defaults_version": gui_app_module._PO_DEFAULTS_VERSION,
+                    "settings": {"hybrid_max_reflectors": 1},
+                }
+            )
+        )
+    )
+    count = next(
+        w
+        for w in application.modal[0].select(pn.widgets.IntInput)
+        if w.label == "Image-source maximum count"
+    )
+    assert count.value == 2
+
+    revert_button = next(w for w in banner.select(pn.widgets.Button) if w.label == "Revert")
+    revert = next(
+        w.fn
+        for w in revert_button.param.watchers["clicks"]["value"]
+        if getattr(w.fn, "__name__", "") == "revert"
+    )
+    asyncio.run(revert(None))
+    assert count.value == 4
+    assert state["result"] is fake_result
+    assert state["results"] == {"hybrid_po": fake_result}
+    assert banner.visible is False
+    assert tabs._names[1] == "Dynamic Scenes"
+    assert export.disabled is False
+
+
+def test_dynamic_run_reports_chirps_and_restores_input_widgets(monkeypatch):
     application = build_app()
     tabs = application.main[0]
     run_button = next(
-        button
-        for button in tabs.select(pn.widgets.Button)
-        if button.label == "Start"
+        button for button in tabs.select(pn.widgets.Button) if button.label == "Start"
     )
     run_callback = next(
         watcher.fn
         for watcher in run_button.param.watchers["clicks"]["value"]
         if getattr(watcher.fn, "__name__", "") == "on_run_human_room"
     )
-    run_closure = inspect.getclosurevars(run_callback)
+    run_closure = _callback_scope(run_callback)
     run_inputs = run_closure.nonlocals["human_room_run_input_widgets"]
+    status = run_closure.nonlocals["human_room_status"]
     assert len({id(widget) for widget in run_inputs}) == len(run_inputs)
 
-    by_label = {
-        widget.label: widget
-        for widget in run_inputs
-        if getattr(widget, "label", "")
-    }
+    by_label = {widget.label: widget for widget in run_inputs if getattr(widget, "label", "")}
     required_labels = {
         "AMASS-like human motion (.npz)",
         "Hybrid PO",
-        "Human x / range-forward [m]",
+        "X [m]",
         "Carrier frequency [GHz]",
         "RT ray samples per source",
-        "Begin frame (inclusive)",
+        "Start [s]",
     }
     assert required_labels.issubset(by_label)
     motion_upload = by_label["AMASS-like human motion (.npz)"]
@@ -1850,6 +2530,7 @@ def test_dynamic_run_locks_and_restores_every_input_widget(monkeypatch):
 
     started = threading.Event()
     release = threading.Event()
+    progress_callbacks = []
 
     monkeypatch.setattr(
         gui_app_module,
@@ -1857,7 +2538,8 @@ def test_dynamic_run_locks_and_restores_every_input_widget(monkeypatch):
         lambda *_args, **_kwargs: object(),
     )
 
-    def interruptible_run(*_args, **_kwargs):
+    def interruptible_run(*_args, **kwargs):
+        progress_callbacks.append(kwargs["progress_callback"])
         started.set()
         assert release.wait(timeout=5.0)
         raise InterruptedError("test run stopped")
@@ -1867,22 +2549,53 @@ def test_dynamic_run_locks_and_restores_every_input_widget(monkeypatch):
         "run_human_room_experiment",
         interruptible_run,
     )
-    original_states = tuple(
-        (widget, bool(widget.disabled)) for widget in run_inputs
-    )
+    original_states = tuple((widget, bool(widget.disabled)) for widget in run_inputs)
 
     async def exercise_run():
         task = asyncio.create_task(run_callback(None))
-        assert await asyncio.to_thread(started.wait, 5.0)
-        assert all(widget.disabled for widget in run_inputs)
-        release.set()
-        await asyncio.wait_for(task, timeout=5.0)
+        try:
+            assert await asyncio.to_thread(started.wait, 5.0)
+            assert all(widget.disabled for widget in run_inputs)
+            for solver_mode, pass_label in (
+                ("po", "Human PO"),
+                ("hybrid_static_environment", "Static environment"),
+                ("hybrid_coupling", "Human/environment coupling"),
+            ):
+                progress_callbacks[0](
+                    {
+                        "solver": "hybrid_po",
+                        "solver_mode": solver_mode,
+                        "frame_index": 1,
+                        "num_frames": 3,
+                        "chirp_index": 6,
+                        "num_chirps": 32,
+                    }
+                )
+                # Detailed integration updates must not displace chirp progress.
+                progress_callbacks[0](
+                    {
+                        "solver": "hybrid_po",
+                        "frame_index": 1,
+                        "num_frames": 3,
+                        "stage": "quadrature_aggregate_progress",
+                        "parent_faces_processed": 500,
+                        "parent_faces_total": 1_000,
+                        "subfaces_processed": 32_000,
+                        "subfaces_total": 64_000,
+                    }
+                )
+                expected = f"**RUNNING** · Hybrid PO · {pass_label} · " "frame 2/3 · chirp 7/32"
+                deadline = asyncio.get_running_loop().time() + 2.0
+                while str(status.object) != expected:
+                    assert asyncio.get_running_loop().time() < deadline
+                    await asyncio.sleep(0.01)
+        finally:
+            release.set()
+            await asyncio.wait_for(task, timeout=5.0)
 
     asyncio.run(exercise_run())
 
-    assert all(
-        widget.disabled is disabled for widget, disabled in original_states
-    )
+    assert all(widget.disabled is disabled for widget, disabled in original_states)
 
 
 def test_widget_lock_restores_preexisting_disabled_states():
@@ -1948,11 +2661,14 @@ def test_dropped_file_materialization_enforces_resource_limits(tmp_path):
 
 
 def test_single_file_input_payload_enforces_resource_limit():
-    assert gui_app_module._validated_upload_payload(
-        b"123",
-        label="motion",
-        max_bytes=3,
-    ) == b"123"
+    assert (
+        gui_app_module._validated_upload_payload(
+            b"123",
+            label="motion",
+            max_bytes=3,
+        )
+        == b"123"
+    )
     with pytest.raises(ValueError, match="the limit is 3 bytes"):
         gui_app_module._validated_upload_payload(
             b"1234",
@@ -1973,9 +2689,7 @@ def test_gui_launcher_serves_browser_icon_probe_routes(monkeypatch):
     assert gui_cli_module.main(["--no-browser"]) == 0
     patterns = served["kwargs"]["extra_patterns"]
     assert len(patterns) == 1
-    assert patterns[0][0] == (
-        r"/(?:apple-touch-icon(?:-precomposed)?\.png|favicon\.ico)"
-    )
+    assert patterns[0][0] == (r"/(?:apple-touch-icon(?:-precomposed)?\.png|favicon\.ico)")
     assert patterns[0][1].__name__ == "HermesIconHandler"
 
 
@@ -2007,14 +2721,17 @@ def test_gui_launcher_marks_unsafe_remote_app_as_restricted(
     monkeypatch.setattr(pn, "serve", capture_serve)
     monkeypatch.setattr(gui_app_module, "build_app", capture_build_app)
 
-    assert gui_cli_module.main(
-        [
-            "--address",
-            "192.0.2.10",
-            "--unsafe-allow-remote",
-            "--no-browser",
-        ]
-    ) == 0
+    assert (
+        gui_cli_module.main(
+            [
+                "--address",
+                "192.0.2.10",
+                "--unsafe-allow-remote",
+                "--no-browser",
+            ]
+        )
+        == 0
+    )
     application_factory = served["args"][0]["/"]
     application_factory()
 
@@ -2028,11 +2745,13 @@ def test_gui_launcher_marks_unsafe_remote_app_as_restricted(
     assert len(served["kwargs"]["cookie_secret"]) == 64
     assert served["kwargs"]["auth_provider"].get_user is not None
     expected_websocket_limit = gui_cli_module._websocket_message_limit(
-        64 * 1024 * 1024
+        max(
+            gui_app_module._MAX_MOTION_UPLOAD_BYTES,
+            gui_app_module._MAX_STATIC_MESH_UPLOAD_BYTES,
+            gui_app_module._MAX_SCENE_XML_UPLOAD_BYTES,
+        )
     )
-    assert served["kwargs"]["websocket_max_message_size"] == (
-        expected_websocket_limit
-    )
+    assert served["kwargs"]["websocket_max_message_size"] == (expected_websocket_limit)
     assert served["kwargs"]["http_server_kwargs"] == {
         "max_header_size": 16 * 1024,
         "max_body_size": 64 * 1024,
@@ -2063,25 +2782,25 @@ def test_gui_launch_auth_rejects_cross_site_before_session_creation():
     same_origin = Handler("same-origin", b"hermes")
     assert provider.get_user(same_origin) == "hermes"
     assert same_origin.headers["X-Frame-Options"] == "DENY"
-    assert "frame-ancestors 'none'" in same_origin.headers[
-        "Content-Security-Policy"
-    ]
+    assert "frame-ancestors 'none'" in same_origin.headers["Content-Security-Policy"]
 
     assert provider.get_user(Handler("cross-site", b"hermes")) is None
     assert provider.get_user(Handler("", b"hermes")) is None
     assert provider.get_user(Handler("same-origin", None)) is None
 
 
-def test_gui_launch_auth_accepts_authenticated_websocket_without_headers():
+@pytest.mark.parametrize("fetch_site", [None, "same-origin", "none"])
+def test_gui_launch_auth_accepts_authenticated_websocket_without_headers(fetch_site):
     from types import SimpleNamespace
 
     from tornado.websocket import WebSocketHandler
 
     provider = gui_cli_module._build_launch_auth_provider("secret")
     handler = object.__new__(WebSocketHandler)
-    handler.request = SimpleNamespace(
-        headers={"Sec-Fetch-Site": "same-origin"}
-    )
+    headers = {"Upgrade": "websocket", "Connection": "keep-alive, Upgrade"}
+    if fetch_site is not None:
+        headers["Sec-Fetch-Site"] = fetch_site
+    handler.request = SimpleNamespace(headers=headers)
 
     def reject_websocket_headers(*_args, **_kwargs):
         raise RuntimeError("Method not supported for Web Sockets")
@@ -2090,6 +2809,12 @@ def test_gui_launch_auth_accepts_authenticated_websocket_without_headers():
     handler.get_secure_cookie = lambda *_args, **_kwargs: b"hermes"
 
     assert provider.get_user(handler) == "hermes"
+
+    handler.request.headers["Sec-Fetch-Site"] = "cross-site"
+    assert provider.get_user(handler) is None
+    handler.request.headers.pop("Sec-Fetch-Site")
+    handler.get_secure_cookie = lambda *_args, **_kwargs: None
+    assert provider.get_user(handler) is None
 
 
 def test_gui_launcher_requires_origins_for_unsafe_wildcard_bind(capsys):
@@ -2115,20 +2840,23 @@ def test_gui_launcher_uses_explicit_wildcard_origin_allowlist(monkeypatch):
         lambda *args, **kwargs: served.update(args=args, kwargs=kwargs),
     )
 
-    assert gui_cli_module.main(
-        [
-            "--address",
-            "::",
-            "--port",
-            "6006",
-            "--unsafe-allow-remote",
-            "--allow-websocket-origin",
-            "radar-lab.example",
-            "--allow-websocket-origin",
-            "[2001:db8::7]:7007",
-            "--no-browser",
-        ]
-    ) == 0
+    assert (
+        gui_cli_module.main(
+            [
+                "--address",
+                "::",
+                "--port",
+                "6006",
+                "--unsafe-allow-remote",
+                "--allow-websocket-origin",
+                "radar-lab.example",
+                "--allow-websocket-origin",
+                "[2001:db8::7]:7007",
+                "--no-browser",
+            ]
+        )
+        == 0
+    )
 
     assert served["kwargs"]["websocket_origin"] == [
         "radar-lab.example:6006",
@@ -2162,9 +2890,12 @@ def test_gui_launcher_formats_ipv6_loopback_websocket_origin(monkeypatch):
         lambda *args, **kwargs: served.update(args=args, kwargs=kwargs),
     )
 
-    assert gui_cli_module.main(
-        ["--address", "::1", "--no-browser"],
-    ) == 0
+    assert (
+        gui_cli_module.main(
+            ["--address", "::1", "--no-browser"],
+        )
+        == 0
+    )
 
     assert served["kwargs"]["websocket_origin"] == ["[::1]:5006"]
 
@@ -2194,7 +2925,7 @@ def test_remote_gui_locks_and_enforces_server_side_inputs(monkeypatch):
         for watcher in load_button.param.watchers["clicks"]["value"]
         if getattr(watcher.fn, "__name__", "") == "on_load_bundle"
     )
-    load_closure = inspect.getclosurevars(load_callback).nonlocals
+    load_closure = _callback_scope(load_callback).nonlocals
     bundle_path = load_closure["bundle_path"]
     assert bundle_path.disabled is True
 
@@ -2215,9 +2946,7 @@ def test_remote_gui_locks_and_enforces_server_side_inputs(monkeypatch):
         for watcher in compare_button.param.watchers["clicks"]["value"]
         if getattr(watcher.fn, "__name__", "") == "on_compare"
     )
-    simulated_path = inspect.getclosurevars(compare_callback).nonlocals[
-        "simulated_path"
-    ]
+    simulated_path = _callback_scope(compare_callback).nonlocals["simulated_path"]
     assert simulated_path.disabled is True
 
     scene_callback = next(
@@ -2225,12 +2954,8 @@ def test_remote_gui_locks_and_enforces_server_side_inputs(monkeypatch):
         for watcher in scene_upload.param.watchers["value"]["value"]
         if getattr(watcher.fn, "__name__", "") == "on_human_room_controls"
     )
-    refresh_preview = inspect.getclosurevars(scene_callback).nonlocals[
-        "refresh_human_room_preview"
-    ]
-    current_scene = inspect.getclosurevars(refresh_preview).nonlocals[
-        "current_human_room_scene"
-    ]
+    refresh_preview = _callback_scope(scene_callback).nonlocals["refresh_human_room_preview"]
+    current_scene = _callback_scope(refresh_preview).nonlocals["current_human_room_scene"]
     with param.parameterized.discard_events(scene_upload):
         scene_upload.filename = "remote.xml"
         scene_upload.value = b'<scene><include filename="/etc/passwd"/></scene>'
@@ -2268,17 +2993,27 @@ def test_fast_motion_playback_uses_a_larger_stride_at_source_cadence():
 
 def test_human_room_window_defaults_to_one_frame_and_clamps_existing_window():
     assert _human_room_window_values(
-        last_frame=99,
-        previous_begin=0,
-        previous_end=99,
+        duration_s=14.5,
+        frame_period_s=0.05,
+        previous_start=0.0,
+        previous_end=14.5,
         reset_window=True,
-    ) == (0, 0)
+    ) == pytest.approx((0.0, 0.05))
     assert _human_room_window_values(
-        last_frame=7,
-        previous_begin=3,
-        previous_end=99,
+        duration_s=0.3,
+        frame_period_s=0.05,
+        previous_start=0.2,
+        previous_end=9.0,
         reset_window=False,
-    ) == (3, 7)
+    ) == pytest.approx((0.2, 0.3))
+    # A single static pose still allows one radar frame.
+    assert _human_room_window_values(
+        duration_s=0.0,
+        frame_period_s=0.05,
+        previous_start=0.0,
+        previous_end=0.0,
+        reset_window=True,
+    ) == pytest.approx((0.0, 0.05))
 
 
 def test_human_room_range_maps_support_frame_selection():
@@ -2286,9 +3021,7 @@ def test_human_room_range_maps_support_frame_selection():
         range_time_power=np.arange(12, dtype=float).reshape(4, 3) + 1.0,
         range_time_ranges_m=np.asarray([0.0, 0.5, 1.0]),
         adc_times_s=np.asarray([[0.0, 0.001], [0.05, 0.051]]),
-        range_doppler_power=(
-            np.arange(30, dtype=float).reshape(2, 5, 3) + 1.0
-        ),
+        range_doppler_power=(np.arange(30, dtype=float).reshape(2, 5, 3) + 1.0),
         range_doppler_ranges_m=np.asarray([0.0, 0.5, 1.0]),
         velocities_mps=np.linspace(-1.0, 1.0, 5),
     )
@@ -2304,18 +3037,19 @@ def test_human_room_range_maps_support_frame_selection():
         go,
         title="Prepared-room range-Doppler map",
         frame_index=1,
-        source_frame_index=7,
+        motion_time_s=3.25,
         plot_template="plotly_dark",
     )
 
     assert np.asarray(range_time.data[0].z).shape == (4, 3)
     assert range_time.layout.yaxis.title.text == "Time [s]"
     assert np.asarray(range_doppler.data[0].z).shape == (5, 3)
-    assert "simulated frame 2" in range_doppler.layout.title.text
-    assert "source motion frame 7" in range_doppler.layout.title.text
+    assert "radar frame 1" in range_doppler.layout.title.text
+    assert "t = 3.250 s" in range_doppler.layout.title.text
 
 
-def test_human_room_scene_renders_dynamic_solver_overlays_and_room_bounds():
+@pytest.mark.parametrize("face_power", [1.0, 0.0])
+def test_human_room_scene_renders_dynamic_solver_overlays_and_room_bounds(face_power):
     sequence = MeshSequence(
         vertices=np.asarray(
             [[[1.0, -0.2, 0.0], [1.0, 0.2, 0.0], [1.0, 0.0, 0.5]]],
@@ -2332,7 +3066,7 @@ def test_human_room_scene_renders_dynamic_solver_overlays_and_room_bounds():
     )
     diagnostics = SimpleNamespace(
         po=SimpleNamespace(visible_face_count=1),
-        po_face_power=np.asarray([1.0]),
+        po_face_power=np.asarray([face_power]),
         rt=SimpleNamespace(
             segment_starts_m=np.asarray([[0.0, 0.0, 0.0]]),
             segment_ends_m=np.asarray([[1.0, 0.0, 0.25]]),
@@ -2352,18 +3086,341 @@ def test_human_room_scene_renders_dynamic_solver_overlays_and_room_bounds():
     assert "Top target-touching RT rays" in names
     floor_trace = next(trace for trace in figure.data if trace.name == "Floor")
     assert "Object: Floor" in floor_trace.hovertemplate
-    assert "Material: Wood" in floor_trace.hovertemplate
+    floor_material = next(
+        box["material_display"] for box in preview.room_boxes if box["id"] == "floor"
+    )
+    assert f"Material: {floor_material}" in floor_trace.hovertemplate
     human_trace = next(trace for trace in figure.data if trace.name == "PO face power")
     assert "Material: Human skin" in human_trace.hovertemplate
     assert len(human_trace.facecolor) == 1
+    assert (human_trace.facecolor[0] == "#000000") == (face_power == 0.0)
+    assert human_trace.opacity == 1.0
+    assert human_trace.lighting.ambient == 1.0
+    assert human_trace.lighting.diffuse == 0.0
+    assert human_trace.lighting.specular == 0.0
+    assert human_trace.lighting.fresnel == 0.0
     assert figure.layout.scene.xaxis.range[0] <= 0.0
     assert figure.layout.scene.xaxis.range[1] >= 4.0
     assert figure.layout.scene.yaxis.range[0] <= -1.2
     room_y_max = max(
-        float(box["translate"][1]) + float(box["scale"][1])
-        for box in preview.room_boxes
+        float(box["translate"][1]) + float(box["scale"][1]) for box in preview.room_boxes
     )
     assert figure.layout.scene.yaxis.range[1] >= room_y_max
+
+
+@pytest.mark.parametrize(
+    ("lowest_z", "expected_status", "expected_count"),
+    [
+        (-0.98, "No floor penetration", 0),
+        (-1.0, "No floor penetration", 0),
+        (-1.00001, "No floor penetration", 0),
+        (-1.02, "Floor penetration: 2.00 cm", 1),
+        (-1.20, "Floor penetration: 20.00 cm", 1),
+    ],
+)
+def test_human_floor_check_uses_the_floor_surface_and_contact_tolerance(
+    lowest_z, expected_status, expected_count
+):
+    vertices = np.asarray([[1.6, 0.0, lowest_z], [1.6, 0.0, 0.0]], dtype=np.float32)
+
+    overlay = _human_floor_overlay_data(vertices, prepared_room_boxes())
+
+    assert expected_status in overlay["meta"]["floor_status"]
+    assert len(overlay["z"]) == expected_count
+    if expected_count:
+        np.testing.assert_allclose(overlay["customdata"], [-100.0 * (lowest_z + 1.0)], atol=1e-4)
+
+
+def test_human_floor_check_does_not_flag_vertices_outside_the_floor():
+    vertices = np.asarray([[50.0, 0.0, -1.2], [1.6, 0.0, -0.98]])
+
+    overlay = _human_floor_overlay_data(vertices, prepared_room_boxes())
+
+    assert "No floor penetration" in overlay["meta"]["floor_status"]
+    assert "2.00 cm" in overlay["meta"]["floor_status"]
+    assert len(overlay["z"]) == 0
+    outside = _human_floor_overlay_data(vertices[:1], prepared_room_boxes())
+    assert "Outside floor footprint" in outside["meta"]["floor_status"]
+    unavailable = _human_floor_overlay_data(vertices, ())
+    assert "Floor check unavailable" in unavailable["meta"]["floor_status"]
+
+
+def test_dynamic_position_numeric_entry_refreshes_floor_status(monkeypatch, tmp_path):
+    sequence = MeshSequence(
+        vertices=np.asarray(
+            [[[0.0, -0.1, 0.0], [0.0, 0.1, 0.0], [0.0, 0.0, 2.0]]],
+            dtype=np.float32,
+        ),
+        faces=np.asarray([[0, 1, 2]], dtype=np.uint32),
+        times=np.asarray([0.0]),
+    )
+    # Exercise numeric entry without local motion or licensed SMPL assets.
+    monkeypatch.setattr(gui_app_module, "_default_amass_motion_path", lambda: None)
+    monkeypatch.setattr(gui_app_module, "_default_smpl_model_dir", lambda: tmp_path / "no-smpl")
+    application = build_app()
+    tabs = application.main[0]
+    upload = next(
+        widget
+        for widget in tabs.select(pn.widgets.FileInput)
+        if widget.label == "AMASS-like human motion (.npz)"
+    )
+    payload = BytesIO()
+    np.savez(payload, vertices=sequence.vertices, faces=sequence.faces, times=sequence.times)
+    upload._process_events(
+        {  # pylint: disable=protected-access
+            "filename": "floor-position.npz",
+            "value": base64.b64encode(payload.getvalue()).decode("ascii"),
+        }
+    )
+    default_motion_button = next(
+        button
+        for button in tabs.select(pn.widgets.Button)
+        if button.label == "Load default motion"
+    )
+    assert not default_motion_button.visible
+    positions = _numeric_controls(tabs, "dynamic-position")
+    assert list(positions) == ["X [m]", "Y [m]", "Z [m]"]
+    x, y, z = positions.values()
+    position_mode = next(
+        widget for widget in tabs.select(pn.widgets.Select) if widget.label == "Human position"
+    )
+    position_row = next(
+        row for row in tabs.select(pn.Row) if "hermes-dynamic-position" in row.css_classes
+    )
+    assert not position_row.visible
+    position_mode.value = "manual"
+    assert position_row.visible
+
+    for widget, value in ((x, 1.61), (y, 0.01), (z, -0.045)):
+        assert widget.step == 0.01
+        widget._process_events({"value": value})  # pylint: disable=protected-access
+        assert widget.value == value
+
+    floor_status = next(
+        pane
+        for pane in tabs.select(pn.pane.Markdown)
+        if "Floor penetration: 1.00 cm" in str(pane.object)
+    )
+    z._process_events({"value": -0.025})  # pylint: disable=protected-access
+    assert "No floor penetration" in floor_status.object
+    assert "floor clearance: 1.00 cm" in floor_status.object
+
+
+def test_human_position_bounds_use_room_surfaces_and_do_not_invent_height():
+    floor = {"id": "floor", "translate": (10, 20, -2.1), "scale": (4, 3, 0.1)}
+    wall = {"id": "wall", "translate": (14, 20, 0.5), "scale": (0.1, 3, 2.5)}
+    ceiling = {"id": "ceiling", "translate": (10, 20, 2.1), "scale": (4, 3, 0.1)}
+    furniture = {"id": "desk", "translate": (10, 20, -1.5), "scale": (1, 1, 0.5)}
+    assert _human_position_bounds((floor, wall, ceiling, furniture)) == (
+        (6.0, 14.0),
+        (17.0, 23.0),
+        (-2.0, 2.0),
+    )
+    assert _human_position_bounds((floor, wall))[-1] == (-2.0, 3.0)
+    assert _human_position_bounds((floor, furniture))[-1] == (-2.0, None)
+    assert _human_position_bounds(()) == ((None, None),) * 3
+
+
+def test_manual_position_limits_follow_scene_without_clipping_file_motion(monkeypatch):
+    monkeypatch.setattr(gui_app_module, "_default_amass_motion_path", lambda: None)
+    application = build_app()
+    tabs = application.main[0]
+    x, y, z = _numeric_controls(tabs, "dynamic-position").values()
+    np.testing.assert_allclose(
+        [(widget.start, widget.end) for widget in (x, y, z)],
+        [(-0.45, 5.45), (-3.6, 5.1), (-1.035, 1.965)],
+    )
+    preset = next(
+        widget
+        for widget in tabs.select(pn.widgets.Select)
+        if widget.label == "Prepared scene fallback"
+    )
+    preset.value = "tutorial_bedroom"
+    assert (z.start, z.end) == pytest.approx((-1.0, 2.0))
+    scene_upload = next(
+        widget
+        for widget in tabs.select(pn.widgets.FileInput)
+        if widget.label == "Static environment scene (.xml, optional)"
+    )
+    scene_xml = b"""<scene version="2.1.0">
+        <shape type="cube" id="floor"><transform name="to_world">
+            <scale x="4" y="3" z="0.1"/><translate x="10" y="20" z="-2.1"/>
+        </transform></shape>
+        <shape type="cube" id="wall"><transform name="to_world">
+            <scale x="0.1" y="3" z="2"/><translate x="14" y="20"/>
+        </transform></shape>
+    </scene>"""
+    scene_upload._process_events(
+        {  # pylint: disable=protected-access
+            "filename": "offset-room.xml",
+            "value": base64.b64encode(scene_xml).decode("ascii"),
+        }
+    )
+    assert [(widget.start, widget.end) for widget in (x, y, z)] == [
+        (6.0, 14.0),
+        (17.0, 23.0),
+        (-2.0, 2.0),
+    ]
+    payload = BytesIO()
+    vertices = np.asarray([[[100, 20, 0], [100, 20.2, 0], [100, 20, 0.4]]], dtype=np.float32)
+    np.savez(payload, vertices=vertices, faces=[[0, 1, 2]], times=[0.0])
+    motion_upload = next(
+        widget
+        for widget in tabs.select(pn.widgets.FileInput)
+        if widget.label == "AMASS-like human motion (.npz)"
+    )
+    motion_upload._process_events(
+        {  # pylint: disable=protected-access
+            "filename": "world-position.npz",
+            "value": base64.b64encode(payload.getvalue()).decode("ascii"),
+        }
+    )
+    interaction = next(
+        component
+        for component in tabs.select(pn.reactive.ReactiveHTML)
+        if component.name == "Dynamic scene camera interaction"
+    )
+    human = next(
+        trace for trace in interaction.children[0].object.data if trace.name == "Human mesh"
+    )
+    np.testing.assert_allclose(human.x, 100.0)
+    mode = next(
+        widget for widget in tabs.select(pn.widgets.Select) if widget.label == "Human position"
+    )
+    mode.value = "manual"
+    x.value = 99.0
+    assert x.value == 14.0
+    human = next(
+        trace for trace in interaction.children[0].object.data if trace.name == "Human mesh"
+    )
+    assert (min(human.x) + max(human.x)) / 2 == pytest.approx(14.0)
+    scene_upload._process_events({"filename": "", "value": ""})  # pylint: disable=protected-access
+    assert (x.start, x.end) == pytest.approx((-0.45, 5.45))
+    assert x.value == pytest.approx(5.45)
+
+
+def test_custom_scene_restore_keeps_position_until_its_bounds_are_loaded(monkeypatch):
+    monkeypatch.setattr(gui_app_module, "_default_amass_motion_path", lambda: None)
+    application = build_app()
+    tabs = application.main[0]
+    storage = next(
+        component
+        for component in application.header[0].select(pn.reactive.ReactiveHTML)
+        if "loaded_uploads" in component.param
+    )
+    storage.loaded_state = {
+        "schema_version": 2,
+        "has_uploads": True,
+        "dynamic_controls": {
+            "position_mode": "manual",
+            "human_x": 10.0,
+            "human_y": 20.0,
+            "human_z": 5.0,
+        },
+    }
+    scene_xml = b"""<scene version="2.1.0">
+        <shape type="cube" id="floor"><transform name="to_world">
+            <scale x="4" y="3" z="0.1"/><translate x="10" y="20" z="-2.1"/>
+        </transform></shape>
+        <shape type="cube" id="wall"><transform name="to_world">
+            <scale x="0.1" y="3" z="6"/><translate x="14" y="20" z="4"/>
+        </transform></shape>
+    </scene>"""
+    storage.loaded_uploads = {
+        "scene_xml": {
+            "filename": "large-room.xml",
+            "payload": base64.b64encode(scene_xml).decode("ascii"),
+        }
+    }
+    x, y, z = _numeric_controls(tabs, "dynamic-position").values()
+    assert (x.value, y.value, z.value) == (10.0, 20.0, 5.0)
+    assert [(widget.start, widget.end) for widget in (x, y, z)] == [
+        (6.0, 14.0),
+        (17.0, 23.0),
+        (-2.0, 10.0),
+    ]
+
+
+def test_dynamic_floor_check_renders_uploaded_xml_cubes():
+    sequence = MeshSequence(
+        vertices=np.asarray(
+            [[[1.6, -0.1, -0.92], [1.6, 0.1, -0.92], [1.6, 0.0, 0.0]]],
+            dtype=np.float32,
+        ),
+        faces=np.asarray([[0, 1, 2]], dtype=np.uint32),
+        times=np.asarray([0.0]),
+    )
+    preview = SimpleNamespace(
+        room_boxes=(),
+        mesh_sequence=sequence,
+        scene_source_name="raised-floor.xml",
+        source_name="floor-contact.npz",
+        scene_xml=b"""<scene version="2.1.0">
+            <shape type="cube" id="floor">
+                <transform name="to_world">
+                    <scale x="3" y="3" z="0.1"/>
+                    <translate z="-1"/>
+                </transform>
+            </shape>
+        </scene>""",
+    )
+
+    figure = _human_room_scene_figure(preview, go, frame_index=0, plot_template="plotly_dark")
+
+    assert any(trace.name == "Floor" for trace in figure.data)
+    overlay = next(trace for trace in figure.data if trace.name == "Below-floor vertices")
+    assert "Floor penetration: 2.00 cm" in overlay.meta["floor_status"]
+    assert _update_human_room_scene_frame(figure, preview, frame_index=0)
+    assert "Floor penetration: 2.00 cm" in overlay.meta["floor_status"]
+
+
+def test_human_room_playback_updates_floor_penetration_without_moving_camera(
+    monkeypatch,
+):
+    vertices = np.asarray(
+        [[1.6, -0.1, -0.98], [1.6, 0.1, -0.98], [1.6, 0.0, 0.0]],
+        dtype=np.float32,
+    )
+    sequence = MeshSequence(
+        vertices=np.stack((vertices, vertices - [0.0, 0.0, 0.04], vertices)),
+        faces=np.asarray([[0, 1, 2]], dtype=np.uint32),
+        times=np.asarray([0.0, 0.1, 0.2]),
+    )
+    preview = SimpleNamespace(
+        room_boxes=prepared_room_boxes(),
+        mesh_sequence=sequence,
+        scene_source_name="tutorial_bedroom",
+        source_name="floor-contact.npz",
+    )
+    figure = _human_room_scene_figure(preview, go, frame_index=0, plot_template="plotly_dark")
+    floor_trace = next(trace for trace in figure.data if trace.name == "Floor")
+    overlay = next(trace for trace in figure.data if trace.name == "Below-floor vertices")
+    camera = figure.layout.scene.camera.to_plotly_json()
+    assert len(overlay.z) == 0
+    restyles = []
+    original_restyle = go.Figure.plotly_restyle
+
+    def record_restyle(target, updates, trace_indices):
+        restyles.append(trace_indices)
+        return original_restyle(target, updates, trace_indices)
+
+    monkeypatch.setattr(go.Figure, "plotly_restyle", record_restyle)
+
+    assert _update_human_room_scene_frame(figure, preview, frame_index=1, update_title=False)
+
+    assert len(overlay.z) == 2
+    assert len(restyles) == 1
+    assert [figure.data[index].name for index in restyles[0]] == [
+        "Human mesh",
+        "Below-floor vertices",
+    ]
+    assert "Floor penetration: 2.00 cm" in overlay.meta["floor_status"]
+    assert overlay.marker.color == "#ef4444"
+    assert figure.layout.scene.camera.to_plotly_json() == camera
+    assert next(trace for trace in figure.data if trace.name == "Floor") is floor_trace
+    assert _update_human_room_scene_frame(figure, preview, frame_index=2, update_title=False)
+    assert len(overlay.z) == 0
+    assert "No floor penetration" in overlay.meta["floor_status"]
 
 
 def test_human_room_playback_restyles_only_the_moving_mesh():
@@ -2401,7 +3458,7 @@ def test_human_room_playback_restyles_only_the_moving_mesh():
     human_trace = next(trace for trace in figure.data if trace.name == "Human mesh")
     assert np.allclose(np.asarray(human_trace.x), 1.2)
     assert figure.data[0] is room_trace
-    assert figure.layout.title.text.endswith("frame 1")
+    assert figure.layout.title.text.endswith("t = 0.100 s")
 
 
 def test_human_room_playback_does_not_relayout_during_camera_interaction():
@@ -2448,9 +3505,7 @@ def test_dynamic_scene_camera_interaction_coalesces_playback_redraws():
     plot = pn.pane.Plotly(go.Figure())
     interaction = _dynamic_scene_interaction_component(pn, plot)
     script = interaction._scripts["render"]  # pylint: disable=protected-access
-    remove_script = interaction._scripts[  # pylint: disable=protected-access
-        "remove"
-    ]
+    remove_script = interaction._scripts["remove"]  # pylint: disable=protected-access
 
     assert interaction.children == [plot]
     assert interaction.name == "Dynamic scene camera interaction"
@@ -2541,26 +3596,37 @@ def test_bundle_scene_boxes_include_referenced_material(tmp_path):
     assert boxes[0]["material_id"] == "mat-wood"
 
 
-def test_human_room_results_group_modes_by_product_and_reset_plot_state():
+def test_human_room_results_group_solvers_by_product_and_reset_plot_state():
     manifest = ExperimentManifest(
         name="human-only test",
         scene=SceneExperimentConfig(
             scenario="tutorial_bedroom",
             parameters={
-                "motion_begin_frame_index": 4,
-                "motion_end_frame_index": 5,
+                "motion_start_s": 0.2,
+                "motion_end_s": 0.3,
             },
         ),
-        radar=RadarExperimentConfig(board_model="IWR6843AOPEVM"),
-        solver=SolverExperimentConfig(mode="target_po"),
+        radar=RadarExperimentConfig(
+            board_model="IWR6843AOPEVM",
+            parameters={"frame_period_s": 0.05},
+        ),
+        solver=SolverExperimentConfig(solvers=("po",)),
     )
     result = SimpleNamespace(
-        simulation_mode="human_only_po",
+        solver="po",
         manifest=manifest,
         adc=np.ones((2, 2, 8, 1), dtype=np.complex64),
         adc_times_s=np.asarray([[0.0, 0.001], [0.05, 0.051]]),
         ranges_m=np.asarray([0.0, 0.5, 1.0]),
         range_profiles={"total": np.asarray([1.0, 2.0, 1.0])},
+        channel_range_profiles={
+            "total": np.asarray(
+                [
+                    [[1.0], [2.0], [1.0]],
+                    [[4.0], [8.0], [4.0]],
+                ]
+            )
+        },
         range_time_power=np.ones((4, 3)),
         range_time_ranges_m=np.asarray([0.0, 0.5, 1.0]),
         range_doppler_power=np.ones((2, 2, 3)),
@@ -2577,16 +3643,14 @@ def test_human_room_results_group_modes_by_product_and_reset_plot_state():
     )
 
     coherent = SimpleNamespace(**vars(result))
-    coherent.simulation_mode = "coherent_rt"
+    coherent.solver = "rt"
     coherent.manifest = ExperimentManifest(
         name="coherent test",
         scene=manifest.scene,
         radar=manifest.radar,
-        solver=SolverExperimentConfig(mode="rt_scattering"),
+        solver=SolverExperimentConfig(solvers=("rt",)),
     )
-    coherent.range_profiles = {
-        "total": np.asarray([0.5, 1.5, 0.5])
-    }
+    coherent.range_profiles = {"total": np.asarray([0.5, 1.5, 0.5])}
     coherent.metadata = SimpleNamespace(
         **vars(result.metadata),
         path_depth_histogram=np.asarray(
@@ -2597,89 +3661,107 @@ def test_human_room_results_group_modes_by_product_and_reset_plot_state():
             dtype=np.int64,
         ),
     )
+    result.metadata.events = [
+        {
+            "reason": "adaptive_po_refinement",
+            "limited_passes": 1,
+            "max_unresolved_parent_faces": 37,
+        }
+    ]
     view = _human_room_results_view(
-        {"coherent_rt": coherent, "human_only_po": result},
+        {"rt": coherent, "po": result},
         pn,
         go,
         plot_template="plotly_dark",
+    )
+    assert any(
+        "37 facets remained above a tolerance" in str(pane.object)
+        for pane in view.select(pn.pane.Markdown)
     )
     product_tabs = next(
         child
         for child in view.select(pn.Tabs)
         if child._names == ["Range profile", "Range-time", "Range-Doppler"]
     )
-    profile = product_tabs.objects[0]
+    profile = next(
+        pane
+        for pane in product_tabs.objects[0].select(pn.pane.Plotly)
+        if pane.object.layout.title.text == "Range profile comparison"
+    )
+    channel_profiles = [
+        pane
+        for pane in product_tabs.objects[0].select(pn.pane.Plotly)
+        if "range profiles by channel" in pane.object.layout.title.text
+    ]
+    assert [pane.object.layout.title.text for pane in channel_profiles] == [
+        "PO · range profiles by channel",
+        "RT · range profiles by channel",
+    ]
+    assert all(len(pane.object.data) == 1 for pane in channel_profiles)
     profile.relayout_data = {"yaxis.autorange": True}
     product_tabs.active = 1
     product_tabs.active = 0
 
     assert profile.relayout_data == {}
     assert profile.object.layout.title.text == "Range profile comparison"
-    assert [trace.name for trace in profile.object.data] == [
-        "Coherent RT",
-        "Human-only PO",
-    ]
+    # Solvers appear in canonical order: PO, RT, Hybrid PO.
+    assert [trace.name for trace in profile.object.data] == ["PO", "RT"]
     assert len(product_tabs.objects[1].select(pn.pane.Plotly)) == 2
     assert len(product_tabs.objects[2].select(pn.pane.Plotly)) == 2
     assert not any(
-        set(getattr(child, "_names", []))
-        & {"Coherent RT", "Human-only PO"}
-        for child in view.select(pn.Tabs)
+        set(getattr(child, "_names", [])) & {"RT", "PO"} for child in view.select(pn.Tabs)
     )
     range_doppler_frame = next(
         widget
         for widget in view.select(pn.widgets.IntSlider)
-        if widget.label.startswith("Range-Doppler frame (")
+        if widget.label.startswith("Radar frame index (")
     )
-    assert range_doppler_frame.label == "Range-Doppler frame (1–2)"
-    assert range_doppler_frame.start == 1
-    assert range_doppler_frame.end == 2
-    assert range_doppler_frame.value == 1
+    assert range_doppler_frame.label == "Radar frame index (0–1)"
+    assert range_doppler_frame.start == 0
+    assert range_doppler_frame.end == 1
+    assert range_doppler_frame.value == 0
     assert range_doppler_frame.disabled is False
     previous_button = next(
-        widget
-        for widget in view.select(pn.widgets.Button)
-        if widget.label == "Previous frame"
+        widget for widget in view.select(pn.widgets.Button) if widget.label == "Previous frame"
     )
     next_button = next(
-        widget
-        for widget in view.select(pn.widgets.Button)
-        if widget.label == "Next frame"
+        widget for widget in view.select(pn.widgets.Button) if widget.label == "Next frame"
     )
     assert previous_button.disabled is True
     assert next_button.disabled is False
     next_button.clicks += 1
-    assert range_doppler_frame.value == 2
+    assert range_doppler_frame.value == 1
     assert previous_button.disabled is False
     assert next_button.disabled is True
+    np.testing.assert_allclose(profile.object.data[0].y, 10 * np.log10([4, 8, 4]))
+    np.testing.assert_allclose(channel_profiles[0].object.data[0].y, 10 * np.log10([4, 8, 4]))
+    product_tabs.active = 1
+    product_tabs.active = 0
+    np.testing.assert_allclose(profile.object.data[0].y, 10 * np.log10([4, 8, 4]))
     previous_button.clicks += 1
-    assert range_doppler_frame.value == 1
-    range_doppler_frame.value = 2
+    assert range_doppler_frame.value == 0
+    np.testing.assert_allclose(profile.object.data[0].y, 10 * np.log10([1, 2, 1]))
+    np.testing.assert_allclose(channel_profiles[0].object.data[0].y, 10 * np.log10([1, 2, 1]))
+    range_doppler_frame.value = 1
     range_doppler_panes = product_tabs.objects[2].select(pn.pane.Plotly)
-    assert all(
-        "simulated frame 2" in pane.object.layout.title.text
-        for pane in range_doppler_panes
-    )
-    assert all(
-        "source motion frame 5" in pane.object.layout.title.text
-        for pane in range_doppler_panes
-    )
+    assert all("radar frame 1" in pane.object.layout.title.text for pane in range_doppler_panes)
+    assert all("t = 0.250 s" in pane.object.layout.title.text for pane in range_doppler_panes)
     rt_histogram = next(
         pane.object
         for pane in view.select(pn.pane.Plotly)
         if pane.object.layout.title.text == "RT path segment-count histogram"
     )
-    assert [trace.name for trace in rt_histogram.data] == ["Coherent RT"]
+    assert [trace.name for trace in rt_histogram.data] == ["RT"]
     assert list(rt_histogram.data[0].x) == [1, 2, 3]
     assert list(rt_histogram.data[0].y) == [0, 9, 7]
 
     hybrid = SimpleNamespace(**vars(result))
-    hybrid.simulation_mode = "hybrid_po"
+    hybrid.solver = "hybrid_po"
     hybrid.manifest = ExperimentManifest(
         name="hybrid test",
         scene=manifest.scene,
         radar=manifest.radar,
-        solver=SolverExperimentConfig(mode="hybrid_rt_po"),
+        solver=SolverExperimentConfig(solvers=("hybrid_po",)),
     )
     hybrid.range_profiles = {
         "total": np.asarray([2.0, 4.0, 2.0]),
@@ -2698,7 +3780,7 @@ def test_human_room_results_group_modes_by_product_and_reset_plot_state():
         )
     }
     hybrid_view = _human_room_results_view(
-        {"hybrid_po": hybrid},
+        {"po": result, "rt": coherent, "hybrid_po": hybrid},
         pn,
         go,
         plot_template="plotly_dark",
@@ -2709,14 +3791,19 @@ def test_human_room_results_group_modes_by_product_and_reset_plot_state():
         if child._names == ["Range profile", "Range-time", "Range-Doppler"]
     )
     hybrid_profile_figures = [
-        pane.object
-        for pane in hybrid_tabs.objects[0].select(pn.pane.Plotly)
+        pane.object for pane in hybrid_tabs.objects[0].select(pn.pane.Plotly)
+    ]
+    assert [figure.layout.title.text for figure in hybrid_profile_figures] == [
+        "Range profile comparison",
+        "PO · range profiles by channel",
+        "RT · range profiles by channel",
+        "Hybrid PO component range profiles",
+        "Hybrid PO · range profiles by channel",
     ]
     component_figure = next(
         figure
         for figure in hybrid_profile_figures
-        if figure.layout.title.text
-        == "Hybrid PO component range profiles"
+        if figure.layout.title.text == "Hybrid PO component range profiles"
     )
     assert [trace.name for trace in component_figure.data] == [
         "Human only",
@@ -2724,15 +3811,32 @@ def test_human_room_results_group_modes_by_product_and_reset_plot_state():
         "Human → environment",
         "Environment → human",
     ]
+    single = SimpleNamespace(**vars(result))
+    single.adc = result.adc[:1]
+    single.adc_times_s = result.adc_times_s[:1]
+    single.channel_range_profiles = {"total": result.channel_range_profiles["total"][:1]}
+    single.range_time_power = result.range_time_power[:2]
+    single.range_doppler_power = result.range_doppler_power[:1]
+    single_view = _human_room_results_view({"po": single}, pn, go, plot_template="plotly_dark")
+    single_frame = next(
+        widget
+        for widget in single_view.select(pn.widgets.IntSlider)
+        if widget.label.startswith("Radar frame index")
+    )
+    assert single_frame.disabled and single_frame.value == 0
+    assert single_frame.label == "Radar frame index (0–0)"
+    single_model = single_frame.get_root(Document())
+    assert single_model.start < single_model.end
+    assert not [
+        issue for issue in check_integrity(single_model.references()).error if issue.code == 1021
+    ]
 
 
 def test_radar_change_refreshes_tx_and_rx_choices():
     application = build_app()
     settings = application.modal[0]
     board = next(
-        widget
-        for widget in settings.select(pn.widgets.Select)
-        if widget.label == "TI radar"
+        widget for widget in settings.select(pn.widgets.Select) if widget.label == "TI radar"
     )
     tx_selector = next(
         widget
@@ -2765,8 +3869,8 @@ def test_radar_change_refreshes_tx_and_rx_choices():
     assert rx_selector.value == [4, 5, 6, 7]
     assert len(tx_model.options) == 12
     assert len(rx_model.options) == 16
-    assert tx_model.value == ["TX1", "TX2", "TX3", "TX10"]
-    assert rx_model.value == ["RX5", "RX6", "RX7", "RX8"]
+    assert tx_model.value == ["TX0", "TX1", "TX2", "TX9"]
+    assert rx_model.value == ["RX4", "RX5", "RX6", "RX7"]
 
     with param.parameterized.discard_events(board):
         board.value = "IWR6843AOPEVM"
@@ -2790,20 +3894,16 @@ def test_angle_fft_defaults_to_target_centroid_and_compares_rt_po():
         target_z_m=0.4,
         width_m=0.3,
         height_m=0.3,
-        tdm_enabled=True,
+        tx_schedule="tdm",
     )
     products = _angle_fft_range_products(result)
     centroid_bin = int(products["centroid_range_bin"])
     ranges_m = np.asarray(products["ranges_m"])
-    assert products["fmcw"].tdm_enabled is True
+    assert products["fmcw"].tx_schedule == "tdm"
 
     expected_range_m = np.sqrt(4.25)
-    assert float(products["centroid_range_m"]) == pytest.approx(
-        expected_range_m
-    )
-    assert centroid_bin == int(
-        np.argmin(np.abs(ranges_m - expected_range_m))
-    )
+    assert float(products["centroid_range_m"]) == pytest.approx(expected_range_m)
+    assert centroid_bin == int(np.argmin(np.abs(ranges_m - expected_range_m)))
 
     figure = _angle_map_figure(
         products,
@@ -2837,16 +3937,16 @@ def test_angle_fft_defaults_to_target_centroid_and_compares_rt_po():
         go,
         plot_template="plotly_dark",
     )
-    assert np.max(np.asarray(range_figure.data[0].y)) == pytest.approx(
-        10.0 * np.log10(np.max(result.po_range_profile_power))
-    )
-    rt_peak = float(np.max(result.rt_range_profile_power))
-    if rt_peak > 0.0:
-        assert np.max(np.asarray(range_figure.data[1].y)) == pytest.approx(
-            10.0 * np.log10(rt_peak)
-        )
-    else:
-        assert np.max(np.asarray(range_figure.data[1].y)) < -3_000.0
+    for name, power in (
+        ("Physical optics (PO)", result.po_channel_range_profile_power),
+        ("Ray tracing (RT)", result.rt_channel_range_profile_power),
+    ):
+        mean = next(trace for trace in range_figure.data if trace.name == name)
+        expected_mean = 10.0 * np.log10(np.maximum(power.mean(axis=-1), np.finfo(float).tiny))
+        expected_mean[expected_mean < -80.0] = np.nan
+        np.testing.assert_allclose(mean.y, expected_mean, equal_nan=True)
+    assert len(range_figure.data) == 2
+    assert range_figure.layout.height == 330
 
 
 def test_angle_range_bin_selection_updates_map_without_rerunning_simulation():
@@ -2868,9 +3968,7 @@ def test_angle_range_bin_selection_updates_map_without_rerunning_simulation():
     asyncio.run(callback(None))
 
     angle_figure = _angle_map_pane(tabs).object
-    assert f"bins {centroid_bin - 1}–{centroid_bin + 1}" in (
-        angle_figure.layout.title.text
-    )
+    assert f"bins {centroid_bin - 1}–{centroid_bin + 1}" in (angle_figure.layout.title.text)
 
 
 def test_shift_drag_bridge_previews_target_without_hijacking_camera():
@@ -2906,9 +4004,7 @@ def test_shift_drag_bridge_previews_target_without_hijacking_camera():
     assert "emitGesture(false)" not in script
     assert script.count("emitGesture()") == 1
     assert "event.stopImmediatePropagation()" in script
-    update_script = interaction._scripts[  # pylint: disable=protected-access
-        "target_result"
-    ]
+    update_script = interaction._scripts["target_result"]  # pylint: disable=protected-access
     assert "window.Plotly.restyle" in update_script
     assert "Plotly.relayout" not in update_script
 
@@ -2916,6 +4012,15 @@ def test_shift_drag_bridge_previews_target_without_hijacking_camera():
 def test_radar_float_input_noise_is_normalized():
     assert _rounded_gui_float(60.400000000000006) == 60.4
     assert _rounded_target_size(0.17999999999999988) == 0.18
+
+
+def test_result_settings_survive_json_numeric_type_changes():
+    fingerprint = gui_app_module._result_settings_fingerprint
+    before = {"radar": {"carrier": 60.0, "samples": 225}, "position": [2.0, 0.0, 0.3]}
+    restored = {"position": [2, 0, 0.3], "radar": {"samples": 225.0, "carrier": 60}}
+    assert fingerprint(before) == fingerprint(restored)
+    restored["position"][2] = 0.31
+    assert fingerprint(before) != fingerprint(restored)
 
 
 def test_static_experiment_honors_preflight_cancellation():
@@ -2934,30 +4039,29 @@ def test_untrusted_markdown_values_are_rendered_as_text():
     model = pane._get_model(Document())  # pylint: disable=protected-access
 
     assert "<img" not in model.text
-    assert "&amp;amp;lt;img" in model.text
+    assert "&amp;lt;img" in model.text
+    assert "&amp;amp;lt;img" not in model.text
 
 
 def test_static_failure_invalidates_previous_export(monkeypatch):
     application = build_app()
     tabs = application.main[0]
     width = next(
-        widget
-        for widget in tabs.select(pn.widgets.FloatInput)
-        if widget.label == "Plate width [m]"
+        widget for widget in tabs.select(pn.widgets.FloatInput) if widget.label == "Width [m]"
     )
     callback = next(
         watcher.fn
         for watcher in width.param.watchers["value"]["value"]
-        if getattr(watcher.fn, "__name__", "")
-        == "on_physics_control_change"
+        if getattr(watcher.fn, "__name__", "") == "on_physics_control_change"
     )
-    update_physics = inspect.getclosurevars(callback).nonlocals["update_physics"]
-    update_closure = inspect.getclosurevars(update_physics).nonlocals
+    update_physics = _callback_scope(callback).nonlocals["update_physics"]
+    update_closure = _callback_scope(update_physics).nonlocals
     export_button = next(
         button
         for button in tabs.select(pn.widgets.FileDownload)
         if button.filename == "hermes-static-target-bundle.zip"
     )
+    original_width = width.value
 
     def fail_update(**_kwargs):
         raise ValueError('<img src=x onerror="boom">')
@@ -2967,6 +4071,8 @@ def test_static_failure_invalidates_previous_export(monkeypatch):
         "run_static_target_experiment",
         fail_update,
     )
+    with param.parameterized.discard_events(width):
+        width.value += 0.1
     asyncio.run(callback(SimpleNamespace(obj=width)))
 
     assert update_closure["physics_state"]["result"] is None
@@ -2977,20 +4083,66 @@ def test_static_failure_invalidates_previous_export(monkeypatch):
     assert "<img" not in status
     assert "&lt;img" in status
 
+    with param.parameterized.discard_events(width):
+        width.value = original_width
+    asyncio.run(callback(SimpleNamespace(obj=width)))
+    assert update_closure["physics_state"]["result"] is not None
+    assert export_button.disabled is False
+    assert export_button.callback().getvalue()
+
+
+def test_static_revert_discards_an_older_inflight_completion(monkeypatch):
+    application = build_app()
+    tabs = application.main[0]
+    width = next(w for w in tabs.select(pn.widgets.FloatInput) if w.label == "Width [m]")
+    callback = next(
+        w.fn
+        for w in width.param.watchers["value"]["value"]
+        if getattr(w.fn, "__name__", "") == "on_physics_control_change"
+    )
+    update = _callback_scope(callback).nonlocals["update_physics"]
+    state = _callback_scope(update).nonlocals["physics_state"]
+    previous_result = state["result"]
+    previous_width = width.value
+    started = threading.Event()
+    release = threading.Event()
+
+    def finishing_old_run(**_kwargs):
+        started.set()
+        assert release.wait(timeout=5)
+        return previous_result
+
+    monkeypatch.setattr(gui_app_module, "run_static_target_experiment", finishing_old_run)
+
+    async def change_then_revert():
+        with param.parameterized.discard_events(width):
+            width.value += 0.1
+        task = asyncio.create_task(callback(SimpleNamespace(obj=width)))
+        try:
+            assert await asyncio.to_thread(started.wait, 5)
+            with param.parameterized.discard_events(width):
+                width.value = previous_width
+            await callback(SimpleNamespace(obj=width))
+        finally:
+            release.set()
+            await task
+
+    asyncio.run(change_then_revert())
+    assert state["result"] is previous_result
+    assert _result_banner(tabs, "Static").visible is False
+    assert tabs._names[0] == "Static Target"
+
 
 def test_static_run_can_be_stopped_at_a_safe_boundary(monkeypatch):
     application = build_app()
     tabs = application.main[0]
     width = next(
-        widget
-        for widget in tabs.select(pn.widgets.FloatInput)
-        if widget.label == "Plate width [m]"
+        widget for widget in tabs.select(pn.widgets.FloatInput) if widget.label == "Width [m]"
     )
     update_callback = next(
         watcher.fn
         for watcher in width.param.watchers["value"]["value"]
-        if getattr(watcher.fn, "__name__", "")
-        == "on_physics_control_change"
+        if getattr(watcher.fn, "__name__", "") == "on_physics_control_change"
     )
     stop_button = next(
         button
@@ -3002,8 +4154,8 @@ def test_static_run_can_be_stopped_at_a_safe_boundary(monkeypatch):
         for watcher in stop_button.param.watchers["clicks"]["value"]
         if getattr(watcher.fn, "__name__", "") == "on_stop_physics"
     )
-    update_closure = inspect.getclosurevars(
-        inspect.getclosurevars(update_callback).nonlocals["update_physics"]
+    update_closure = _callback_scope(
+        _callback_scope(update_callback).nonlocals["update_physics"]
     ).nonlocals
     started = threading.Event()
 
@@ -3020,9 +4172,9 @@ def test_static_run_can_be_stopped_at_a_safe_boundary(monkeypatch):
     )
 
     async def stop_active_run():
-        task = asyncio.create_task(
-            update_callback(SimpleNamespace(obj=width))
-        )
+        with param.parameterized.discard_events(width):
+            width.value += 0.1
+        task = asyncio.create_task(update_callback(SimpleNamespace(obj=width)))
         while not started.is_set():
             await asyncio.sleep(0.005)
         stop_callback(None)
@@ -3050,17 +4202,13 @@ def test_display_only_static_controls_keep_theme_result_cache():
         if widget.label == "Angle-FFT range bins (inclusive)"
     )
     top_paths = next(
-        widget
-        for widget in tabs.select(pn.widgets.IntInput)
-        if widget.label == "Top RT paths"
+        widget for widget in tabs.select(pn.widgets.IntInput) if widget.label == "Top RT paths"
     )
 
     selected = int(angle_bins.value[0])
     angle_bins.value = (selected, min(selected + 1, angle_bins.end))
     top_paths.value += 1
-    cached = _get_theme_gui_results(
-        storage.saved_state["gui_result_cache_key"]
-    )
+    cached = _get_theme_gui_results(storage.saved_state["gui_result_cache_key"])
 
     assert cached is not None
     assert cached["static_result"] is not None
@@ -3074,19 +4222,19 @@ def test_target_size_inputs_use_two_decimal_precision():
         for widget in tabs.select(pn.widgets.FloatInput)
         if widget.label
         in {
-            "Plate width [m]",
-            "Plate height [m]",
+            "Width [m]",
+            "Height [m]",
             "Corner edge length [m]",
         }
     }
     assert set(size_inputs) == {
-        "Plate width [m]",
-        "Plate height [m]",
+        "Width [m]",
+        "Height [m]",
         "Corner edge length [m]",
     }
     assert all(widget.format == "0.00" for widget in size_inputs.values())
 
-    width = size_inputs["Plate width [m]"]
+    width = size_inputs["Width [m]"]
     width.value = 0.17999999999999988
     callback = next(
         watcher.fn
@@ -3123,30 +4271,22 @@ def test_trihedral_scene_has_stable_frame_and_po_power_colorbar():
             },
         )
         results.append(result)
-        figures.append(
-            _physics_scene_figure(result, go, plot_template="plotly_dark")
-        )
+        figures.append(_physics_scene_figure(result, go, plot_template="plotly_dark"))
 
     mesh = figures[0].data[0]
-    assert mesh.facecolor == tuple(
-        gui_app_module._face_colors(results[0].face_power)
-    )
-    colorbar = next(
-        trace
-        for trace in figures[0].data
-        if trace.name == "PO relative facet power"
-    )
+    assert mesh.facecolor == tuple(gui_app_module._face_colors(results[0].face_power))
+    colorbar = next(trace for trace in figures[0].data if trace.name == "PO relative facet power")
     assert colorbar.marker.colorscale is not None
     assert colorbar.marker.cmin == pytest.approx(-60.0)
     assert colorbar.marker.cmax == pytest.approx(0.0)
     assert colorbar.marker.showscale is True
     assert colorbar.marker.colorbar.title.text == "PO relative<br>power [dB]"
-    assert mesh.lighting.ambient == pytest.approx(0.88)
-    assert mesh.lighting.diffuse == pytest.approx(0.30)
+    assert mesh.facecolor[0] == "#000000"
+    assert mesh.opacity == 1.0
+    assert mesh.lighting.ambient == pytest.approx(1.0)
+    assert mesh.lighting.diffuse == pytest.approx(0.0)
     assert mesh.lighting.specular == pytest.approx(0.0)
-    assert mesh.lightposition.x == pytest.approx(-1000.0)
-    assert mesh.lightposition.y == pytest.approx(-1000.0)
-    assert mesh.lightposition.z == pytest.approx(1000.0)
+    assert mesh.lighting.fresnel == pytest.approx(0.0)
     for axis in ("xaxis", "yaxis", "zaxis"):
         initial_range = tuple(getattr(figures[0].layout.scene, axis).range)
         rotated_range = tuple(getattr(figures[1].layout.scene, axis).range)
@@ -3166,7 +4306,11 @@ def test_trihedral_scene_has_stable_frame_and_po_power_colorbar():
     assert set(post_gesture_update) == {"sequence", "facecolor", "meta"}
 
 
-def test_human_scene_shows_only_po_power_and_lights_from_radar():
+@pytest.mark.parametrize(
+    "face_power",
+    [[1.0, 0.0, 0.25, 0.0], [0.0, 0.0, 0.0, 0.0]],
+)
+def test_human_scene_uses_opaque_unlit_po_power_colors(face_power):
     vertices = np.asarray(
         [
             [2.0, 0.0, 0.0],
@@ -3183,7 +4327,7 @@ def test_human_scene_shows_only_po_power_and_lights_from_radar():
     result = SimpleNamespace(
         vertices=vertices,
         faces=faces,
-        face_power=np.asarray([1.0, 0.0, 0.25, 0.0]),
+        face_power=np.asarray(face_power),
         rt_face_hit_counts=np.asarray([0, 2, 1, 0]),
         target_type="human_mesh",
         target_parameters={
@@ -3202,12 +4346,14 @@ def test_human_scene_shows_only_po_power_and_lights_from_radar():
     )
 
     mesh = figure.data[0]
-    assert mesh.facecolor == tuple(
-        gui_app_module._face_colors(result.face_power)
-    )
-    assert mesh.lightposition.x == pytest.approx(0.0)
-    assert mesh.lightposition.y == pytest.approx(0.0)
-    assert mesh.lightposition.z == pytest.approx(0.0)
+    assert mesh.facecolor == tuple(gui_app_module._face_colors(result.face_power))
+    for power, color in zip(face_power, mesh.facecolor):
+        assert (color == "#000000") == (power == 0.0)
+    assert mesh.opacity == 1.0
+    assert mesh.lighting.ambient == 1.0
+    assert mesh.lighting.diffuse == 0.0
+    assert mesh.lighting.specular == 0.0
+    assert mesh.lighting.fresnel == 0.0
     assert not any(trace.showlegend for trace in figure.data)
     assert figure.layout.title.text == "PO facet contribution · Human Mesh"
 
@@ -3255,12 +4401,8 @@ def test_scene_radar_pose_vectors_show_yaw_pitch_and_roll():
         plot_template="plotly_dark",
     )
 
-    boresight = next(
-        trace for trace in figure.data if trace.name == "Radar boresight"
-    )
-    local_up = next(
-        trace for trace in figure.data if trace.name == "Radar local up"
-    )
+    boresight = next(trace for trace in figure.data if trace.name == "Radar boresight")
+    local_up = next(trace for trace in figure.data if trace.name == "Radar local up")
     assert boresight.x[-1] == pytest.approx(0.0, abs=1e-10)
     assert boresight.y[-1] > 0.0
     assert boresight.z[-1] == pytest.approx(0.0)
@@ -3268,20 +4410,20 @@ def test_scene_radar_pose_vectors_show_yaw_pitch_and_roll():
     assert local_up.z[-1] == pytest.approx(0.0, abs=1e-10)
 
 
-def test_shift_drag_updates_orientation_controls_and_recomputes_target():
+def test_shift_drag_updates_orientation_controls_and_recomputes_target(monkeypatch):
     application = build_app()
     tabs = application.main[0]
     scene = _scene_pane(tabs)
-    yaw = next(
-        slider
-        for slider in tabs.select(pn.widgets.FloatSlider)
-        if slider.label == "Yaw / aspect [deg]"
-    )
-    pitch = next(
-        slider
-        for slider in tabs.select(pn.widgets.FloatSlider)
-        if slider.label == "Pitch [deg]"
-    )
+    yaw = _numeric_controls(tabs, "static-orientation")["Yaw [deg]"]
+    pitch = _numeric_controls(tabs, "static-orientation")["Pitch [deg]"]
+    solve_calls = []
+    original_run = gui_app_module.run_static_target_experiment
+
+    def count_solve(*args, **kwargs):
+        solve_calls.append(kwargs)
+        return original_run(*args, **kwargs)
+
+    monkeypatch.setattr(gui_app_module, "run_static_target_experiment", count_solve)
     interaction = next(
         component
         for component in tabs.select(pn.reactive.ReactiveHTML)
@@ -3289,12 +4431,8 @@ def test_shift_drag_updates_orientation_controls_and_recomputes_target():
     )
     yaw_value_events = []
     pitch_value_events = []
-    yaw_throttled_events = []
-    pitch_throttled_events = []
     yaw.param.watch(yaw_value_events.append, "value")
     pitch.param.watch(pitch_value_events.append, "value")
-    yaw.param.watch(yaw_throttled_events.append, "value_throttled")
-    pitch.param.watch(pitch_throttled_events.append, "value_throttled")
     before = np.asarray(scene.object.data[0].x, dtype=float)
     event = SimpleNamespace(
         new={
@@ -3315,18 +4453,115 @@ def test_shift_drag_updates_orientation_controls_and_recomputes_target():
     assert pitch.value == pytest.approx(10.0)
     assert [event.new for event in yaw_value_events] == [-25.0]
     assert [event.new for event in pitch_value_events] == [10.0]
-    assert yaw_throttled_events == []
-    assert pitch_throttled_events == []
+    assert len(solve_calls) == 1
     assert "x" not in interaction.target_result
     assert interaction.target_result["meta"]["yaw_deg"] == pytest.approx(-25.0)
     assert interaction.target_result["meta"]["pitch_deg"] == pytest.approx(10.0)
     assert np.allclose(np.asarray(scene.object.data[0].x, dtype=float), before)
 
 
-def test_saved_solver_settings_are_validated_restored_and_normalized():
+@pytest.mark.parametrize("restore_order", [("solver", "session"), ("session", "solver")])
+@pytest.mark.parametrize(
+    ("old_version", "old_phase", "old_depth", "old_cap"),
+    [(1, 1.0, 2, 16), (1, np.pi / 8, 16, 0), (1, np.pi / 8, 3, 64), (2, 3.0, 3, 64)],
+)
+def test_old_browser_po_settings_migrate_to_displayed_defaults(
+    restore_order,
+    old_version,
+    old_phase,
+    old_depth,
+    old_cap,
+):
+    application = build_app()
+    widgets = {widget.label: widget for widget in application.modal[0].select(pn.widgets.Widget)}
+    expected = {
+        "PO subdivision phase span [rad]": 6.0,
+        "PO curvature tolerance [rad]": 0.005,
+        "PO maximum refinement depth": 3,
+        "PO subfaces per parent (0 = unlimited)": 64,
+    }
+    models = {label: widgets[label].get_root(Document()) for label in expected}
+
+    def assert_displayed_defaults():
+        assert widgets["PO facet integration"].value == "parent_face_adaptive_analytic"
+        for label, value in expected.items():
+            assert widgets[label].value == pytest.approx(value)
+            assert models[label].value == pytest.approx(value)
+        assert models["PO subdivision phase span [rad]"].format == "0.[000]"
+
+    assert_displayed_defaults()
+    components = application.header[0].select(pn.reactive.ReactiveHTML)
+    solver_storage = next(c for c in components if "loaded_settings" in c.param)
+    session_storage = next(c for c in components if "loaded_state" in c.param)
+    solver_restore = next(
+        watcher.fn
+        for watcher in solver_storage.param.watchers["loaded_settings"]["value"]
+        if getattr(watcher.fn, "__name__", "") == "on_solver_settings_loaded"
+    )
+    session_restore = next(
+        watcher.fn
+        for watcher in session_storage.param.watchers["loaded_state"]["value"]
+        if getattr(watcher.fn, "__name__", "") == "restore_gui_session"
+    )
+    human_room_state = _callback_scope(session_restore).nonlocals["human_room_state"]
+    old_cache_key = _cache_theme_gui_results(
+        dynamic_results={"po": SimpleNamespace()},
+    )
+    old_settings = {
+        "po_integration_mode": (
+            "parent_face_adaptive_analytic" if old_version == 2 else "parent_face_quadrature"
+        ),
+        "po_quadrature_phase_span_scale_rad": old_phase,
+        "po_curvature_error_rad": 0.01,
+        "po_quadrature_max_refinement_depth": old_depth,
+        "po_quadrature_max_subfaces_per_parent": old_cap,
+        "rt_samples_per_source": 600,
+        "rt_max_paths_per_source": 700,
+        "rt_max_depth": 2,
+    }
+    for source in restore_order:
+        if source == "solver":
+            asyncio.run(
+                solver_restore(
+                    SimpleNamespace(
+                        new={
+                            "schema_version": gui_app_module._SOLVER_SETTINGS_SCHEMA_VERSION,
+                            "po_defaults_version": old_version,
+                            "settings": old_settings,
+                        }
+                    )
+                )
+            )
+        else:
+            session_storage.loaded_state = {
+                "schema_version": 2,
+                "po_defaults_version": old_version,
+                "solver_settings": old_settings,
+                "gui_result_cache_key": old_cache_key,
+            }
+        assert_displayed_defaults()
+        assert human_room_state["result"] is None
+
+    assert widgets["RT ray samples per source"].value == 600
+    assert widgets["RT maximum paths per source"].value == 700
+    assert widgets["RT maximum path depth"].value == 2
+    for payload, settings_key in (
+        (solver_storage.saved_settings, "settings"),
+        (session_storage.saved_state, "solver_settings"),
+    ):
+        assert payload["po_defaults_version"] == gui_app_module._PO_DEFAULTS_VERSION
+        settings = payload[settings_key]
+        assert settings["po_quadrature_phase_span_scale_rad"] == 6.0
+        assert settings["po_curvature_error_rad"] == 0.005
+        assert settings["po_quadrature_max_refinement_depth"] == 3
+        assert settings["po_quadrature_max_subfaces_per_parent"] == 64
+
+
+def test_saved_solver_settings_are_validated_restored_and_normalized(monkeypatch):
     assert _validated_solver_settings_payload(
         {
-            "schema_version": 1,
+            "schema_version": gui_app_module._SOLVER_SETTINGS_SCHEMA_VERSION,
+            "po_defaults_version": gui_app_module._PO_DEFAULTS_VERSION,
             "settings": {
                 "po_integration_mode": "face_centroid",
                 "po_quadrature_phase_span_scale_rad": 0.75,
@@ -3346,36 +4581,83 @@ def test_saved_solver_settings_are_validated_restored_and_normalized():
         "rt_max_paths_per_source": 700,
         "rt_max_depth": 2,
     }
+    assert (
+        _validated_solver_settings_payload(
+            {
+                "schema_version": gui_app_module._SOLVER_SETTINGS_SCHEMA_VERSION,
+                "po_defaults_version": gui_app_module._PO_DEFAULTS_VERSION,
+                "settings": {
+                    "po_integration_mode": "unsupported",
+                    "rt_samples_per_source": -1,
+                    "rt_max_depth": True,
+                },
+            }
+        )
+        == {}
+    )
+    assert _validated_solver_settings_payload({"schema_version": 0, "settings": {}}) == {}
+    # Version 1 profiles used the removed names and are ignored.
+    assert (
+        _validated_solver_settings_payload(
+            {"schema_version": 1, "settings": {"coupling_max_reflectors": 2}}
+        )
+        == {}
+    )
     assert _validated_solver_settings_payload(
         {
-            "schema_version": 1,
+            "schema_version": gui_app_module._SOLVER_SETTINGS_SCHEMA_VERSION,
+            "po_defaults_version": gui_app_module._PO_DEFAULTS_VERSION,
             "settings": {
-                "po_integration_mode": "unsupported",
-                "rt_samples_per_source": -1,
-                "rt_max_depth": True,
+                "array_model": "element",
+                "array_tx_groups": "0-1; 2",
+                "array_rx_groups": "0-1; x",
+                "rt_human_bounces": "any",
+                "rt_refresh_frames": 0,
+                "po_visibility_fade_frames": 2,
+                "hybrid_coupling": False,
+                "hybrid_calibration": "rt_sequence",
+                "hybrid_max_reflectors": 3,
             },
         }
-    ) == {}
-    assert _validated_solver_settings_payload(
-        {"schema_version": 0, "settings": {}}
-    ) == {}
+    ) == {
+        "array_tx_groups": "0-1; 2",
+        "rt_human_bounces": "any",
+        "rt_refresh_frames": 0,
+        "po_visibility_fade_frames": 2,
+        "hybrid_coupling": False,
+        "hybrid_calibration": "rt_sequence",
+        "hybrid_max_reflectors": 3,
+    }
 
     application = build_app()
+    unexpected_runs = []
+    monkeypatch.setattr(
+        gui_app_module,
+        "run_static_target_experiment",
+        lambda **kwargs: unexpected_runs.append(kwargs),
+    )
     solver_settings = application.modal[0]
     settings_storage = next(
         component
-        for component in application.header[0].select(
-            pn.reactive.ReactiveHTML
-        )
+        for component in application.header[0].select(pn.reactive.ReactiveHTML)
         if "loaded_settings" in component.param
     )
     restored_payload = {
-        "schema_version": 1,
+        "schema_version": gui_app_module._SOLVER_SETTINGS_SCHEMA_VERSION,
+        "po_defaults_version": gui_app_module._PO_DEFAULTS_VERSION,
         "settings": {
             "po_integration_mode": "face_centroid",
             "po_quadrature_phase_span_scale_rad": 0.75,
             "po_quadrature_max_refinement_depth": 1,
             "po_quadrature_max_subfaces_per_parent": 8,
+            "hybrid_reflector_cutoff_db": -30.0,
+            "po_curvature_error_rad": 0.02,
+            "po_refresh_on_area_fraction": 0.3,
+            "po_refresh_on_normal_deg": 20.0,
+            "po_visibility_samples_per_face": 16,
+            "po_adaptive_visibility_sampling": False,
+            "po_adaptive_visibility_edge_margin": 0.2,
+            "hybrid_max_reflectors": 2,
             "rt_samples_per_source": 600,
             "rt_max_paths_per_source": 700,
             "rt_max_depth": 2,
@@ -3383,94 +4665,218 @@ def test_saved_solver_settings_are_validated_restored_and_normalized():
     }
     callback = next(
         watcher.fn
-        for watcher in settings_storage.param.watchers[
-            "loaded_settings"
-        ]["value"]
+        for watcher in settings_storage.param.watchers["loaded_settings"]["value"]
         if getattr(watcher.fn, "__name__", "") == "on_solver_settings_loaded"
     )
 
     asyncio.run(callback(SimpleNamespace(new=restored_payload)))
+    assert unexpected_runs == []
 
     solver_widgets = [
         *solver_settings.select(pn.widgets.Select),
         *solver_settings.select(pn.widgets.FloatInput),
         *solver_settings.select(pn.widgets.IntInput),
     ]
-    values_by_label = {
-        widget.label: widget.value for widget in solver_widgets
-    }
+    values_by_label = {widget.label: widget.value for widget in solver_widgets}
     assert values_by_label["PO facet integration"] == "face_centroid"
     assert values_by_label["PO subdivision phase span [rad]"] == 0.75
     assert values_by_label["PO maximum refinement depth"] == 1
     assert values_by_label["PO subfaces per parent (0 = unlimited)"] == 8
+    assert values_by_label["PO curvature tolerance [rad]"] == 0.02
+    assert values_by_label["PO refresh relative area change"] == 0.3
+    assert values_by_label["PO refresh normal change [deg]"] == 20.0
+    assert values_by_label["PO visibility samples per face"] == 16
+    assert values_by_label["PO grazing cosine margin"] == 0.2
+    assert (
+        next(
+            widget
+            for widget in solver_settings.select(pn.widgets.Checkbox)
+            if widget.label == "Adaptive PO visibility sampling"
+        ).value
+        is False
+    )
+    assert values_by_label["Image-source power cutoff [dB relative to strongest]"] == -30.0
+    assert values_by_label["Image-source maximum count"] == 2
     assert values_by_label["RT ray samples per source"] == 600
     assert values_by_label["RT maximum paths per source"] == 700
     assert values_by_label["RT maximum path depth"] == 2
-    assert settings_storage.saved_settings == restored_payload
+    saved_payload = dict(settings_storage.saved_settings)
+    remembered_spans = saved_payload.pop("po_phase_span_by_mode")
+    saved_settings = saved_payload.pop("settings")
+    assert saved_payload == {
+        key: value for key, value in restored_payload.items() if key != "settings"
+    }
+    # Every setting is saved; the restored ones keep their restored values.
+    assert set(saved_settings) == {
+        *gui_app_module._SOLVER_SETTINGS_DEFAULTS,
+        *gui_app_module._SOLVER_SETTINGS_GROUP_TEXT,
+    }
+    assert {key: saved_settings[key] for key in restored_payload["settings"]} == restored_payload[
+        "settings"
+    ]
+    assert remembered_spans["face_centroid"] == 0.75
+    mode_widget = next(
+        widget for widget in solver_widgets if widget.label == "PO facet integration"
+    )
+    span_widget = next(
+        widget for widget in solver_widgets if widget.label == "PO subdivision phase span [rad]"
+    )
+    mode_widget.value = "parent_face_quadrature"
+    assert span_widget.value == 1.0
+    mode_widget.value = "face_centroid"
+    assert span_widget.value == 0.75
+
+
+def test_image_source_settings_defaults_and_supported_limits():
+    application = build_app()
+    widgets = {widget.label: widget for widget in application.modal[0].select(pn.widgets.Widget)}
+    cutoff = widgets["Image-source power cutoff [dB relative to strongest]"]
+    count = widgets["Image-source maximum count"]
+    assert cutoff.value == -20.0
+    assert (count.value, count.start, count.end) == (4, 1, 4)
+    assert not any("keep all" in str(label).lower() for label in widgets)
+    assert (
+        _validated_solver_settings_payload(
+            {
+                "schema_version": gui_app_module._SOLVER_SETTINGS_SCHEMA_VERSION,
+                "po_defaults_version": gui_app_module._PO_DEFAULTS_VERSION,
+                "settings": {"hybrid_reflector_cutoff_db": None, "hybrid_max_reflectors": 0},
+            }
+        )
+        == {}
+    )
+
+
+def test_po_phase_span_is_remembered_per_integration_mode():
+    application = build_app()
+    widgets = {widget.label: widget for widget in application.modal[0].select(pn.widgets.Widget)}
+    mode = widgets["PO facet integration"]
+    span = widgets["PO subdivision phase span [rad]"]
+    assert (mode.value, span.value) == ("parent_face_adaptive_analytic", 6.0)
+
+    mode.value = "parent_face_quadrature"
+    assert span.value == 1.0
+    span.value = 0.5
+    mode.value = "parent_face_adaptive_analytic"
+    assert span.value == 6.0
+    mode.value = "parent_face_quadrature"
+    assert span.value == 0.5
+
+
+def test_saved_po_phase_spans_reject_invalid_modes_values_and_versions():
+    payload = {
+        "schema_version": gui_app_module._SOLVER_SETTINGS_SCHEMA_VERSION,
+        "po_defaults_version": gui_app_module._PO_DEFAULTS_VERSION,
+        "po_phase_span_by_mode": {
+            "parent_face_adaptive_analytic": 8.0,
+            "parent_face_quadrature": 0.5,
+            "parent_face_far_field_analytic": np.inf,
+            "face_centroid": True,
+            "unsupported": 3.0,
+        },
+    }
+    validate = gui_app_module._validated_po_phase_span_by_mode
+    assert validate(payload) == {
+        "parent_face_adaptive_analytic": 8.0,
+        "parent_face_quadrature": 0.5,
+    }
+    for value in (None, "0.5", np.nan, -1.0, 0.0, 21.0):
+        assert (
+            validate(
+                {
+                    **payload,
+                    "po_phase_span_by_mode": {"parent_face_quadrature": value},
+                }
+            )
+            == {}
+        )
+    assert validate({**payload, "schema_version": 0}) == {}
+    assert validate({**payload, "po_defaults_version": 2}) == {}
+    assert validate({**payload, "po_phase_span_by_mode": []}) == {}
+
+
+@pytest.mark.parametrize(
+    "active_mode",
+    [
+        "parent_face_adaptive_analytic",
+        "parent_face_quadrature",
+    ],
+)
+@pytest.mark.parametrize(
+    "restore_order",
+    [
+        ("solver",),
+        ("session",),
+        ("solver", "session"),
+        ("session", "solver"),
+    ],
+)
+def test_po_phase_spans_survive_browser_and_theme_reload(active_mode, restore_order):
+    original = build_app()
+    widgets = {widget.label: widget for widget in original.modal[0].select(pn.widgets.Widget)}
+    mode, span = widgets["PO facet integration"], widgets["PO subdivision phase span [rad]"]
+    span.value = 8.0
+    mode.value = "parent_face_quadrature"
+    span.value = 0.5
+    mode.value = active_mode
+    components = original.header[0].select(pn.reactive.ReactiveHTML)
+    solver = next(c for c in components if "loaded_settings" in c.param)
+    session = next(c for c in components if "loaded_state" in c.param)
+    # Serialize as the browser does; the restored app has its own mode memory.
+    solver_payload = json.loads(json.dumps(solver.saved_settings))
+    session_payload = json.loads(json.dumps(session.saved_state))
+    expected = {"parent_face_adaptive_analytic": 8.0, "parent_face_quadrature": 0.5}
+    assert solver_payload["po_phase_span_by_mode"] == expected
+    assert session_payload["po_phase_span_by_mode"] == expected
+
+    restored = build_app()
+    widgets = {widget.label: widget for widget in restored.modal[0].select(pn.widgets.Widget)}
+    mode, span = widgets["PO facet integration"], widgets["PO subdivision phase span [rad]"]
+    components = restored.header[0].select(pn.reactive.ReactiveHTML)
+    solver = next(c for c in components if "loaded_settings" in c.param)
+    session = next(c for c in components if "loaded_state" in c.param)
+    restore_solver = next(
+        watcher.fn
+        for watcher in solver.param.watchers["loaded_settings"]["value"]
+        if getattr(watcher.fn, "__name__", "") == "on_solver_settings_loaded"
+    )
+    for source in restore_order:
+        if source == "solver":
+            asyncio.run(restore_solver(SimpleNamespace(new=solver_payload)))
+        else:
+            session.loaded_state = session_payload
+        assert mode.value == active_mode
+        assert span.value == expected[active_mode]
+    for name, value in expected.items():
+        mode.value = name
+        assert span.value == value
+    assert solver.saved_settings["po_phase_span_by_mode"] == expected
+    assert session.saved_state["po_phase_span_by_mode"] == expected
 
 
 def test_physics_controls_recompute_the_interactive_preview():
     application = build_app()
     tabs = application.main[0]
-    aspect = next(
-        slider
-        for slider in tabs.select(pn.widgets.FloatSlider)
-        if slider.label == "Yaw / aspect [deg]"
-    )
+    aspect = _numeric_controls(tabs, "static-orientation")["Yaw [deg]"]
     scene = _scene_pane(tabs)
-    aspect.value = 35
-    callbacks = aspect.param.watchers["value_throttled"]["value"]
-    callback = next(
-        watcher.fn
-        for watcher in callbacks
-        if getattr(watcher.fn, "__name__", "") == "on_physics_control_change"
+    aspect._process_events({"value": 35.0})  # pylint: disable=protected-access
+    interaction = next(
+        component
+        for component in tabs.select(pn.reactive.ReactiveHTML)
+        if "target_gesture" in component.param
     )
+    assert interaction.target_result["meta"]["yaw_deg"] == 35.0
+    assert np.ptp(np.asarray(interaction.target_result["x"], dtype=float)) > 0.1
 
-    asyncio.run(callback(None))
-
-    assert np.ptp(np.asarray(scene.object.data[0].x, dtype=float)) > 0.1
-
-    target_y = next(
-        slider
-        for slider in tabs.select(pn.widgets.FloatSlider)
-        if slider.label == "Target y / lateral-left [m]"
-    )
-    target_y.value = 0.35
-    target_position_callback = next(
-        watcher.fn
-        for watcher in target_y.param.watchers["value_throttled"]["value"]
-        if getattr(watcher.fn, "__name__", "") == "on_physics_control_change"
-    )
-
-    asyncio.run(
-        target_position_callback(SimpleNamespace(obj=target_y))
-    )
-
+    target_y = _numeric_controls(tabs, "static-position")["Y [m]"]
+    target_y._process_events({"value": 0.35})  # pylint: disable=protected-access
     target_trace = scene.object.data[0]
-    assert np.mean(np.asarray(target_trace.y, dtype=float)) == pytest.approx(
-        0.35
-    )
-    assert tuple(target_trace.meta["orientation_pivot"]) == pytest.approx(
-        (2.0, 0.35, 0.0)
-    )
+    assert np.mean(np.asarray(target_trace.y, dtype=float)) == pytest.approx(0.35)
+    assert tuple(target_trace.meta["orientation_pivot"]) == pytest.approx((2.0, 0.35, 0.0))
 
-    radar_yaw = next(
-        slider
-        for slider in tabs.select(pn.widgets.FloatSlider)
-        if slider.label == "Radar yaw [deg]"
-    )
-    radar_yaw.value = 30.0
-    radar_callback = next(
-        watcher.fn
-        for watcher in radar_yaw.param.watchers["value_throttled"]["value"]
-        if getattr(watcher.fn, "__name__", "") == "on_physics_control_change"
-    )
-
-    asyncio.run(radar_callback(SimpleNamespace(obj=radar_yaw)))
-
-    boresight = next(
-        trace for trace in scene.object.data if trace.name == "Radar boresight"
-    )
+    radar_yaw = _numeric_controls(tabs, "static-radar-orientation")["Yaw [deg]"]
+    radar_yaw._process_events({"value": 30.0})  # pylint: disable=protected-access
+    boresight = next(trace for trace in scene.object.data if trace.name == "Radar boresight")
     assert boresight.x[-1] > 0.0
     assert boresight.y[-1] > 0.0
 
@@ -3479,9 +4885,7 @@ def test_material_selection_updates_diffuse_scattering_description():
     application = build_app()
     tabs = application.main[0]
     material = next(
-        widget
-        for widget in tabs.select(pn.widgets.Select)
-        if widget.label == "Material preset"
+        widget for widget in tabs.select(pn.widgets.Select) if widget.label == "Material preset"
     )
     material.value = "concrete"
     callback = next(
@@ -3509,9 +4913,7 @@ def test_selecting_human_uses_internal_default_mesh():
     application = build_app()
     tabs = application.main[0]
     selector = next(
-        widget
-        for widget in tabs.select(pn.widgets.Select)
-        if widget.label == "Static object"
+        widget for widget in tabs.select(pn.widgets.Select) if widget.label == "Target type"
     )
     selector.value = "human_mesh"
     callback = next(
@@ -3526,8 +4928,7 @@ def test_selecting_human_uses_internal_default_mesh():
     assert len(scene.object.data[0].x) == 6890
     assert scene.object.data[0].name == "Human Mesh"
     assert any(
-        "RT-Pose seq186 frame0020" in str(pane.object)
-        for pane in tabs.select(pn.pane.Markdown)
+        "RT-Pose seq186 frame0020" in str(pane.object) for pane in tabs.select(pn.pane.Markdown)
     )
 
 
@@ -3560,7 +4961,9 @@ def test_gui_export_is_a_loadable_static_target_bundle(tmp_path):
             "scene.xml",
             "experiment_manifest.json",
         }.issubset(archive.namelist())
-        assert b'type="obj"' in archive.read("scene.xml")
+        # The target is indexed separately; the environment must not retain a
+        # second copy that would be traced again during re-simulation.
+        assert b'type="obj"' not in archive.read("scene.xml")
         sensor = json.loads(archive.read("sensor.json"))
         assert sensor["orientation_deg"] == [8.0, -3.0, 5.0]
         assert sensor["pattern_mode"] == "cosine"
@@ -3575,16 +4978,14 @@ def test_gui_export_is_a_loadable_static_target_bundle(tmp_path):
             BytesIO(archive.read("solver_diagnostics.npz")),
             allow_pickle=False,
         ) as diagnostics:
-            assert diagnostics["rt_face_hit_counts"].shape == (
-                result.faces.shape[0],
-            )
+            assert diagnostics["rt_face_hit_counts"].shape == (result.faces.shape[0],)
 
     loaded = load_bundle(path)
 
     assert loaded.profile == "hermes"
     assert loaded.data_origin == "simulation"
     assert loaded.available_simulations == ("po", "rt")
-    assert loaded.can_resimulate is False
+    assert loaded.can_resimulate is True
     assert loaded.integrity_report["static_target"]["present"] is True
     assert loaded.load_bundled_simulation("rt").shape == loaded.primary_adc.shape
     scene = _bundle_scene_figure(
@@ -3596,32 +4997,31 @@ def test_gui_export_is_a_loadable_static_target_bundle(tmp_path):
     assert "Material: pec" in target.hovertemplate
 
 
-def test_prepared_room_export_preserves_rough_wall_scattering():
+@pytest.mark.parametrize("preset", ["tutorial_bedroom", "empty_room"])
+def test_prepared_room_export_preserves_rough_wall_scattering(preset):
     result = SimpleNamespace(
         scene_xml=None,
         preview=SimpleNamespace(
             scene_xml=None,
-            room_boxes=prepared_room_boxes(),
+            room_boxes=prepared_room_boxes(preset),
         ),
     )
 
-    scene_xml = _human_room_scene_xml(result).decode("utf-8")
+    scene = ET.fromstring(_human_room_scene_xml(result))
+    assert {shape.attrib["id"] for shape in scene.findall("./shape")} == {
+        box["id"] for box in prepared_room_boxes(preset)
+    }
+    assert scene.find("./shape[@id='human-frame-0']") is None
+    floor = scene.find("./shape[@id='floor']")
+    right_wall = scene.find("./shape[@id='right_wall']")
+    wall = scene.find("./bsdf[@id='mat-wall']")
 
-    assert scene_xml.count(
-        '<float name="scattering_coefficient" value="0.2"/>'
-    ) == 2
-    assert (
-        '<bsdf type="itu-radio-material" id="mat-metal">'
-        '<string name="type" value="metal"/>'
-        '<float name="scattering_coefficient" value="0.2"/>'
-        "</bsdf>"
-    ) in scene_xml
-    assert (
-        '<bsdf type="itu-radio-material" id="mat-plasterboard">'
-        '<string name="type" value="plasterboard"/>'
-        '<float name="scattering_coefficient" value="0.2"/>'
-        "</bsdf>"
-    ) in scene_xml
+    expected_floor = next(box for box in prepared_room_boxes(preset) if box["id"] == "floor")
+    assert floor.find("./ref[@name='bsdf']").attrib["id"] == expected_floor["material_id"]
+    assert right_wall.find("./ref[@name='bsdf']").attrib["id"] == "mat-wall"
+    assert float(
+        wall.find("./float[@name='scattering_coefficient']").attrib["value"]
+    ) == pytest.approx(0.2)
 
 
 def test_human_room_export_is_loadable_and_keeps_radar_at_origin(tmp_path):
@@ -3664,8 +5064,8 @@ def test_human_room_export_is_loadable_and_keeps_radar_at_origin(tmp_path):
             "poses": np.zeros((2, 72), dtype=np.float32),
             "trans": np.zeros((2, 3), dtype=np.float32),
             "betas": np.zeros(10, dtype=np.float32),
-            "times": np.asarray([0.0, 1.0 / 30.0]),
-            "bundle_times": np.asarray([0.0, 1.0 / 30.0]),
+            "times": np.asarray([0.0, 0.04]),
+            "bundle_times": np.asarray([0.0, 0.04]),
             "faces": faces,
             "gender": np.asarray("neutral"),
             "model_type": np.asarray("smpl"),
@@ -3681,10 +5081,12 @@ def test_human_room_export_is_loadable_and_keeps_radar_at_origin(tmp_path):
         "chirp_duration_s": 58e-6,
         "chirp_repetition_time_s": 65e-6,
         "sampling_frequency_hz": 4.5e6,
+        "adc_mode": "complex2x",
+        "if_bandwidth_hz": 1e6,
         "num_adc_samples": 8,
         "num_chirps_per_frame": 2,
         "frame_period_s": 50e-3,
-        "tdm_enabled": True,
+        "tx_schedule": "tdm",
         "tx_indices_zero_based": [0, 1, 2],
         "rx_indices_zero_based": [0, 1, 2, 3],
         "antenna_pattern_mode": "cosine",
@@ -3696,9 +5098,9 @@ def test_human_room_export_is_loadable_and_keeps_radar_at_origin(tmp_path):
             scenario="tutorial_bedroom",
             parameters={
                 "scene_editable": False,
-                "source_motion_frame_count": 2,
-                "motion_begin_frame_index": 1,
-                "motion_end_frame_index": 1,
+                "motion_pose_count": 2,
+                "motion_start_s": 1.0 / 30.0,
+                "motion_end_s": 0.04,
             },
         ),
         radar=RadarExperimentConfig(
@@ -3706,12 +5108,12 @@ def test_human_room_export_is_loadable_and_keeps_radar_at_origin(tmp_path):
             profile="gui_human_room",
             parameters=radar_parameters,
         ),
-        solver=SolverExperimentConfig(mode="hybrid_rt_po"),
+        solver=SolverExperimentConfig(solvers=("hybrid_po",)),
     )
     adc = np.ones((1, 2, 8, 12), dtype=np.complex64)
-    times = np.asarray([[0.0, 65e-6]])
+    times = np.asarray([[0.0, 195e-6]])
     result = SimpleNamespace(
-        simulation_mode="hybrid_po",
+        solver="hybrid_po",
         manifest=manifest,
         preview=preview,
         radar_orientation_rad=np.deg2rad((10.0, -3.0, 2.0)),
@@ -3729,6 +5131,7 @@ def test_human_room_export_is_loadable_and_keeps_radar_at_origin(tmp_path):
             "static_environment_blocked": adc * 0.75,
         },
         metadata=SimpleNamespace(
+            adc_if_filter={"adc_mode": "complex2x", "rejected_path_channels": 3},
             path_counts=np.ones((1, 2), dtype=np.int64),
             visible_face_counts=np.ones((1, 2), dtype=np.int64),
             effective_visible_area_fraction=np.ones((1, 2)),
@@ -3742,20 +5145,20 @@ def test_human_room_export_is_loadable_and_keeps_radar_at_origin(tmp_path):
         scene_xml=custom_scene,
         scene_source_name="lab.xml",
     )
-    full_rt_result = SimpleNamespace(**vars(result))
-    full_rt_result.simulation_mode = "full_rt"
-    full_rt_result.adc = adc * 2.0
-    full_rt_result.manifest = replace(
+    rt_result = SimpleNamespace(**vars(result))
+    rt_result.solver = "rt"
+    rt_result.adc = adc * 2.0
+    rt_result.manifest = replace(
         manifest,
         name="human room full RT test",
-        solver=SolverExperimentConfig(mode="rt_scattering"),
+        solver=SolverExperimentConfig(solvers=("rt",)),
     )
     path = tmp_path / "human-room.zip"
     path.write_bytes(
         _human_room_export(
             result,
-            mode_results={
-                "full_rt": full_rt_result,
+            solver_results={
+                "rt": rt_result,
                 "hybrid_po": result,
             },
         ).getvalue()
@@ -3768,7 +5171,6 @@ def test_human_room_export_is_loadable_and_keeps_radar_at_origin(tmp_path):
             "frames.json",
             "radar_adc.npz",
             "simulated_adc_rt.npz",
-            "simulated_adc_po.npz",
             "target_mesh.npz",
             "human_motion.npz",
             "amass_sequence.npz",
@@ -3777,37 +5179,60 @@ def test_human_room_export_is_loadable_and_keeps_radar_at_origin(tmp_path):
             "environment.json",
             "experiment_manifest.json",
             "experiment_manifest_hybrid_po.json",
-            "experiment_manifest_full_rt.json",
-            "simulated_adc_full_rt.npz",
+            "experiment_manifest_rt.json",
             "simulated_adc_hybrid_po.npz",
         }.issubset(archive.namelist())
+        assert "simulated_adc_po.npz" not in archive.namelist()
+        components_path = json.loads(archive.read("bundle.json"))["diagnostics"][
+            "hybrid_po_components"
+        ]
+        assert components_path == "hybrid_po_components.npz"
+        with np.load(
+            BytesIO(archive.read(components_path)),
+            allow_pickle=False,
+        ) as components:
+            assert set(components.files) == {
+                "times",
+                "human_po",
+                "static_environment_blocked",
+            }
+            np.testing.assert_array_equal(
+                components["human_po"],
+                result.components["human_po"],
+            )
         descriptor = json.loads(archive.read("bundle.json"))
         assert descriptor["profile"] == "hermes"
-        assert descriptor["primary_solver"] == "po"
-        assert descriptor["primary_simulation_mode"] == "hybrid_po"
+        assert descriptor["primary_solver"] == "hybrid_po"
+        assert descriptor["adcs"]["primary"]["solver"] == "hybrid_po"
+        assert "primary_simulation_mode" not in descriptor
         assert descriptor["motion"] == {
             "evaluated_mesh": "human_motion.npz",
             "parameters": "amass_sequence.npz",
-            "frame_window": {
-                "begin_frame_index": 1,
-                "end_frame_index": 1,
+            "time_window": {
+                "start_s": pytest.approx(1.0 / 30.0),
+                "end_s": pytest.approx(0.04),
             },
         }
-        assert descriptor["adcs"]["full_rt"]["path"] == (
-            "simulated_adc_full_rt.npz"
-        )
-        assert descriptor["adcs"]["hybrid_po"]["path"] == (
-            "simulated_adc_hybrid_po.npz"
-        )
+        assert descriptor["adcs"]["rt"] == {
+            "path": "simulated_adc_rt.npz",
+            "origin": "simulation",
+            "solver": "rt",
+        }
+        assert descriptor["adcs"]["hybrid_po"]["path"] == ("simulated_adc_hybrid_po.npz")
         with np.load(
             BytesIO(archive.read("simulated_adc_rt.npz")),
             allow_pickle=False,
         ) as rt_comparison:
-            assert np.array_equal(rt_comparison["adc"], full_rt_result.adc)
+            assert np.array_equal(rt_comparison["adc"], rt_result.adc)
         sensor = json.loads(archive.read("sensor.json"))
+        assert sensor["tx_schedule"] == "tdm"
+        assert sensor["fmcw"]["tx_schedule"] == "tdm"
+        assert "tdm_enabled" not in sensor["fmcw"]
         assert sensor["position"] == [0.0, 0.0, 0.0]
+        assert sensor["fmcw"]["adc_mode"] == "complex2x"
+        assert sensor["fmcw"]["if_bandwidth_hz"] == 1e6
         frames = json.loads(archive.read("frames.json"))
-        assert frames["frames"][0]["source_motion_frame_index"] == 1
+        assert "source_motion_frame_index" not in frames["frames"][0]
         assert frames["frames"][0]["motion_time_s"] == pytest.approx(1.0 / 30.0)
         assert archive.read("scene.xml") == custom_scene
         with np.load(
@@ -3820,27 +5245,29 @@ def test_human_room_export_is_loadable_and_keeps_radar_at_origin(tmp_path):
         assert environment["motion_mesh"] == "human_motion.npz"
         assert environment["motion_parameters"] == "amass_sequence.npz"
         assert environment["scene_source"] == "lab.xml"
-        assert environment["motion_frame_window"] == {
-            "begin_frame_index": 1,
-            "end_frame_index": 1,
+        assert environment["motion_time_window"] == {
+            "start_s": pytest.approx(1.0 / 30.0),
+            "end_s": pytest.approx(0.04),
         }
         with np.load(
             BytesIO(archive.read("solver_diagnostics.npz")),
             allow_pickle=False,
         ) as diagnostics:
+            assert (
+                json.loads(str(diagnostics["adc_if_filter_json"].item()))
+                == result.metadata.adc_if_filter
+            )
             assert diagnostics["range_time_power"].shape == (2, 8)
             assert diagnostics["range_doppler_power"].shape == (1, 2, 8)
 
     loaded = load_bundle(path)
 
+    assert loaded.bundle.sensor_config.fmcw.adc_mode == "complex2x"
+    assert loaded.bundle.sensor_config.fmcw.if_bandwidth_hz == 1e6
     assert loaded.profile == "hermes"
     assert loaded.data_origin == "simulation"
-    assert loaded.available_simulations == (
-        "full_rt",
-        "hybrid_po",
-        "po",
-        "rt",
-    )
+    assert loaded.bundle.sensor_config.fmcw.tx_schedule == "tdm"
+    assert loaded.available_simulations == ("hybrid_po", "rt")
     assert loaded.primary_adc.shape == adc.shape
     assert loaded.can_resimulate is True
 
@@ -3849,11 +5276,9 @@ def test_human_room_export_is_loadable_and_keeps_radar_at_origin(tmp_path):
     ("data_origin", "descriptor", "expected"),
     (
         ("measurement", {}, "Measured"),
-        (
-            "simulation",
-            {"primary_simulation_mode": "full_rt", "primary_solver": "rt"},
-            "Primary Full RT simulation",
-        ),
+        ("simulation", {"primary_solver": "hybrid_po"}, "Primary Hybrid PO simulation"),
+        ("simulation", {"primary_solver": "po"}, "Primary PO simulation"),
+        # Bundles written before the solver names recorded Hybrid PO this way.
         (
             "simulation",
             {"primary_simulation_mode": "hybrid_po", "primary_solver": "po"},
@@ -3863,7 +5288,7 @@ def test_human_room_export_is_loadable_and_keeps_radar_at_origin(tmp_path):
         ("simulation", {}, "Primary simulation"),
     ),
 )
-def test_bundle_primary_label_uses_declared_mode_and_solver(
+def test_bundle_primary_label_uses_declared_solver(
     data_origin,
     descriptor,
     expected,
@@ -3876,13 +5301,46 @@ def test_bundle_primary_label_uses_declared_mode_and_solver(
     assert _bundle_primary_label(loaded) == expected
 
 
+def test_saved_session_restore_waits_for_the_connected_page(monkeypatch):
+    """A theme reload reports saved state before document_ready.
+
+    Restoring earlier can leave new result models unsent, so the restore runs
+    from Panel's onload hook; it must then run once and not queue itself again
+    (Panel reports ``loaded`` only after the onload callbacks finish).
+    """
+
+    application = build_app()
+    tabs = application.main[0]
+    storage = next(
+        c
+        for c in application.header[0].select(pn.reactive.ReactiveHTML)
+        if "loaded_state" in c.param
+    )
+    queued = []
+    monkeypatch.setattr(type(pn.state), "loaded", property(lambda self: False))
+    monkeypatch.setattr(
+        pn.state, "onload", lambda callback, threaded=False: queued.append(callback)
+    )
+
+    storage.loaded_state = {"schema_version": 2, "top_tab": 2}
+    storage.loaded_uploads = {"load_sequence": 1}
+    assert tabs.active == 0
+    assert len(queued) == 2
+
+    for callback in list(queued):
+        queued.remove(callback)
+        callback()
+    assert tabs.active == 2
+    assert queued == []
+
+
 def test_plot_theme_tracks_the_single_panel_theme_switch():
     assert _plot_template({}) == "plotly_dark"
     assert _plot_template({"theme": [b"dark"]}) == "plotly_dark"
     assert _plot_template({"theme": [b"default"]}) == "plotly_white"
 
 
-def test_theme_switch_copies_live_dynamic_modes_and_result_cache(monkeypatch):
+def test_theme_switch_copies_live_dynamic_solvers_and_result_cache(monkeypatch):
     callbacks = []
     restore_callbacks = []
     original_jscallback = pn.widgets.Button.jscallback
@@ -3919,22 +5377,28 @@ def test_theme_switch_copies_live_dynamic_modes_and_result_cache(monkeypatch):
     script = callback["clicks"]
     storage = arguments["session_bridge"]
     assert storage in application.header[0].select(pn.reactive.ReactiveHTML)
-    assert arguments["dynamic_full_rt"].label == "Full RT"
-    assert arguments["dynamic_coherent_rt"].label == "Coherent RT"
-    assert arguments["dynamic_human_only_po"].label == "Human-only PO"
+    assert arguments["dynamic_rt"].label == "RT"
+    assert arguments["dynamic_po"].label == "PO"
     assert arguments["dynamic_hybrid_po"].label == "Hybrid PO"
+    mounted_widgets = application.main[0].select(pn.widgets.Widget)
+    assert arguments["bundle_path_input"] in mounted_widgets
+    assert arguments["simulated_path_input"] in mounted_widgets
+    for name in ("frame", "chirp", "channel"):
+        assert arguments[f"adc_{name}_selector"] in mounted_widgets
+        assert f"{name}: adc_{name}_selector.value" in script
     assert "...bridged" in script
     assert "session_bridge.data.saved_state" in script
     assert "schema_version: 2" in script
-    assert "full_rt: dynamic_full_rt.active" in script
-    assert "coherent_rt: dynamic_coherent_rt.active" in script
-    assert "human_only_po: dynamic_human_only_po.active" in script
+    assert "dynamic_solvers: {" in script
+    assert "rt: dynamic_rt.active" in script
+    assert "po: dynamic_po.active" in script
     assert "hybrid_po: dynamic_hybrid_po.active" in script
     assert "bridged.gui_result_cache_key" in script
     restore_script = restore_callbacks[0]["loaded_state"]
     assert "workflow_tabs.active =" in restore_script
     assert "dynamic_tabs.active =" in restore_script
-    assert "dynamic_human_only_po.active" in restore_script
+    assert "dynamic_po.active" in restore_script
+    assert "restored.dynamic_solvers" in restore_script
 
 
 def test_theme_comparison_cache_is_scoped_to_the_primary_bundle():
@@ -3944,10 +5408,10 @@ def test_theme_comparison_cache_is_scoped_to_the_primary_bundle():
         comparison_kind="run",
         candidates=[
             (
-                "human_only_po",
-                "new Human-only PO simulation",
+                "po",
+                "new PO simulation",
                 "Simulated",
-                "Human-only PO",
+                "PO",
                 adc,
             )
         ],
@@ -3965,10 +5429,13 @@ def test_theme_comparison_cache_is_scoped_to_the_primary_bundle():
     assert restored["comparison_kind"] == "run"
     assert restored["clutter_removal"] == "mean"
     assert np.array_equal(restored["candidates"][0][4], adc)
-    assert _get_theme_comparison(
-        key,
-        bundle_fingerprint="bundle-b",
-    ) is None
+    assert (
+        _get_theme_comparison(
+            key,
+            bundle_fingerprint="bundle-b",
+        )
+        is None
+    )
 
 
 def test_light_gui_uses_a_dark_accessible_accent(monkeypatch):
@@ -3993,8 +5460,7 @@ def test_light_gui_uses_a_dark_accessible_accent(monkeypatch):
         if widget.label == "AMASS-like human motion (.npz)"
     )
     assert any(
-        "background: #f8fafc" in str(stylesheet)
-        and "color: #172033" in str(stylesheet)
+        "background: #f8fafc" in str(stylesheet) and "color: #172033" in str(stylesheet)
         for stylesheet in motion_upload.stylesheets
     )
 
@@ -4050,6 +5516,221 @@ def test_dark_plot_style_preserves_existing_visual_language():
     assert figure.layout.xaxis.gridcolor == "rgba(148,163,184,0.18)"
 
 
+def test_channel_profile_panels_preserve_each_channel_and_selected_frame():
+    power = np.array(
+        [
+            [[1e-4, 1e-6], [1e-9, 1e-8], [1e-3, 1e-5]],
+            [[1e-5, 1e-3], [1e-8, 0.0], [1e-6, 1e-4]],
+        ]
+    )
+    labels = ("TX2/RX1", "TX2/RX3")
+    figures = [
+        gui_app_module._channel_range_profile_figure(
+            power,
+            np.arange(3),
+            go,
+            labels=labels,
+            title="PO · range profiles by channel",
+            plot_template="plotly_dark",
+            frame_index=frame,
+        )
+        for frame in range(2)
+    ]
+    for frame, figure in enumerate(figures):
+        assert [trace.name for trace in figure.data] == list(labels)
+        assert len({trace.line.color for trace in figure.data}) == 2
+        assert "xaxis2" not in figure.layout.to_plotly_json()
+        for channel, trace in enumerate(figure.data):
+            expected = 10 * np.log10(np.maximum(power[frame, :, channel], 1e-30))
+            expected[expected < -80] = np.nan
+            np.testing.assert_allclose(trace.y, expected, equal_nan=True)
+            assert not trace.connectgaps
+    assert figures[0].layout.yaxis.range == figures[1].layout.yaxis.range
+    assert figures[0].layout.yaxis.range[0] == -80
+
+
+def test_static_channel_panels_label_physical_pairs_in_stored_order():
+    power = np.array([[1e-4, 1e-5, 1e-6, 1e-7], [1e-5, 1e-4, 1e-7, 1e-6]])
+    result = SimpleNamespace(
+        ranges_m=np.arange(2),
+        po_channel_range_profile_power=power,
+        rt_channel_range_profile_power=power * 0.1,
+        sensor_parameters={
+            "board_model": "IWR6843AOPEVM",
+            "tx_indices_zero_based": [2, 0],
+            "rx_indices_zero_based": [3, 1],
+        },
+    )
+    figures = gui_app_module._static_channel_profile_figures(
+        result, go, plot_template="plotly_dark"
+    )
+    assert [figure.layout.title.text for figure in figures] == [
+        "PO · range profiles by channel",
+        "RT · range profiles by channel",
+    ]
+    for figure in figures:
+        assert [trace.name for trace in figure.data] == [
+            "TX0/RX1",
+            "TX0/RX3",
+            "TX2/RX1",
+            "TX2/RX3",
+        ]
+    np.testing.assert_allclose(figures[0].data[2].y, 10 * np.log10(power[:, 2]))
+    np.testing.assert_allclose(figures[1].data[2].y, 10 * np.log10(0.1 * power[:, 2]))
+
+
+def test_static_profile_restores_single_axes_with_mean_power_and_the_floor():
+    po = np.asarray([[1e-4, 1e-6], [1e-9, 0.0], [1e-8, 1e-8], [1e-3, 1e-5]])
+    result = SimpleNamespace(
+        ranges_m=np.arange(4),
+        po_channel_range_profile_power=po,
+        rt_channel_range_profile_power=po * 0.1,
+        po_range_profile_power=po.sum(axis=-1),
+        rt_range_profile_power=po.sum(axis=-1) * 0.1,
+        sensor_parameters={"tx_indices_zero_based": [2], "rx_indices_zero_based": [1, 3]},
+    )
+    figure = _range_profile_figure(result, go, plot_template="plotly_dark")
+    assert len(figure.data) == 2
+    assert not figure.layout.annotations
+    assert "xaxis2" not in figure.layout.to_plotly_json()
+    assert figure.layout.height == 330
+    po_traces = [trace for trace in figure.data if trace.name == "Physical optics (PO)"]
+    expected_mean = 10.0 * np.log10(po.mean(axis=-1))
+    expected_mean[expected_mean < -80.0] = np.nan
+    np.testing.assert_allclose(po_traces[0].y, expected_mean, equal_nan=True)
+    assert len(po_traces) == 1
+    assert po_traces[0].y[2] == pytest.approx(-80.0)
+    assert not po_traces[0].connectgaps
+    assert figure.layout.yaxis.range[0] == -80.0
+
+
+def test_dynamic_profiles_overlay_component_channel_means_on_single_axes():
+    total = np.asarray([[1e-4, 1e-6], [1e-10, 1e-5]])
+    human = total * 0.1
+    result = SimpleNamespace(
+        solver="hybrid_po",
+        ranges_m=np.asarray([0.0, 1.0]),
+        range_profiles={"total": total.sum(axis=-1), "human_po": human.sum(axis=-1)},
+        channel_range_profiles={"total": total, "human_po": human},
+    )
+    figure = _human_room_profile_figure(result, go, plot_template="plotly_dark")
+    total_traces = [trace for trace in figure.data if trace.name == "Hybrid PO"]
+    assert len(total_traces) == 1
+    np.testing.assert_allclose(total_traces[0].y, 10 * np.log10(total.mean(axis=-1)))
+    human_traces = [trace for trace in figure.data if trace.name == "Human PO"]
+    assert len(human_traces) == 1
+    np.testing.assert_allclose(human_traces[0].y, 10 * np.log10(human.mean(axis=-1)))
+    assert "xaxis2" not in figure.layout.to_plotly_json()
+
+
+def test_bundle_profiles_normalize_the_channel_mean_and_mask_the_floor():
+    channels = np.asarray([[1, 0.01], [1e-9, 0.0], [1e-8, 1e-5]])
+    products = SimpleNamespace(
+        channel_range_profile_power=channels,
+        range_profile_power=channels.sum(axis=-1),
+        range_time_ranges_m=np.arange(3),
+        channel_labels=("TX2/RX0", "TX2/RX3"),
+    )
+    figure = _bundle_range_profile_comparison_figure(
+        "Measured",
+        products,
+        [("PO", products)],
+        go,
+        plot_template="plotly_dark",
+    )
+    measured = [trace for trace in figure.data if trace.name == "Measured"]
+    assert len(measured) == 1
+    expected = 10 * np.log10(channels.mean(axis=-1) / channels.mean(axis=-1).max())
+    expected[expected < -80] = np.nan
+    np.testing.assert_allclose(measured[0].y, expected, equal_nan=True)
+    assert figure.layout.yaxis.range == (-80.0, 0.0)
+
+
+def test_bundle_profile_frame_controls_show_one_frame_and_follow_adc_selection():
+    root = Path(gui_app_module.__file__).resolve().parents[3]
+    loaded = load_bundle(root / "data/validation_bundles/rtpose_seq10_frame0020")
+    adc = np.repeat(loaded.primary_adc[:1], 2, axis=0)
+    adc[1] *= 2
+    products = compute_radar_products(adc, loaded.bundle.sensor_config.fmcw)
+    application = build_app()
+    tabs = application.main[0]
+    load_button = next(
+        button
+        for button in tabs.select(pn.widgets.Button)
+        if button.label == "Load and validate bundle"
+    )
+    callback = next(
+        watcher.fn
+        for watcher in load_button.param.watchers["clicks"]["value"]
+        if getattr(watcher.fn, "__name__", "") == "on_load_bundle"
+    )
+    scope = _callback_scope(callback).nonlocals
+    scope["measurement_state"]["bundle"] = loaded
+    configure = scope["configure_adc_selection"]
+    config_scope = _callback_scope(configure).nonlocals
+    controls = config_scope["range_profile_frame_controls"]
+    frame = config_scope["range_profile_frame"]
+    model = frame.get_root(Document())
+    assert not [issue for issue in check_integrity(model.references()).error if issue.code == 1021]
+    configure(products)
+    pane = _callback_scope(config_scope["refresh_profile_selection"]).nonlocals[
+        "range_profile_plot"
+    ]
+    assert controls.visible and not frame.disabled and frame.end == 1
+    first = np.asarray(pane.object.data[0].y).copy()
+    peak_bin = int(np.nanargmax(first))
+    next_button = next(
+        button for button in controls.select(pn.widgets.Button) if button.label == "Next frame"
+    )
+    next_button.clicks += 1
+    assert frame.value == config_scope["adc_selectors"]["frame"].value == 1
+    assert pane.object.data[0].y[peak_bin] - first[peak_bin] == pytest.approx(10 * np.log10(4))
+    assert pane.height == pane.object.layout.height
+    config_scope["adc_selectors"]["frame"].value = 0
+    assert frame.value == 0
+    np.testing.assert_allclose(pane.object.data[0].y, first, equal_nan=True)
+    configure(compute_radar_products(adc[:1], loaded.bundle.sensor_config.fmcw))
+    assert not controls.visible and frame.disabled
+    assert frame.value == 0 and frame.label == "Range-profile frame index (0–0)"
+    assert model.start < model.end
+    assert not [issue for issue in check_integrity(model.references()).error if issue.code == 1021]
+    assert next_button.disabled
+    next_button.clicks += 1
+    assert frame.value == 0
+
+
+def test_single_profile_keeps_the_mean_over_all_channels_and_the_frame_scale():
+    channels = np.ones((2, 3, 14)) * np.arange(1, 15)[None, None, :] * 1e-4
+    channels[1] *= 4
+    products = SimpleNamespace(
+        channel_range_profile_power=channels,
+        range_profile_power=channels.mean(axis=0).sum(axis=-1),
+        range_time_ranges_m=np.arange(3),
+    )
+
+    def figure(frame):
+        return _bundle_range_profile_comparison_figure(
+            "Measured",
+            products,
+            [],
+            go,
+            plot_template="plotly_dark",
+            frame_index=frame,
+        )
+
+    first = figure(0)
+    assert len(first.data) == 1
+    assert first.layout.height == 350
+    assert "xaxis2" not in first.layout.to_plotly_json()
+    expected = 10 * np.log10(channels[0].mean(axis=-1) / channels.mean(axis=-1).max())
+    np.testing.assert_allclose(first.data[0].y, expected)
+    second_frame = figure(1)
+    np.testing.assert_allclose(
+        np.asarray(second_frame.data[0].y) - np.asarray(first.data[0].y),
+        10 * np.log10(4),
+    )
+
+
 def test_light_profile_traces_use_dark_canvas_safe_colors():
     static_result = SimpleNamespace(
         ranges_m=np.asarray([0.0, 1.0]),
@@ -4062,7 +5743,7 @@ def test_light_profile_traces_use_dark_canvas_safe_colors():
         plot_template="plotly_white",
     )
     room_result = SimpleNamespace(
-        simulation_mode="hybrid_po",
+        solver="hybrid_po",
         ranges_m=np.asarray([0.0, 1.0]),
         range_profiles={
             "total": np.asarray([1.0, 0.5]),
@@ -4080,3 +5761,34 @@ def test_light_profile_traces_use_dark_canvas_safe_colors():
         "#b45309",
     ]
     assert room_figure.data[0].line.color == "#0f172a"
+
+
+def test_gui_array_groups_parse_and_apply_only_to_subarrays():
+    parse = gui_app_module._parse_array_groups
+    assert parse("", label="Tx groups") is None
+    assert parse(" 0-1 ; 2 ;", label="Tx groups") == [[0, 1], [2]]
+    with pytest.raises(ValueError, match="Rx groups"):
+        parse("0-1; x", label="Rx groups")
+    arguments = gui_app_module._array_group_arguments
+    assert arguments("phase_center", "0; 1", "0") == {
+        "array_tx_groups": None,
+        "array_rx_groups": None,
+    }
+    assert arguments("subarray", "0; 1-2", "") == {
+        "array_tx_groups": [[0], [1, 2]],
+        "array_rx_groups": None,
+    }
+    captured = {}
+    gui_app_module._call_with_array_groups(
+        lambda **kwargs: captured.update(kwargs),
+        array_model="subarray",
+        array_tx_groups="0; 1",
+        array_rx_groups="",
+        other=1,
+    )
+    assert captured == {
+        "array_model": "subarray",
+        "array_tx_groups": [[0], [1]],
+        "array_rx_groups": None,
+        "other": 1,
+    }

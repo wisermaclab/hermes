@@ -12,10 +12,15 @@ from .targets import (
     load_amass_npz,
     visualize_amass_markers,
 )
-from .visualization import mesh_face_hits, path_lengths_m, \
-                           plot_top_paths_with_mesh_hits, preview_top_paths, \
-                           top_path_indices, top_path_segments, \
-                           target_object_ids
+from .visualization import (
+    mesh_face_hits,
+    path_lengths_m,
+    plot_top_paths_with_mesh_hits,
+    preview_top_paths,
+    top_path_indices,
+    top_path_segments,
+    target_object_ids,
+)
 
 __all__ = [
     "AMASSSMPLMotionSequence",

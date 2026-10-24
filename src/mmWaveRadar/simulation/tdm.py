@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 from dataclasses import fields, replace
+import warnings
 
 import numpy as np
 
@@ -15,8 +16,23 @@ from .types import RadarCube, SensingMetadata
 
 def tdm_expansion_required(radar: RadarSensor) -> bool:
     """Returns whether a radar needs per-transmitter physical slot sampling."""
+    _validate_core_tdm(radar)
+    return bool(radar.fmcw.tx_schedule == "tdm" and radar.fmcw.num_tx > 1)
 
-    return bool(radar.fmcw.tdm_enabled and radar.fmcw.num_tx > 1)
+
+def _validate_core_tdm(radar: RadarSensor) -> None:
+    """The core currently supports one consecutive slot per local TX only."""
+    if radar.fmcw.tx_schedule != "tdm":
+        return
+    metadata = radar.hardware.board_metadata or {}
+    physical = tuple(metadata.get("physical_tx_indices", range(radar.hardware.num_tx)))
+    order = tuple(metadata.get("tdm_slot_tx_indices", physical))
+    if radar.fmcw.num_tx != radar.hardware.num_tx or order != physical:
+        raise ValueError(
+            "Core TDM simulation requires one slot per hardware TX in local TX order; "
+            "this sensor has omitted or reordered acquisition slots. "
+            "Use the slot-aware bundle validation runner (mmwave-validation-benchmark)."
+        )
 
 
 def expanded_tdm_radar(radar: RadarSensor) -> RadarSensor:
@@ -28,7 +44,7 @@ def expanded_tdm_radar(radar: RadarSensor) -> RadarSensor:
     expanded_fmcw = replace(
         fmcw,
         num_chirps_per_frame=fmcw.num_chirps_per_frame * fmcw.num_tx,
-        tdm_enabled=False,
+        tx_schedule="simultaneous",
     )
     return replace(radar, fmcw=expanded_fmcw)
 
@@ -58,9 +74,7 @@ def _pack_channel_samples(
     for tx_index in range(num_tx):
         channel_indices = np.flatnonzero(channel_tx_indices == tx_index)
         if channel_indices.size:
-            packed[..., channel_indices] = array[
-                :, tx_index::num_tx, :, channel_indices
-            ]
+            packed[..., channel_indices] = array[:, tx_index::num_tx, :, channel_indices]
     return packed
 
 
@@ -77,20 +91,25 @@ def _collapse_slot_array(
     expected_slots = num_chirps * num_tx
     if array.ndim < 2 or array.shape[1] != expected_slots:
         return array
-    grouped = array.reshape(
-        (array.shape[0], num_chirps, num_tx, *array.shape[2:])
-    )
+    grouped = array.reshape((array.shape[0], num_chirps, num_tx, *array.shape[2:]))
     if np.issubdtype(array.dtype, np.bool_):
         return np.any(grouped, axis=2)
     if name == "runtime_per_chirp_s":
         return np.sum(grouped, axis=2)
-    if "_min_" in name:
-        return np.nanmin(grouped, axis=2)
-    if "_max_" in name or name.endswith("_counts") or name == "path_counts":
-        return np.nanmax(grouped, axis=2).astype(array.dtype, copy=False)
-    if np.issubdtype(array.dtype, np.integer):
-        return np.max(grouped, axis=2)
-    return np.nanmean(grouped, axis=2)
+    # An unobserved diagnostic stays NaN after packing. Suppress only NumPy's
+    # expected missing-data warnings; overflow and invalid arithmetic still warn.
+    with warnings.catch_warnings():
+        warnings.filterwarnings(
+            "ignore", message="All-NaN slice encountered", category=RuntimeWarning
+        )
+        warnings.filterwarnings("ignore", message="Mean of empty slice", category=RuntimeWarning)
+        if "_min_" in name:
+            return np.nanmin(grouped, axis=2)
+        if "_max_" in name or name.endswith("_counts") or name == "path_counts":
+            return np.nanmax(grouped, axis=2).astype(array.dtype, copy=False)
+        if np.issubdtype(array.dtype, np.integer):
+            return np.max(grouped, axis=2)
+        return np.nanmean(grouped, axis=2)
 
 
 def _expand_slot_array(
@@ -105,9 +124,7 @@ def _expand_slot_array(
     if array.ndim < 2 or array.shape[1] != num_chirps:
         return array
     expanded = np.repeat(array[:, :, None, ...], num_tx, axis=2)
-    return expanded.reshape(
-        (array.shape[0], num_chirps * num_tx, *array.shape[2:])
-    )
+    return expanded.reshape((array.shape[0], num_chirps * num_tx, *array.shape[2:]))
 
 
 def _tdm_events(events: list[dict], *, num_tx: int) -> list[dict]:
@@ -126,7 +143,7 @@ def _tdm_events(events: list[dict], *, num_tx: int) -> list[dict]:
 
 def virtual_channel_times(radar: RadarSensor, num_frames: int) -> np.ndarray:
     """Returns acquisition time coordinates for every virtual channel."""
-
+    _validate_core_tdm(radar)
     fmcw = radar.fmcw
     channel_tx = radar.hardware.virtual_tx_indices()
     result = np.empty(
@@ -176,7 +193,7 @@ def collapse_tdm_cube(cube: RadarCube, radar: RadarSensor) -> RadarCube:
         dtype=np.float64,
     )
     for channel, tx_index in enumerate(channel_tx):
-        channel_times[..., channel] = physical_times[:, int(tx_index)::num_tx]
+        channel_times[..., channel] = physical_times[:, int(tx_index) :: num_tx]
     metadata_updates: dict[str, object] = {
         "events": _tdm_events(cube.metadata.events, num_tx=num_tx),
         "virtual_channel_times_s": channel_times,
@@ -233,17 +250,12 @@ def expand_tdm_cube(cube: RadarCube, radar: RadarSensor) -> RadarCube:
         return cube
     adc = np.asarray(cube.adc)
     if adc.ndim != 4:
-        raise ValueError(
-            "packed TDM ADC must have shape "
-            "[frames, chirps, samples, channels]"
-        )
+        raise ValueError("packed TDM ADC must have shape [frames, chirps, samples, channels]")
     fmcw = radar.fmcw
     num_chirps = fmcw.num_chirps_per_frame
     num_tx = fmcw.num_tx
     if adc.shape[1] != num_chirps:
-        raise ValueError(
-            "packed TDM ADC chirp count does not match FMCW configuration"
-        )
+        raise ValueError("packed TDM ADC chirp count does not match FMCW configuration")
     channel_tx = radar.hardware.virtual_tx_indices()
     expanded_adc = np.zeros(
         (adc.shape[0], num_chirps * num_tx, adc.shape[2], adc.shape[3]),
@@ -252,23 +264,15 @@ def expand_tdm_cube(cube: RadarCube, radar: RadarSensor) -> RadarCube:
     for tx_index in range(num_tx):
         channel_indices = np.flatnonzero(channel_tx == tx_index)
         if channel_indices.size:
-            expanded_adc[:, tx_index::num_tx, :, channel_indices] = adc[
-                ..., channel_indices
-            ]
+            expanded_adc[:, tx_index::num_tx, :, channel_indices] = adc[..., channel_indices]
 
     packed_times = np.asarray(cube.times, dtype=np.float64)
     if packed_times.shape != adc.shape[:2]:
         raise ValueError(
-            "packed TDM times must have shape "
-            f"{adc.shape[:2]}; received {packed_times.shape}"
+            "packed TDM times must have shape " f"{adc.shape[:2]}; received {packed_times.shape}"
         )
-    slot_offsets = (
-        np.arange(num_tx, dtype=np.float64)
-        * fmcw.chirp_repetition_time
-    )
-    times = (packed_times[:, :, None] + slot_offsets).reshape(
-        expanded_adc.shape[:2]
-    )
+    slot_offsets = np.arange(num_tx, dtype=np.float64) * fmcw.chirp_repetition_time
+    times = (packed_times[:, :, None] + slot_offsets).reshape(expanded_adc.shape[:2])
 
     metadata_updates: dict[str, object] = {"virtual_channel_times_s": None}
     for item in fields(SensingMetadata):
@@ -324,7 +328,7 @@ def collapse_tdm_first_frame_adc(
     radar: RadarSensor,
 ) -> np.ndarray:
     """Packs an expanded ``[chirp, sample, channel]`` first-frame ADC cube."""
-
+    _validate_core_tdm(radar)
     packed = _pack_channel_samples(
         np.asarray(adc)[None, ...],
         num_chirps=radar.fmcw.num_chirps_per_frame,

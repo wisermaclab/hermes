@@ -1,0 +1,26 @@
+<!-- Radar origin: (0, 0, 0) m; floor surface: z = -1.035 m. -->
+<scene version="2.1.0">
+    <bsdf type="itu-radio-material" id="mat-wall">
+        <string name="type" value="plasterboard" />
+        <float name="scattering_coefficient" value="0.2" />
+    </bsdf>
+    <bsdf type="itu-radio-material" id="mat-metal">
+        <string name="type" value="metal" />
+    </bsdf>
+    <shape type="cube" id="floor">
+        <transform name="to_world"><scale x="2.95" y="4.35" z="0.04" /><translate x="2.5" y="0.75" z="-1.075" /></transform>
+        <ref name="bsdf" id="mat-metal" />
+    </shape>
+    <shape type="cube" id="back_wall">
+        <transform name="to_world"><scale x="0.05" y="4.35" z="1.5" /><translate x="5.45" y="0.75" z="0.465" /></transform>
+        <ref name="bsdf" id="mat-wall" />
+    </shape>
+    <shape type="cube" id="left_wall">
+        <transform name="to_world"><scale x="2.95" y="0.05" z="1.5" /><translate x="2.5" y="-3.6" z="0.465" /></transform>
+        <ref name="bsdf" id="mat-wall" />
+    </shape>
+    <shape type="cube" id="right_wall">
+        <transform name="to_world"><scale x="2.95" y="0.05" z="1.5" /><translate x="2.5" y="5.1" z="0.465" /></transform>
+        <ref name="bsdf" id="mat-wall" />
+    </shape>
+    </scene>

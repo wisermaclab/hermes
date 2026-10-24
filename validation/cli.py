@@ -6,16 +6,42 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import ExitStack
+import json
 from pathlib import Path
+import sys
+from tempfile import TemporaryDirectory
 
-from bundle_prepare.contract import Bundle as BenchmarkClip
-from bundle_prepare.integrity import check_bundle_integrity
+from bundle_prepare.integrity import check_and_load_bundle
+from mmWaveRadar.naming import HYBRID_CALIBRATIONS, add_removed_options, parse_index_spec
+from mmWaveRadar.simulation.types import DEFAULT_PO_REFRESH_ON_PHASE_ERROR_RAD
+from .results import write_metrics_json
 from .runner import (
-    DEFAULT_VALIDATION_MOBILITY_MODES,
-    VALIDATION_MOBILITY_MODES,
+    DEFAULT_VALIDATION_SOLVERS,
+    VALIDATION_SOLVERS,
     BenchmarkRunConfig,
     run_validation_benchmark,
 )
+
+_REMOVED_OPTIONS = {
+    "--mobility-mode": (
+        "--solvers (po, rt, hybrid_po); the RT retrace cadence is "
+        "--rt-refresh-frames (0 = every chirp)"
+    ),
+    "--no-diffuse-reflection": "--no-rt-diffuse-reflection",
+    "--refraction": "--rt-refraction",
+    "--human-specular-reflection": "--rt-human-specular-reflection",
+    "--hybrid-po-calibration": "--hybrid-calibration",
+    "--subarray-tx": "--tx-indices, which is zero-based (TI's TX1 is 0)",
+    "--subarray-rx": "--rx-indices, which is zero-based (TI's RX1 is 0)",
+}
+
+
+def _frame_count(value: str) -> int:
+    count = int(value)
+    if count < 0:
+        raise argparse.ArgumentTypeError("must be a non-negative frame count")
+    return count
 
 
 class _ValidationHelpFormatter(argparse.ArgumentDefaultsHelpFormatter):
@@ -39,36 +65,12 @@ class _ValidationHelpFormatter(argparse.ArgumentDefaultsHelpFormatter):
 
 
 def _parse_index_spec(value: str) -> tuple[int, ...]:
-    text = str(value).strip()
-    if not text:
-        raise argparse.ArgumentTypeError("index list must not be empty")
-    out: list[int] = []
-    for token in text.replace(" ", "").split(","):
-        if not token:
-            continue
-        if "-" in token:
-            parts = token.split("-")
-            if len(parts) != 2 or not parts[0] or not parts[1]:
-                raise argparse.ArgumentTypeError(f"invalid index range {token!r}")
-            start, stop = (int(parts[0]), int(parts[1]))
-            if start <= 0 or stop <= 0:
-                raise argparse.ArgumentTypeError("indices are 1-based")
-            step = 1 if stop >= start else -1
-            out.extend(range(start, stop + step, step))
-        else:
-            index = int(token)
-            if index <= 0:
-                raise argparse.ArgumentTypeError("indices are 1-based")
-            out.append(index)
-    if not out:
-        raise argparse.ArgumentTypeError("index list must select at least one value")
-    seen: set[int] = set()
-    unique: list[int] = []
-    for index in out:
-        if index not in seen:
-            seen.add(index)
-            unique.append(index)
-    return tuple(unique)
+    """Parses zero-based indices such as ``0-2,9`` for argparse."""
+
+    try:
+        return parse_index_spec(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from None
 
 
 def _parse_args(argv: list[str] | None = None):
@@ -77,72 +79,120 @@ def _parse_args(argv: list[str] | None = None):
     parser = argparse.ArgumentParser(
         description="Validate simulator output against a standard real-radar clip.",
         formatter_class=_ValidationHelpFormatter,
+        epilog="Configuration sweeps: mmwave-validation-benchmark study --help",
     )
     required = parser.add_argument_group("required inputs")
-    required.add_argument("--clip", type=Path, required=True,
-                          help="Path to a standard validation clip bundle.")
-    required.add_argument("--out", type=Path, required=True,
-                          help="Output directory for metrics, maps, and plots.")
+    required.add_argument(
+        "--clip",
+        type=Path,
+        required=True,
+        help="Path to a validation bundle directory or ZIP file.",
+    )
+    required.add_argument(
+        "--out", type=Path, required=True, help="Output directory for metrics, maps, and plots."
+    )
 
     benchmark = parser.add_argument_group("benchmark controls")
-    benchmark.add_argument("--suite",
-                           choices=("smoke", "range_time", "range_doppler",
-                                    "pose_range", "dsp_maps"),
-                           default="dsp_maps",
-                           help="Validation suite to run.")
-    benchmark.add_argument("--simulated-adc", type=Path, default=None,
-                           help=(
-                               "Optional NPZ containing simulated adc [F,M,N,C]. "
-                               "When omitted, the CLI runs simulation."
-                           ))
-    benchmark.add_argument("--max-frames", type=int, default=None,
-                           help="Limit the clip to the first N frames.")
+    benchmark.add_argument(
+        "--suite",
+        choices=("smoke", "range_time", "range_doppler", "pose_range", "dsp_maps"),
+        default="dsp_maps",
+        help="Validation suite to run.",
+    )
+    benchmark.add_argument(
+        "--simulated-adc",
+        type=Path,
+        default=None,
+        help=(
+            "Optional NPZ containing simulated adc [F,M,N,C]. "
+            "When omitted, the CLI runs simulation."
+        ),
+    )
+    benchmark.add_argument(
+        "--max-frames", type=int, default=None, help="Limit the clip to the first N frames."
+    )
 
     simulation = parser.add_argument_group("simulation controls")
     simulation.add_argument(
-        "--mobility-mode",
-        choices=VALIDATION_MOBILITY_MODES,
-        default=DEFAULT_VALIDATION_MOBILITY_MODES,
+        "--solver-settings",
+        type=Path,
+        help="JSON object of public RT/PO/Hybrid/array/backend settings.",
+    )
+    simulation.add_argument(
+        "--target-material",
+        type=Path,
+        help="JSON object of RadioMaterial parameters for the target.",
+    )
+    simulation.add_argument(
+        "--frozen-human-po-amplitude-gain",
+        type=float,
+        help="Fixed validation-boundary PO gain; use --hybrid-calibration none.",
+    )
+    simulation.add_argument(
+        "--solvers",
+        choices=VALIDATION_SOLVERS,
+        default=DEFAULT_VALIDATION_SOLVERS,
         nargs="+",
         help=(
-            "One or more simulator mobility modes used when --simulated-adc "
-            "is omitted. Supported modes: "
-            f"{', '.join(VALIDATION_MOBILITY_MODES)}."
+            "One or more solvers run when --simulated-adc is omitted: "
+            f"{', '.join(VALIDATION_SOLVERS)}."
         ),
     )
-    simulation.add_argument("--scene", type=str, default=None,
-                            help=(
-                                "Sionna scene path used when simulation runs. "
-                                "Defaults to the clip environment scene, then "
-                                "an empty scene."
-                            ))
-    simulation.add_argument("--smpl-model-dir", type=str, default=None,
-                            help=(
-                                "SMPL/SMPL-X model directory used to build the "
-                                "bundle's parameterized body motion for range "
-                                "metadata and simulation. "
-                                "Defaults to MMWAVE_SMPL_MODEL_DIR when set."
-                            ))
-    simulation.add_argument("--no-diffuse-reflection",
-                            action="store_true",
-                            help="Disable diffuse reflection in generated simulation.")
-    simulation.add_argument("--refraction", action="store_true",
-                            help="Enable refraction in generated simulation.")
-    simulation.add_argument("--human-specular-reflection",
-                            action="store_true",
-                            help=(
-                                "Enable human specular reflection in generated "
-                                "simulation."
-                            ))
     simulation.add_argument(
-        "--hybrid-po-calibration",
-        choices=("none", "rt_first_pose", "rt_sequence"),
+        "--rt-refresh-frames",
+        type=_frame_count,
+        default=1,
+        help=(
+            "RT retraces at the start of every N radar frames and "
+            "phase-updates the traced paths in between; 0 retraces every "
+            "chirp."
+        ),
+    )
+    simulation.add_argument(
+        "--po-refresh-on-phase-error-rad",
+        type=float,
+        default=DEFAULT_PO_REFRESH_ON_PHASE_ERROR_RAD,
+        help="PO and Hybrid PO neglected vertex phase-change trigger [rad].",
+    )
+    simulation.add_argument(
+        "--scene",
+        type=str,
+        default=None,
+        help=(
+            "Sionna scene path used when simulation runs. "
+            "Defaults to the clip environment scene, then "
+            "an empty scene."
+        ),
+    )
+    simulation.add_argument(
+        "--smpl-model-dir",
+        type=str,
+        default=None,
+        help=(
+            "SMPL/SMPL-X model directory used to build the "
+            "bundle's parameterized body motion for range "
+            "metadata and simulation. "
+            "Defaults to MMWAVE_SMPL_MODEL_DIR when set."
+        ),
+    )
+    simulation.add_argument(
+        "--no-rt-diffuse-reflection", action="store_true", help="Disable RT diffuse reflection."
+    )
+    simulation.add_argument("--rt-refraction", action="store_true", help="Enable RT refraction.")
+    simulation.add_argument(
+        "--rt-human-specular-reflection",
+        action="store_true",
+        help="Enable RT specular reflection on the human.",
+    )
+    simulation.add_argument(
+        "--hybrid-calibration",
+        choices=HYBRID_CALIBRATIONS,
         default="rt_first_pose",
         help=(
-            "RT-reference calibration used by hybrid_static_env_po. "
-            "rt_first_pose fits one amplitude gain from the first-frame RT "
-            "baseline; rt_sequence fits from selected path-power samples; "
-            "none disables calibration."
+            "Hybrid PO amplitude calibration. rt_first_pose fits one "
+            "amplitude gain from the first-frame RT baseline; rt_sequence "
+            "fits from selected path-power samples; none disables "
+            "calibration."
         ),
     )
     simulation.add_argument(
@@ -151,7 +201,7 @@ def _parse_args(argv: list[str] | None = None):
         help=(
             "For generated simulation of a TDM bundle, treat all selected TX "
             "channels as simultaneous at each full-cycle start. This uses one "
-            "simulator run per mobility mode and preserves the full-cycle "
+            "simulator run per solver and preserves the full-cycle "
             "slow-time interval, but omits per-slot mesh and phase offsets. "
             "It has no effect for non-TDM bundles or --simulated-adc."
         ),
@@ -159,20 +209,21 @@ def _parse_args(argv: list[str] | None = None):
 
     channels = parser.add_argument_group("channel selection controls")
     channels.add_argument(
-        "--subarray-tx",
+        "--tx-indices",
         type=_parse_index_spec,
         default=None,
         help=(
-            "Optional 1-based physical TX subset, e.g. '1,2,3,10'. "
-            "Ranges such as '1-3,10' are accepted."
+            "Optional zero-based TX subset, e.g. '0,1,2,9'. Ranges such as "
+            "'0-2,9' are accepted. TI and dataset labels count from 1, so "
+            "their TX1 is 0."
         ),
     )
     channels.add_argument(
-        "--subarray-rx",
+        "--rx-indices",
         type=_parse_index_spec,
         default=None,
         help=(
-            "Optional 1-based physical RX subset, e.g. '5-12'. "
+            "Optional zero-based RX subset, e.g. '4-11'. "
             "Ranges and comma-separated lists are accepted."
         ),
     )
@@ -201,25 +252,28 @@ def _parse_args(argv: list[str] | None = None):
         ),
     )
     output = parser.add_argument_group("output controls")
-    output.add_argument("--no-plots", action="store_true",
-                        help="Skip PNG diagnostic plots.")
-    output.add_argument("--progress", action="store_true",
-                        help="Print simulator progress while generated simulation runs.")
+    output.add_argument("--no-plots", action="store_true", help="Skip PNG diagnostic plots.")
+    output.add_argument(
+        "--progress",
+        action="store_true",
+        help="Print simulator progress while generated simulation runs.",
+    )
+    add_removed_options(parser, _REMOVED_OPTIONS)
     args = parser.parse_args(argv)
-    if len(set(args.mobility_mode)) != len(args.mobility_mode):
-        parser.error("--mobility-mode values must not contain duplicates")
+    if len(set(args.solvers)) != len(args.solvers):
+        parser.error("--solvers values must not contain duplicates")
     return args
 
 
 def main(argv: list[str] | None = None) -> int:
     """Loads a clip, runs validation, and reports the output metric path."""
 
+    arguments = list(sys.argv[1:] if argv is None else argv)
+    if arguments and arguments[0] == "study":
+        from .study import main as study_main
+
+        return study_main(arguments[1:])
     args = _parse_args(argv)
-    # Validate the whole portable boundary before loading the numerical subset
-    # used by the runner. This catches missing AMASS, camera, and environment
-    # references with the same rules as ``mmwave-check-bundle``.
-    check_bundle_integrity(args.clip)
-    clip = BenchmarkClip.load(args.clip)
     config = BenchmarkRunConfig(
         suite=args.suite,
         out_dir=args.out,
@@ -230,18 +284,46 @@ def main(argv: list[str] | None = None) -> int:
         simulate=args.simulated_adc is None,
         clutter_removal=args.clutter_removal,
         scene_path=args.scene,
-        mobility_modes=tuple(args.mobility_mode),
-        diffuse_reflection=not args.no_diffuse_reflection,
-        refraction=args.refraction,
-        human_specular_reflection=args.human_specular_reflection,
-        hybrid_po_calibration_mode=args.hybrid_po_calibration,
+        solvers=tuple(args.solvers),
+        rt_refresh_frames=args.rt_refresh_frames,
+        po_refresh_on_phase_error_rad=args.po_refresh_on_phase_error_rad,
+        rt_diffuse_reflection=not args.no_rt_diffuse_reflection,
+        rt_refraction=args.rt_refraction,
+        rt_human_specular_reflection=args.rt_human_specular_reflection,
+        hybrid_calibration=args.hybrid_calibration,
         ignore_tdm_timing=args.ignore_tdm_timing,
         smpl_model_dir=args.smpl_model_dir,
-        subarray_tx_indices=args.subarray_tx,
-        subarray_rx_indices=args.subarray_rx,
+        selected_tx_indices=args.tx_indices,
+        selected_rx_indices=args.rx_indices,
         progress=args.progress,
+        solver_settings=(
+            json.loads(args.solver_settings.read_text()) if args.solver_settings else {}
+        ),
+        target_material=(
+            json.loads(args.target_material.read_text()) if args.target_material else {}
+        ),
+        frozen_human_po_amplitude_gain=args.frozen_human_po_amplitude_gain,
     )
-    metrics = run_validation_benchmark(clip, config)
+    with ExitStack() as stack:
+        clip_root = args.clip
+        is_archive = args.clip.is_file() and args.clip.suffix.lower() == ".zip"
+        if is_archive:
+            from bundle_prepare.archives import extract_bundle_zip
+
+            clip_root = Path(stack.enter_context(TemporaryDirectory(prefix="hermes-validation-")))
+            extract_bundle_zip(args.clip, clip_root)
+        # Check and load once, including all referenced scene/motion resources.
+        # Keep extracted assets alive through simulation and plot generation.
+        clip, _integrity_report = check_and_load_bundle(clip_root)
+        metrics = run_validation_benchmark(clip, config)
+        if is_archive:
+            metrics["clip"] = str(args.clip)
+            if metrics.get("scene_path") is not None:
+                scene = Path(metrics["scene_path"]).resolve()
+                if scene.is_relative_to(clip_root.resolve()):
+                    relative_scene = scene.relative_to(clip_root.resolve())
+                    metrics["scene_path"] = f"{args.clip}!/{relative_scene.as_posix()}"
+            write_metrics_json(args.out / "metrics.json", metrics)
     print(f"Wrote validation metrics: {args.out / 'metrics.json'}")
     if "range_time" in metrics:
         rt = metrics["range_time"]

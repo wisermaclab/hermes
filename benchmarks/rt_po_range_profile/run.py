@@ -1,18 +1,16 @@
 # SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
 # Copyright (c) 2026 Wireless System Research Group, McMaster University
 
-"""Compare human-only PO and RT range profiles on one mesh frame.
+"""Compare PO and RT range profiles of one human mesh frame in an empty scene.
 
-The benchmark is intended to illustrate that full RT range profiles are
-sensitive to the ray/path budget and to the human diffuse scattering
-coefficient, while human-only PO provides a deterministic reference curve.
+The benchmark is intended to illustrate that RT range profiles are sensitive
+to the ray/path budget and to the human diffuse scattering coefficient, while
+the PO solver provides a deterministic reference curve.
 """
 
 from __future__ import annotations
 
 import argparse
-import csv
-import json
 import os
 import sys
 import tempfile
@@ -22,18 +20,7 @@ from pathlib import Path
 
 import numpy as np
 
-
-def _repo_root() -> Path:
-    """Finds the simulator repository root from this benchmark script."""
-
-    path = Path(__file__).resolve()
-    for parent in path.parents:
-        if (parent / "src" / "mmWaveRadar").exists():
-            return parent
-    raise RuntimeError("Could not locate mmWave simulator repository root")
-
-
-REPO_ROOT = _repo_root()
+REPO_ROOT = Path(__file__).resolve().parents[2]
 SRC_PATH = str(REPO_ROOT / "src")
 if SRC_PATH not in sys.path:
     sys.path.insert(0, SRC_PATH)
@@ -43,12 +30,18 @@ if str(REPO_ROOT) not in sys.path:
 
 from sionna.rt import load_scene  # noqa: E402
 
+from mmWaveRadar.defaults import default_amass_npz as _default_amass_npz
+from mmWaveRadar.defaults import default_smpl_model_dir as _default_smpl_model_dir
+from mmWaveRadar.tutorial_support import orientation_toward as _orientation_toward
+from mmWaveRadar.tutorial_support import mean_marker as _mean_marker
 from mmWaveRadar import load_amass_npz  # noqa: E402
 from mmWaveRadar.dsp import range_fft, range_profile_from_cube  # noqa: E402
+from mmWaveRadar.diagnostics.reports import write_summary as _write_summary
 from mmWaveRadar.materials import human_skin_material  # noqa: E402
+from mmWaveRadar.naming import RT_HUMAN_BOUNCES, add_removed_options  # noqa: E402
 from mmWaveRadar.radar import FMCWConfig, RadarSensor  # noqa: E402
 from mmWaveRadar.simulation import (  # noqa: E402
-    HumanPOMobilityConfig,
+    POConfig,
     MmWaveRadarSimulator,
     flatten_adc_for_fft,
     runtime_summary,
@@ -58,33 +51,7 @@ from tools.amass_to_mesh_sequence import (  # noqa: E402
     convert_amass_to_mesh_sequence,
 )
 
-
 DEFAULT_TI_BOARD = "XWRL6844"
-
-
-def _default_amass_npz() -> Path:
-    """Resolves the motion override, dataset root, or bundled CMU walk."""
-
-    value = os.environ.get("MMWAVE_AMASS_NPZ")
-    if value:
-        return Path(value).expanduser()
-    dataset_root = os.environ.get("MMWAVE_DATASET_ROOT")
-    if dataset_root:
-        return (
-            Path(dataset_root).expanduser()
-            / "AMASS"
-            / "walking_poses_cmu_105_02.npz"
-        )
-    return REPO_ROOT / "data" / "AMASS" / "walking_poses_cmu_105_02.npz"
-
-
-def _default_smpl_model_dir() -> Path:
-    """Resolves the model override or the repository-local model directory."""
-
-    value = os.environ.get("MMWAVE_SMPL_MODEL_DIR")
-    if value:
-        return Path(value).expanduser()
-    return REPO_ROOT / "models" / "smpl_models"
 
 
 def _ti_board_key(value: str) -> str:
@@ -116,29 +83,13 @@ def _parse_csv_floats(value: str) -> list[float]:
             "expected comma-separated floats, e.g. 0.05,0.35,0.75"
         ) from exc
     if not items or any(item < 0.0 or item > 1.0 for item in items):
-        raise argparse.ArgumentTypeError(
-            "scattering coefficients must be in [0, 1]"
-        )
+        raise argparse.ArgumentTypeError("scattering coefficients must be in [0, 1]")
     return items
 
 
 def _label_slug(label: str) -> str:
     slug = "".join(ch.lower() if ch.isalnum() else "_" for ch in label)
     return "_".join(part for part in slug.split("_") if part)
-
-
-def _orientation_toward(target_point, radar_position):
-    """Matches Sionna RadioDevice.look_at: local +x points at target_point."""
-
-    direction = np.asarray(target_point, dtype=float) - np.asarray(
-        radar_position, dtype=float)
-    norm = np.linalg.norm(direction)
-    if norm < 1e-12:
-        raise ValueError("radar position and look-at target are identical")
-    direction /= norm
-    theta = np.arccos(np.clip(direction[2], -1.0, 1.0))
-    phi = np.arctan2(direction[1], direction[0])
-    return (float(phi), float(theta - 0.5 * np.pi), 0.0)
 
 
 def _axis_direction(axis: str) -> np.ndarray:
@@ -149,13 +100,6 @@ def _axis_direction(axis: str) -> np.ndarray:
         "-y": np.array([0.0, -1.0, 0.0], dtype=float),
     }
     return directions[axis]
-
-
-def _mean_marker(markers, names):
-    points = [markers[name] for name in names if name in markers]
-    if not points:
-        return None
-    return np.mean(np.asarray(points, dtype=float), axis=0)
 
 
 def _amass_marker_dict(amass_data, frame_index: int):
@@ -181,16 +125,14 @@ def _front_direction_from_amass(amass_data, frame_index: int):
     back_ref = _mean_marker(markers, ["TOPBACK", "MIDBACK", "LBSH", "RBSH"])
     if front_ref is None or back_ref is None:
         return None
-    front_xy = np.asarray(front_ref[:2], dtype=float) - np.asarray(
-        back_ref[:2], dtype=float)
+    front_xy = np.asarray(front_ref[:2], dtype=float) - np.asarray(back_ref[:2], dtype=float)
     norm = np.linalg.norm(front_xy)
     if norm < 1e-6:
         return None
     return np.array([front_xy[0] / norm, front_xy[1] / norm, 0.0], dtype=float)
 
 
-def _radar_pose_in_front_of_subject(mesh_sequence: MeshSequence, args,
-                                    amass_data=None):
+def _radar_pose_in_front_of_subject(mesh_sequence: MeshSequence, args, amass_data=None):
     vertices = mesh_sequence.vertices_at(float(mesh_sequence.times[0]))
     mins = vertices.min(axis=0)
     maxs = vertices.max(axis=0)
@@ -206,12 +148,8 @@ def _radar_pose_in_front_of_subject(mesh_sequence: MeshSequence, args,
     look_at = np.array([center[0], center[1], height], dtype=float)
     front_surface_projection = float(np.max(vertices @ front_dir))
     look_at_projection = float(look_at @ front_dir)
-    front_surface_point = (
-        look_at + (front_surface_projection - look_at_projection) * front_dir
-    )
-    radar_position = (
-        front_surface_point + float(args.radar_clearance_m) * front_dir
-    )
+    front_surface_point = look_at + (front_surface_projection - look_at_projection) * front_dir
+    radar_position = front_surface_point + float(args.radar_clearance_m) * front_dir
     radar_orientation = _orientation_toward(look_at, radar_position)
     return radar_position, radar_orientation, look_at
 
@@ -293,42 +231,48 @@ def _make_target(label: str, mesh_sequence: MeshSequence, scattering: float):
     )
 
 
-def _run_cube(label: str, mode: str, args, radar, mesh_sequence, scattering: float,
-              ray_budget: int | None = None):
+def _run_cube(
+    label: str,
+    solver: str,
+    args,
+    radar,
+    mesh_sequence,
+    scattering: float,
+    ray_budget: int | None = None,
+):
     scene = load_scene()
     target = _make_target(label, mesh_sequence, scattering)
     sim_kwargs = {
-        "mobility_mode": mode,
+        "solver": solver,
         "progress": args.progress,
         "compute_backend": args.compute_backend,
         "compute_precision": args.compute_precision,
         "adc_compute_backend": args.adc_compute_backend,
         "adc_compute_precision": args.adc_compute_precision,
     }
-    if mode == "human_only_po":
-        sim_kwargs["human_po_config"] = HumanPOMobilityConfig(
-            visibility_samples_per_face=args.visibility_samples_per_face,
-            visibility_fade_chirps=args.visibility_fade_chirps,
-            visibility_use_phase_center=True,
-            adaptive_visibility_sampling=args.adaptive_visibility_sampling,
-            adaptive_visibility_edge_margin=args.adaptive_visibility_edge_margin,
+    if solver == "po":
+        sim_kwargs["po_config"] = POConfig(
+            po_visibility_samples_per_face=args.po_visibility_samples_per_face,
+            po_visibility_fade_frames=args.po_visibility_fade_frames,
+            po_adaptive_visibility_sampling=args.po_adaptive_visibility_sampling,
+            po_adaptive_visibility_edge_margin=args.po_adaptive_visibility_edge_margin,
             compute_backend=args.po_compute_backend,
             compute_precision=args.po_compute_precision,
         )
     else:
         sim_kwargs.update(
-            coupling_mode=args.coupling_mode,
-            max_depth=args.max_depth,
-            samples_per_src=int(ray_budget),
-            max_num_paths_per_src=int(
+            rt_human_bounces=args.rt_human_bounces,
+            rt_max_depth=args.rt_max_depth,
+            rt_samples_per_source=int(ray_budget),
+            rt_max_paths_per_source=int(
                 ray_budget
-                if args.max_num_paths_per_src is None
-                else args.max_num_paths_per_src
+                if args.rt_max_paths_per_source is None
+                else args.rt_max_paths_per_source
             ),
-            diffuse_reflection=True,
-            human_specular_reflection=args.human_specular_reflection,
-            retrace_once_per_frame=True,
-            seed=args.seed,
+            rt_diffuse_reflection=True,
+            rt_human_specular_reflection=args.rt_human_specular_reflection,
+            rt_refresh_frames=1,
+            rt_seed=args.rt_seed,
         )
 
     simulator = MmWaveRadarSimulator(**sim_kwargs)
@@ -353,9 +297,18 @@ def _range_profile(cube, fmcw, *, nfft_mult: int):
     return np.asarray(profile, dtype=float), np.asarray(ranges_m, dtype=float)
 
 
-def _profile_row(label: str, kind: str, profile, ranges_m, cube, wall_time_s,
-                 *, scattering: float, ray_budget: int | None,
-                 reference_peak: float):
+def _profile_row(
+    label: str,
+    kind: str,
+    profile,
+    ranges_m,
+    cube,
+    wall_time_s,
+    *,
+    scattering: float,
+    ray_budget: int | None,
+    reference_peak: float,
+):
     peak_index = int(np.argmax(profile))
     total_power = float(np.sum(profile))
     return {
@@ -368,12 +321,9 @@ def _profile_row(label: str, kind: str, profile, ranges_m, cube, wall_time_s,
         "max_paths": int(np.max(cube.metadata.path_counts)),
         "peak_range_m": float(ranges_m[peak_index]),
         "peak_power_db_ref_po": float(
-            10.0 * np.log10(max(float(profile[peak_index]), 1e-30)
-                            / reference_peak)
+            10.0 * np.log10(max(float(profile[peak_index]), 1e-30) / reference_peak)
         ),
-        "total_power_db_ref_po": float(
-            10.0 * np.log10(max(total_power, 1e-30) / reference_peak)
-        ),
+        "total_power_db_ref_po": float(10.0 * np.log10(max(total_power, 1e-30) / reference_peak)),
     }
 
 
@@ -382,20 +332,6 @@ def _write_profiles_npz(output_dir: Path, ranges_m, profiles: dict[str, np.ndarr
     for label, profile in profiles.items():
         payload[f"profile_{_label_slug(label)}"] = profile
     np.savez_compressed(output_dir / "range_profiles.npz", **payload)
-
-
-def _write_summary(output_dir: Path, metadata: dict, rows: list[dict]):
-    summary = dict(metadata)
-    summary["results"] = rows
-    json_path = output_dir / "summary.json"
-    csv_path = output_dir / "summary.csv"
-    json_path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
-    with csv_path.open("w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
-        writer.writeheader()
-        writer.writerows(rows)
-    print(f"Wrote summary JSON: {json_path}", flush=True)
-    print(f"Wrote summary CSV: {csv_path}", flush=True)
 
 
 def _db_relative(profile, reference_peak):
@@ -426,8 +362,7 @@ def _plot_top_down_panel(ax, mesh_sequence: MeshSequence, radar):
         edgecolors="none",
         alpha=0.95,
     )
-    ax.scatter([0.0], [0.0], color="#d62728", marker="^", s=45,
-               label="radar")
+    ax.scatter([0.0], [0.0], color="#d62728", marker="^", s=45, label="radar")
     mesh_center = np.mean(local[:, :2], axis=0)
     ax.annotate(
         "",
@@ -466,8 +401,7 @@ def _plot_profile_panel(ax, mesh_sequence: MeshSequence, radar):
         edgecolors="none",
         alpha=0.95,
     )
-    ax.scatter([0.0], [0.0], color="#d62728", marker="^", s=45,
-               label="radar")
+    ax.scatter([0.0], [0.0], color="#d62728", marker="^", s=45, label="radar")
     mesh_center = np.mean(local[:, [0, 2]], axis=0)
     ax.annotate(
         "",
@@ -492,9 +426,18 @@ def _plot_profile_panel(ax, mesh_sequence: MeshSequence, radar):
     return tri
 
 
-def _plot(output_dir: Path, args, ranges_m, profiles: dict[str, np.ndarray],
-          *, mesh_sequence: MeshSequence, radar, reference_peak: float,
-          nominal_scattering: float, nominal_ray_budget: int):
+def _plot(
+    output_dir: Path,
+    args,
+    ranges_m,
+    profiles: dict[str, np.ndarray],
+    *,
+    mesh_sequence: MeshSequence,
+    radar,
+    reference_peak: float,
+    nominal_scattering: float,
+    nominal_ray_budget: int,
+):
     import matplotlib
 
     matplotlib.use(args.matplotlib_backend)
@@ -516,11 +459,9 @@ def _plot(output_dir: Path, args, ranges_m, profiles: dict[str, np.ndarray],
         fig.add_subplot(grid[:, 2]),
     ]
     top_im = _plot_top_down_panel(top_ax, mesh_sequence, radar)
-    fig.colorbar(top_im, ax=top_ax, label="height z [m]",
-                 fraction=0.046, pad=0.04)
+    fig.colorbar(top_im, ax=top_ax, label="height z [m]", fraction=0.046, pad=0.04)
     profile_im = _plot_profile_panel(profile_ax, mesh_sequence, radar)
-    fig.colorbar(profile_im, ax=profile_ax, label="cross-range y [m]",
-                 fraction=0.046, pad=0.04)
+    fig.colorbar(profile_im, ax=profile_ax, label="cross-range y [m]", fraction=0.046, pad=0.04)
 
     po_profile = profiles["PO"]
     axes[0].plot(
@@ -571,7 +512,7 @@ def _plot(output_dir: Path, args, ranges_m, profiles: dict[str, np.ndarray],
     axes[1].grid(True, alpha=0.3)
     axes[1].legend(fontsize=8)
 
-    figure_path = output_dir / "human_only_rt_po_range_profile.png"
+    figure_path = output_dir / "rt_po_range_profile.png"
     fig.savefig(figure_path, dpi=args.plot_dpi)
     plt.close(fig)
     print(f"Wrote figure: {figure_path}", flush=True)
@@ -582,8 +523,8 @@ def _parse_args() -> argparse.Namespace:
 
     parser = argparse.ArgumentParser(
         description=(
-            "Compare human-only PO and RT range profiles on one RT-Pose/AMASS "
-            "mesh frame, sweeping RT ray budget and human scattering."
+            "Compare PO and RT range profiles of one RT-Pose/AMASS mesh frame "
+            "in an empty scene, sweeping RT ray budget and human scattering."
         )
     )
     parser.add_argument(
@@ -597,8 +538,12 @@ def _parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument("--amass-frame-index", type=int, default=0)
-    parser.add_argument("--mesh-npz", type=Path, default=None,
-                        help="Optional precomputed mesh sequence. Overrides --amass-npz.")
+    parser.add_argument(
+        "--mesh-npz",
+        type=Path,
+        default=None,
+        help="Optional precomputed mesh sequence. Overrides --amass-npz.",
+    )
     parser.add_argument(
         "--smpl-model-dir",
         type=Path,
@@ -615,40 +560,55 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--output-dir",
         type=Path,
-        default=(
-            Path(tempfile.gettempdir())
-            / "mmwave_radar_outputs"
-            / "human_only_rt_po_range_profile"
-        ),
+        default=(Path(tempfile.gettempdir()) / "mmwave_radar_outputs" / "rt_po_range_profile"),
     )
-    parser.add_argument("--ray-budgets", type=_parse_csv_ints,
-                        default=_parse_csv_ints("5000,20000,80000"))
-    parser.add_argument("--scattering-coefficients", type=_parse_csv_floats,
-                        default=_parse_csv_floats("0.05,0.35,0.75"))
+    parser.add_argument(
+        "--ray-budgets", type=_parse_csv_ints, default=_parse_csv_ints("5000,20000,80000")
+    )
+    parser.add_argument(
+        "--scattering-coefficients",
+        type=_parse_csv_floats,
+        default=_parse_csv_floats("0.05,0.35,0.75"),
+    )
     parser.add_argument("--nominal-scattering", type=float, default=0.35)
     parser.add_argument("--nominal-ray-budget", type=int, default=None)
-    parser.add_argument("--max-num-paths-per-src", type=int, default=None)
-    parser.add_argument("--ti-board", default=DEFAULT_TI_BOARD,
-                        help="TI radar board/catalog alias to use.")
-    parser.add_argument("--pattern-mode", default="cosine30",
-                        choices=("digitized", "none", "scalar", "cosine30"))
-    parser.add_argument("--radar-clearance-m", type=float, default=1.5,
-                        help="Distance from subject front surface to radar.")
-    parser.add_argument("--subject-front-axis", default="auto",
-                        choices=("auto", "+x", "-x", "+y", "-y"),
-                        help="Subject front direction. 'auto' uses AMASS markers when available.")
-    parser.add_argument("--subject-front-axis-fallback", default="+x",
-                        choices=("+x", "-x", "+y", "-y"),
-                        help="Fallback front direction if marker-based front inference is unavailable.")
-    parser.add_argument("--radar-height-fraction", type=float, default=0.62,
-                        help="Look-at/radar height as fraction of mesh z span.")
-    parser.add_argument("--max-depth", type=int, default=2)
-    parser.add_argument("--coupling-mode", default="one_target_bounce",
-                        choices=("one_target_bounce", "unrestricted"))
-    parser.add_argument("--human-specular-reflection",
-                        action=argparse.BooleanOptionalAction,
-                        default=False)
-    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--rt-max-paths-per-source", type=int, default=None)
+    parser.add_argument(
+        "--ti-board", default=DEFAULT_TI_BOARD, help="TI radar board/catalog alias to use."
+    )
+    parser.add_argument(
+        "--pattern-mode", default="cosine30", choices=("digitized", "none", "scalar", "cosine30")
+    )
+    parser.add_argument(
+        "--radar-clearance-m",
+        type=float,
+        default=1.5,
+        help="Distance from subject front surface to radar.",
+    )
+    parser.add_argument(
+        "--subject-front-axis",
+        default="auto",
+        choices=("auto", "+x", "-x", "+y", "-y"),
+        help="Subject front direction. 'auto' uses AMASS markers when available.",
+    )
+    parser.add_argument(
+        "--subject-front-axis-fallback",
+        default="+x",
+        choices=("+x", "-x", "+y", "-y"),
+        help="Fallback front direction if marker-based front inference is unavailable.",
+    )
+    parser.add_argument(
+        "--radar-height-fraction",
+        type=float,
+        default=0.62,
+        help="Look-at/radar height as fraction of mesh z span.",
+    )
+    parser.add_argument("--rt-max-depth", type=int, default=2)
+    parser.add_argument("--rt-human-bounces", default="single", choices=RT_HUMAN_BOUNCES)
+    parser.add_argument(
+        "--rt-human-specular-reflection", action=argparse.BooleanOptionalAction, default=False
+    )
+    parser.add_argument("--rt-seed", type=int, default=42)
     parser.add_argument("--carrier-frequency", type=float, default=60.0e9)
     parser.add_argument("--slope", type=float, default=68.0e12)
     parser.add_argument("--chirp-duration", type=float, default=58.0e-6)
@@ -659,32 +619,47 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--frame-period", type=float, default=50.0e-3)
     parser.add_argument("--range-nfft-mult", type=int, default=4)
     parser.add_argument("--range-limit-m", type=float, default=4.0)
-    parser.add_argument("--range-plot-padding-m", type=float, default=0.35,
-                        help="Padding around the human mesh range extent in range-profile panels.")
-    parser.add_argument("--visibility-samples-per-face", type=int, default=1)
-    parser.add_argument("--visibility-fade-chirps", type=int, default=8)
-    parser.add_argument("--adaptive-visibility-sampling",
-                        action=argparse.BooleanOptionalAction,
-                        default=False)
-    parser.add_argument("--adaptive-visibility-edge-margin", type=float,
-                        default=0.15)
-    parser.add_argument("--po-compute-backend",
-                        choices=("numpy", "torch", "auto"), default="auto")
-    parser.add_argument("--po-compute-precision",
-                        choices=("float64", "float32"), default="float32")
-    parser.add_argument("--compute-backend", choices=("numpy", "torch", "auto"),
-                        default="auto")
-    parser.add_argument("--compute-precision",
-                        choices=("float64", "float32"), default="float32")
-    parser.add_argument("--adc-compute-backend",
-                        choices=("numpy", "torch", "auto"), default=None)
-    parser.add_argument("--adc-compute-precision",
-                        choices=("float64", "float32"), default=None)
+    parser.add_argument(
+        "--range-plot-padding-m",
+        type=float,
+        default=0.35,
+        help="Padding around the human mesh range extent in range-profile panels.",
+    )
+    parser.add_argument("--po-visibility-samples-per-face", type=int, default=1)
+    parser.add_argument("--po-visibility-fade-frames", type=int, default=0)
+    parser.add_argument(
+        "--po-adaptive-visibility-sampling", action=argparse.BooleanOptionalAction, default=False
+    )
+    parser.add_argument("--po-adaptive-visibility-edge-margin", type=float, default=0.15)
+    parser.add_argument("--po-compute-backend", choices=("numpy", "torch", "auto"), default="auto")
+    parser.add_argument(
+        "--po-compute-precision", choices=("float64", "float32"), default="float32"
+    )
+    parser.add_argument("--compute-backend", choices=("numpy", "torch", "auto"), default="auto")
+    parser.add_argument("--compute-precision", choices=("float64", "float32"), default="float32")
+    parser.add_argument("--adc-compute-backend", choices=("numpy", "torch", "auto"), default=None)
+    parser.add_argument("--adc-compute-precision", choices=("float64", "float32"), default=None)
     parser.add_argument("--matplotlib-backend", default="Agg")
     parser.add_argument("--plot-dpi", type=int, default=180)
     parser.add_argument("--plot-vmin-db", type=float, default=-80.0)
     parser.add_argument("--plot-vmax-db", type=float, default=10.0)
     parser.add_argument("--progress", action="store_true")
+    add_removed_options(
+        parser,
+        {
+            "--max-num-paths-per-src": "--rt-max-paths-per-source",
+            "--max-depth": "--rt-max-depth",
+            "--coupling-mode": "--rt-human-bounces (single, any)",
+            "--human-specular-reflection": "--rt-human-specular-reflection",
+            "--no-human-specular-reflection": "--no-rt-human-specular-reflection",
+            "--seed": "--rt-seed",
+            "--visibility-samples-per-face": "--po-visibility-samples-per-face",
+            "--visibility-fade-chirps": "--po-visibility-fade-frames",
+            "--adaptive-visibility-sampling": "--po-adaptive-visibility-sampling",
+            "--no-adaptive-visibility-sampling": "--no-po-adaptive-visibility-sampling",
+            "--adaptive-visibility-edge-margin": "--po-adaptive-visibility-edge-margin",
+        },
+    )
     return parser.parse_args()
 
 
@@ -704,9 +679,7 @@ def main() -> None:
             float(args.nominal_scattering),
         ]
     nominal_ray_budget = (
-        max(args.ray_budgets)
-        if args.nominal_ray_budget is None
-        else int(args.nominal_ray_budget)
+        max(args.ray_budgets) if args.nominal_ray_budget is None else int(args.nominal_ray_budget)
     )
     if nominal_ray_budget not in args.ray_budgets:
         args.ray_budgets = [*args.ray_budgets, nominal_ray_budget]
@@ -715,8 +688,7 @@ def main() -> None:
     print("Runtime:", runtime_summary(), flush=True)
     print(f"Mesh source: {mesh_source_path}", flush=True)
     print(
-        f"Mesh: vertices={mesh_sequence.vertices.shape}, "
-        f"faces={mesh_sequence.faces.shape}",
+        f"Mesh: vertices={mesh_sequence.vertices.shape}, " f"faces={mesh_sequence.faces.shape}",
         flush=True,
     )
     print(
@@ -732,7 +704,7 @@ def main() -> None:
     print("Running PO baseline", flush=True)
     po_cube, po_wall_time_s = _run_cube(
         "PO",
-        "human_only_po",
+        "po",
         args,
         radar,
         mesh_sequence,
@@ -772,7 +744,7 @@ def main() -> None:
         print(f"Running {label}", flush=True)
         cube, wall_time_s = _run_cube(
             label,
-            "rt_retrace",
+            "rt",
             args,
             radar,
             mesh_sequence,
@@ -832,13 +804,11 @@ def main() -> None:
         "range_plot_max_m": float(range_plot_max_m),
         "range_plot_padding_m": float(args.range_plot_padding_m),
         "ray_budgets": [int(v) for v in args.ray_budgets],
-        "scattering_coefficients": [
-            float(v) for v in args.scattering_coefficients
-        ],
+        "scattering_coefficients": [float(v) for v in args.scattering_coefficients],
         "nominal_scattering": float(args.nominal_scattering),
         "nominal_ray_budget": int(nominal_ray_budget),
         "rt_diffuse_reflection": True,
-        "rt_human_specular_reflection": bool(args.human_specular_reflection),
+        "rt_human_specular_reflection": bool(args.rt_human_specular_reflection),
     }
     _write_profiles_npz(args.output_dir, ranges_m, profiles)
     _write_summary(args.output_dir, metadata, rows)

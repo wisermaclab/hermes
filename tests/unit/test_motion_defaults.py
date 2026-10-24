@@ -12,7 +12,6 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
-
 REPO_ROOT = Path(__file__).resolve().parents[2]
 MOTION_RELATIVE_PATH = Path("data/AMASS/walking_poses_cmu_105_02.npz")
 MODEL_RELATIVE_PATH = Path("models/smpl_models")
@@ -38,10 +37,10 @@ def human_po_module():
 
 
 @pytest.fixture(scope="module")
-def human_only_module():
+def rt_po_module():
     return _load_script(
-        "benchmarks/human_only_rt_po_range_profile/run.py",
-        "test_human_only_rt_po_range_profile_run",
+        "benchmarks/rt_po_range_profile/run.py",
+        "test_rt_po_range_profile_run",
     )
 
 
@@ -61,7 +60,7 @@ def amass_converter_module():
     )
 
 
-@pytest.mark.parametrize("module_fixture", ["human_rt_module", "human_only_module"])
+@pytest.mark.parametrize("module_fixture", ["human_rt_module", "rt_po_module"])
 def test_benchmark_motion_default_uses_bundled_fixture(
     module_fixture,
     request,
@@ -76,7 +75,7 @@ def test_benchmark_motion_default_uses_bundled_fixture(
     assert expected.is_file()
 
 
-@pytest.mark.parametrize("module_fixture", ["human_rt_module", "human_only_module"])
+@pytest.mark.parametrize("module_fixture", ["human_rt_module", "rt_po_module"])
 def test_benchmark_motion_environment_precedence(
     module_fixture,
     request,
@@ -88,9 +87,7 @@ def test_benchmark_motion_environment_precedence(
     explicit_motion = tmp_path / "motion.npz"
     monkeypatch.setenv("MMWAVE_DATASET_ROOT", str(dataset_root))
     monkeypatch.delenv("MMWAVE_AMASS_NPZ", raising=False)
-    assert module._default_amass_npz() == (
-        dataset_root / "AMASS" / MOTION_RELATIVE_PATH.name
-    )
+    assert module._default_amass_npz() == (dataset_root / "AMASS" / MOTION_RELATIVE_PATH.name)
 
     monkeypatch.setenv("MMWAVE_AMASS_NPZ", str(explicit_motion))
     assert module._default_amass_npz() == explicit_motion
@@ -125,9 +122,7 @@ def test_hybrid_motion_environment_override(
     explicit_motion = tmp_path / "motion.npz"
     monkeypatch.setenv("MMWAVE_AMASS_NPZ", str(explicit_motion))
 
-    assert hybrid_po_module._default_amass_npz(tmp_path / "dataset") == (
-        explicit_motion
-    )
+    assert hybrid_po_module._default_amass_npz(tmp_path / "dataset") == (explicit_motion)
 
 
 def test_human_po_benchmark_binds_fmcw_to_single_channel_hardware(
@@ -166,7 +161,7 @@ def test_human_po_benchmark_binds_fmcw_to_single_channel_hardware(
     [
         "amass_converter_module",
         "human_rt_module",
-        "human_only_module",
+        "rt_po_module",
         "hybrid_po_module",
     ],
 )
@@ -186,7 +181,7 @@ def test_smpl_model_default_uses_repository_local_directory(
     [
         "amass_converter_module",
         "human_rt_module",
-        "human_only_module",
+        "rt_po_module",
         "hybrid_po_module",
     ],
 )

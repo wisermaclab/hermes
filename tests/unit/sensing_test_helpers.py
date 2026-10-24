@@ -20,8 +20,8 @@ from mmWaveRadar.materials import PhysicalOpticsMaterial, human_skin_material
 from mmWaveRadar.radar import FMCWConfig, RadarHardware, RadarSensor
 from mmWaveRadar.simulation import (
     EnvironmentReflectorBank,
-    HybridStaticEnvPOConfig,
-    HumanPOMobilityConfig,
+    HybridPOConfig,
+    POConfig,
     MmWaveRadarSimulator,
     POCalibrationConfig,
     POIncrementalSweepSetting,
@@ -45,10 +45,11 @@ from mmWaveRadar.simulation import (
     extract_rt_reflector_bank,
     extract_static_path_bank,
     fit_sequence_path_power_calibration,
+    fit_sequence_adc_calibration,
     load_radar_cube_npz,
     make_incremental_po_config,
     po_channel,
-    run_rt_mobility_baseline,
+    run_rt_baseline,
     run_incremental_po_sweep,
     save_radar_cube_npz,
     segment_indices_intersecting_aabb,
@@ -67,34 +68,42 @@ from mmWaveRadar.tutorial_support import load_bedroom_scene
 
 def _mesh_sequence(displacement=0.0):
     faces = np.array([[0, 1, 2]], dtype=np.uint32)
-    v0 = np.array([
-        [1.0, -0.5, 0.0],
-        [1.0, 0.5, 0.0],
-        [1.0, 0.0, 1.0],
-    ], dtype=np.float32)
+    v0 = np.array(
+        [
+            [1.0, -0.5, 0.0],
+            [1.0, 0.5, 0.0],
+            [1.0, 0.0, 1.0],
+        ],
+        dtype=np.float32,
+    )
     v1 = v0.copy()
     v1[:, 0] += displacement
     vertices = np.stack([v0, v1], axis=0)
-    return MeshSequence(vertices=vertices, faces=faces,
-                        times=np.array([0.0, 1.0]))
+    return MeshSequence(vertices=vertices, faces=faces, times=np.array([0.0, 1.0]))
 
 
-def _front_facing_triangle(x: float, *, scale: float = 1.0,
-                           y_shift: float = 0.0,
-                           z_shift: float = 0.0) -> np.ndarray:
-    return np.array([
-        [x, y_shift - 0.5 * scale, z_shift],
-        [x, y_shift, z_shift + scale],
-        [x, y_shift + 0.5 * scale, z_shift],
-    ], dtype=np.float32)
+def _front_facing_triangle(
+    x: float, *, scale: float = 1.0, y_shift: float = 0.0, z_shift: float = 0.0
+) -> np.ndarray:
+    return np.array(
+        [
+            [x, y_shift - 0.5 * scale, z_shift],
+            [x, y_shift, z_shift + scale],
+            [x, y_shift + 0.5 * scale, z_shift],
+        ],
+        dtype=np.float32,
+    )
 
 
 def _triangle_from_yz(x: float, yz0, yz1, yz2) -> np.ndarray:
-    return np.array([
-        [x, yz0[0], yz0[1]],
-        [x, yz1[0], yz1[1]],
-        [x, yz2[0], yz2[1]],
-    ], dtype=np.float32)
+    return np.array(
+        [
+            [x, yz0[0], yz0[1]],
+            [x, yz1[0], yz1[1]],
+            [x, yz2[0], yz2[1]],
+        ],
+        dtype=np.float32,
+    )
 
 
 def _single_face_mesh_sequence(*, x0: float, x1: float | None = None) -> MeshSequence:
@@ -108,17 +117,23 @@ def _single_face_mesh_sequence(*, x0: float, x1: float | None = None) -> MeshSeq
 
 
 def _phase_one_radar(num_chirps: int = 3, chirp_repetition_time: float = 0.5):
-    fmcw = FMCWConfig(carrier_frequency=60e9, slope=1e12,
-                      chirp_duration=1e-3,
-                      chirp_repetition_time=chirp_repetition_time,
-                      sampling_frequency=2e3, num_adc_samples=4,
-                      num_chirps_per_frame=num_chirps,
-                      frame_period=max(2.0, num_chirps * chirp_repetition_time))
-    return RadarSensor(name="radar", position=(0.0, 0.0, 0.0),
-                       orientation=(0.0, 0.0, 0.0),
-                       hardware=RadarHardware.from_positions(
-                           [[0.0, 0.0, 0.0]], [[0.0, 0.0, 0.0]]),
-                       fmcw=fmcw)
+    fmcw = FMCWConfig(
+        carrier_frequency=60e9,
+        slope=1e10,
+        chirp_duration=1e-3,
+        chirp_repetition_time=chirp_repetition_time,
+        sampling_frequency=2e3,
+        num_adc_samples=4,
+        num_chirps_per_frame=num_chirps,
+        frame_period=max(2.0, num_chirps * chirp_repetition_time),
+    )
+    return RadarSensor(
+        name="radar",
+        position=(0.0, 0.0, 0.0),
+        orientation=(0.0, 0.0, 0.0),
+        hardware=RadarHardware.from_positions([[0.0, 0.0, 0.0]], [[0.0, 0.0, 0.0]]),
+        fmcw=fmcw,
+    )
 
 
 def _profile_test_cube(
@@ -141,7 +156,7 @@ def _profile_test_cube(
         path_counts=path_counts,
         max_displacements=np.zeros(adc.shape[:2], dtype=float),
         virtual_channel_order="tx_major",
-        mode="human_only_po",
+        solver="po",
         visible_face_counts=path_counts.copy(),
         effective_visible_area_fraction=np.ones(adc.shape[:2], dtype=float),
         runtime_per_chirp_s=np.full(adc.shape[:2], wall_scale, dtype=float),
@@ -192,7 +207,6 @@ def _coherent_test_bank(lengths_m, signatures, coefficients=None):
         frequency_hz=60e9,
         path_signatures=tuple(signatures),
     )
-
 
 
 __all__ = [name for name in globals() if not name.startswith("__")]

@@ -6,7 +6,7 @@
 import numpy as np
 import pytest
 
-from mmWaveRadar.dsp import range_fft
+from mmWaveRadar.dsp import mvdr_pseudospectrum, range_fft
 from mmWaveRadar.radar import RadarHardware
 from mmWaveRadar.simulation.point_targets import (
     PointTarget,
@@ -86,9 +86,7 @@ def test_coupled_angle_grids_recover_off_plane_azimuth():
     elevation_deg = 60.0
     elevation_rad = np.deg2rad(elevation_deg)
     angle = {
-        "u": np.array([
-            np.sin(np.deg2rad(azimuth_deg)) * np.cos(elevation_rad)
-        ]),
+        "u": np.array([np.sin(np.deg2rad(azimuth_deg)) * np.cos(elevation_rad)]),
         "v": np.array([np.sin(elevation_rad)]),
     }
 
@@ -158,8 +156,7 @@ def test_range_resolved_angle_fft_peaks_at_broadside_for_uniform_target():
     result = synthesize_virtual_center_point_targets(
         hardware,
         fmcw,
-        [{"range_m": target_range_m, "azimuth_deg": 0.0,
-          "elevation_deg": 0.0}],
+        [{"range_m": target_range_m, "azimuth_deg": 0.0, "elevation_deg": 0.0}],
         include_channel_phase=False,
     )
 
@@ -172,9 +169,7 @@ def test_range_resolved_angle_fft_peaks_at_broadside_for_uniform_target():
         calibrate_channel_phase=False,
     )
 
-    range_index = int(
-        np.argmin(np.abs(angle_result["ranges_m"] - target_range_m))
-    )
+    range_index = int(np.argmin(np.abs(angle_result["ranges_m"] - target_range_m)))
     power = np.asarray(angle_result["angle"]["map"])[range_index]
     v_index, u_index = np.unravel_index(int(np.argmax(power)), power.shape)
     assert abs(angle_result["angle"]["u"][u_index]) < 0.04
@@ -201,10 +196,10 @@ def test_range_resolved_angle_fft_preserves_multiple_chirp_snapshots():
         angle_fft_size=(4, 4),
     )
 
-    assert result["range_cube"].shape[:2] == (2, fmcw.num_adc_samples // 2)
+    assert result["range_cube"].shape[:2] == (2, fmcw.num_adc_samples)
     assert result["angle"]["map"].shape[:2] == (
         2,
-        fmcw.num_adc_samples // 2,
+        fmcw.num_adc_samples,
     )
     assert not np.array_equal(
         result["angle"]["map"][0],
@@ -227,9 +222,7 @@ def test_range_resolved_angle_fft_uses_virtual_ura_y_z_spacing():
     target_u = 0.5
     target_v = 0.25
     elevation_deg = np.rad2deg(np.arcsin(target_v))
-    azimuth_deg = np.rad2deg(
-        np.arcsin(target_u / np.cos(np.deg2rad(elevation_deg)))
-    )
+    azimuth_deg = np.rad2deg(np.arcsin(target_u / np.cos(np.deg2rad(elevation_deg))))
     synthesis = synthesize_virtual_center_point_targets(
         hardware,
         fmcw,
@@ -255,6 +248,33 @@ def test_range_resolved_angle_fft_uses_virtual_ura_y_z_spacing():
     assert result["grid_metadata"]["spacing_z_lambda"] == pytest.approx(0.75)
 
 
+def test_synthesized_adc_and_steering_estimators_share_angle_sign():
+    hardware = RadarHardware.from_virtual_ura(rows=1, cols=8, wavelength=0.005)
+    fmcw = make_point_target_fmcw_config(
+        carrier_frequency=60.0e9,
+        num_tx=hardware.num_tx,
+    )
+    synthesis = synthesize_virtual_center_point_targets(
+        hardware,
+        fmcw,
+        [PointTarget(1.4, 20.0, 0.0)],
+        include_channel_phase=False,
+    )
+    rt, ranges_m = range_fft(synthesis.adc[None, :, :], fmcw=fmcw, window=None)
+    snapshot = rt[0, int(np.argmin(np.abs(ranges_m - 1.4)))]
+    u_axis = np.linspace(-0.8, 0.8, 401)
+
+    mvdr = mvdr_pseudospectrum(
+        snapshot[None, :],
+        hardware.virtual_channel_positions_lambda[:, 0],
+        u=u_axis,
+        diagonal_loading=1e-2,
+    )
+
+    peak_u = mvdr["u"][int(np.argmax(mvdr["map"]))]
+    assert peak_u == pytest.approx(np.sin(np.deg2rad(20.0)), abs=0.02)
+
+
 def test_virtual_snapshot_grid_maps_half_lambda_virtual_positions():
     hardware = RadarHardware.from_ti_board("AWRL6844EVM", pattern_mode="none")
     range_cube = np.arange(
@@ -265,9 +285,7 @@ def test_virtual_snapshot_grid_maps_half_lambda_virtual_positions():
     grid = virtual_snapshot_grid(range_cube, hardware)
 
     assert grid.shape == (1, 4, 4)
-    grid_index = np.rint(
-        hardware.virtual_channel_positions_lambda * 2
-    ).astype(int)
+    grid_index = np.rint(hardware.virtual_channel_positions_lambda * 2).astype(int)
     for channel, (ix, iy) in enumerate(grid_index):
         assert grid[0, iy, ix] == range_cube[0, channel]
 
@@ -330,11 +348,14 @@ def test_calibrate_range_cube_channel_phase_divides_fixed_signs():
     calibrated = calibrate_range_cube_channel_phase(range_cube, hardware)
 
     np.testing.assert_allclose(calibrated, np.ones_like(range_cube))
-    assert calibrate_range_cube_channel_phase(
-        range_cube,
-        hardware,
-        enabled=False,
-    ) is range_cube
+    assert (
+        calibrate_range_cube_channel_phase(
+            range_cube,
+            hardware,
+            enabled=False,
+        )
+        is range_cube
+    )
 
 
 def test_virtual_snapshot_grid_rejects_non_grid_positions():

@@ -10,16 +10,14 @@ from typing import Optional
 
 import numpy as np
 
+from .arrays import fmcw_value
 from .constants import SPEED_OF_LIGHT
 from .clutter import remove_slow_time_mean
 from .profiles import range_profile_from_cube
 from .window import window_1d
+from ..radar.adc import ADC_MODES
 
-
-def _fmcw_value(fmcw, name: str):
-    """Reads an FMCW attribute from an optional configuration object."""
-
-    return None if fmcw is None else getattr(fmcw, name)
+_fmcw_value = fmcw_value
 
 
 def phase2distance(theta, wavelength):
@@ -33,11 +31,16 @@ def range_fft(
     slope: float | None = None,
     *,
     fmcw=None,
+    adc_mode: str | None = None,
     window: Optional[str] = "hann",
     nfft_mult: int = 1,
 ) -> tuple[np.ndarray, np.ndarray]:
     """
-    Computes the one-sided range FFT in the chirp-slope direction.
+    Computes the range FFT in the chirp-slope direction.
+
+    Complex 1x retains all bins (0 to fs); Complex 2x and real retain
+    half (0 to fs/2). Without a mode/config, complex input means Complex 1x
+    and real input means real sampling. IF guard bands do not crop the FFT.
 
     :param adc: ADC samples with shape ``[num_chirps, num_adc_samples]`` or
         ``[num_chirps, num_adc_samples, num_channels]``.
@@ -57,8 +60,7 @@ def range_fft(
         sampling_frequency = float(sampling_frequency)
         slope = float(slope)
     except (TypeError, ValueError) as exc:
-        raise ValueError("sampling_frequency and slope must be real scalars") \
-            from exc
+        raise ValueError("sampling_frequency and slope must be real scalars") from exc
     if not np.isfinite(sampling_frequency) or sampling_frequency <= 0.0:
         raise ValueError("sampling_frequency must be finite and positive")
     if not np.isfinite(slope) or slope == 0.0:
@@ -74,6 +76,12 @@ def range_fft(
     nfft_mult = int(nfft_mult)
 
     x = np.asarray(adc)
+    if adc_mode is None:
+        adc_mode = getattr(fmcw, "adc_mode", None)
+    if adc_mode is None:
+        adc_mode = "complex1x" if np.iscomplexobj(x) else "real"
+    if adc_mode not in ADC_MODES:
+        raise ValueError(f"adc_mode must be one of {ADC_MODES}")
     if x.ndim not in (2, 3):
         raise ValueError("adc must have shape [M, N] or [M, N, P]")
 
@@ -85,7 +93,7 @@ def range_fft(
     xw = x * w[None, :, None] if x.ndim == 3 else x * w[None, :]
 
     rt = np.fft.fft(xw, n=nfft, axis=1)
-    num_range_bins = nfft // 2
+    num_range_bins = nfft if adc_mode == "complex1x" else nfft // 2
     offsets = np.arange(num_range_bins, dtype=np.int64)
     fft_bins = offsets if slope > 0.0 else (-offsets) % nfft
     rt = np.take(rt, fft_bins, axis=1)
@@ -119,12 +127,11 @@ def range_time_map(
     if x.ndim == 2:
         x = x[:, :, None]
     if x.ndim != 3:
-        raise ValueError("adc must have shape [M, N], [M, N, P], or"
-                         " [F, M, N, P]")
+        raise ValueError("adc must have shape [M, N], [M, N, P], or [F, M, N, P]")
 
-    rt, ranges_m = range_fft(x, sampling_frequency, slope, fmcw=fmcw,
-                             window=window, nfft_mult=nfft_mult)
+    rt, ranges_m = range_fft(
+        x, sampling_frequency, slope, fmcw=fmcw, window=window, nfft_mult=nfft_mult
+    )
     if remove_mean_clutter:
         rt = remove_slow_time_mean(rt)
-    return range_profile_from_cube(rt, combine_antennas=combine_channels), \
-        ranges_m
+    return range_profile_from_cube(rt, combine_antennas=combine_channels), ranges_m

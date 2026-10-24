@@ -8,6 +8,7 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
+from tempfile import TemporaryDirectory
 import sys
 import sysconfig
 from typing import Any, Mapping
@@ -20,13 +21,13 @@ from PIL import Image, UnidentifiedImageError
 
 from mmWaveRadar.targets import MeshSequence
 
+from .paths import portable_relative_path, safe_bundle_file
 from .contract import (
     Bundle,
     load_bundle_descriptor,
     load_static_target_mesh,
     read_json,
 )
-
 
 CORE_REQUIRED_FILES = (
     "bundle.json",
@@ -93,9 +94,33 @@ def _schema_root() -> Path:
     for candidate in candidates:
         if all((candidate / name).is_file() for name in SCHEMA_FILES.values()):
             return candidate
-    raise FileNotFoundError(
-        "Normative HERMES Bundle v1 schemas are not installed"
-    )
+    raise FileNotFoundError("Normative HERMES Bundle v1 schemas are not installed")
+
+
+from .contract import BundleValidationError
+
+
+class BundleIntegrityError(BundleValidationError):
+    """An actionable checker error with a stable source location and code."""
+
+    def __init__(self, message, *, file, field, code):
+        super().__init__(message)
+        self.file, self.field, self.code = file, field, code
+
+
+def _schema_documents(root):
+    documents = dict(SCHEMA_FILES)
+    try:
+        descriptor = read_json(safe_bundle_file(root, "bundle.json", label="bundle.json"))
+        environment = descriptor.get("environment")
+        if isinstance(environment, str) and environment != "environment.json":
+            safe_bundle_file(root, environment, label="environment")
+            documents.pop("environment.json")
+            documents[environment] = "environment.schema.json"
+    except (ValueError, OSError, AttributeError):
+        # The descriptor/schema pass reports the invalid dependency itself.
+        pass
+    return documents
 
 
 def _validate_bundle_schemas(root: Path) -> dict[str, str]:
@@ -103,7 +128,7 @@ def _validate_bundle_schemas(root: Path) -> dict[str, str]:
 
     schema_root = _schema_root()
     validated: dict[str, str] = {}
-    for document_name, schema_name in SCHEMA_FILES.items():
+    for document_name, schema_name in _schema_documents(root).items():
         document_path = root / document_name
         if document_name == "environment.json" and not document_path.exists():
             continue
@@ -111,16 +136,20 @@ def _validate_bundle_schemas(root: Path) -> dict[str, str]:
         Draft202012Validator.check_schema(schema)
         validator = Draft202012Validator(schema)
         errors = sorted(
-            validator.iter_errors(read_json(document_path)),
+            validator.iter_errors(
+                read_json(safe_bundle_file(root, document_name, label=document_name))
+            ),
             key=lambda error: tuple(str(part) for part in error.absolute_path),
         )
         if errors:
             error = errors[0]
             location = ".".join(str(part) for part in error.absolute_path)
             suffix = f" at {location}" if location else ""
-            raise ValueError(
-                f"{document_name} violates {schema_name}{suffix}: "
-                f"{error.message}"
+            raise BundleIntegrityError(
+                f"{document_name} violates {schema_name}{suffix}: " f"{error.message}",
+                file=document_name,
+                field=location,
+                code=f"schema.{error.validator}",
             )
         validated[document_name] = schema_name
     return validated
@@ -130,9 +159,24 @@ def check_bundle_integrity(root: str | Path) -> dict[str, Any]:
     """Check bundle structure without running simulation or comparison metrics."""
 
     root = Path(root)
+    if root.is_file() and root.suffix.lower() == ".zip":
+        from bundle_prepare.archives import extract_bundle_zip
+
+        with TemporaryDirectory(prefix="hermes-check-") as directory:
+            extract_bundle_zip(root, Path(directory))
+            report = check_bundle_integrity(directory)
+            report["path"] = str(root)
+            return report
+    return check_and_load_bundle(root)[1]
+
+
+def check_and_load_bundle(root: str | Path) -> tuple[Bundle, dict[str, Any]]:
+    """Validate a directory and return its already-loaded numerical contract."""
+    root = Path(root)
     descriptor = load_bundle_descriptor(root)
     profile = str(descriptor["profile"])
     _validate_file_boundary(root, CORE_REQUIRED_FILES)
+    schema_report = _validate_bundle_schemas(root)
     bundle = Bundle.load(root)
     amass_report = (
         _validate_amass_sequence(bundle.motion_path)
@@ -156,11 +200,7 @@ def check_bundle_integrity(root: str | Path) -> dict[str, Any]:
         name: _validate_optional_json_object(root / name)
         for name in ("benchmark_metadata.json", "bundle_summary.json")
     }
-    # Run schema conformance after the more specific semantic checks above so
-    # existing callers retain actionable cross-file error messages. The schema
-    # pass still rejects constraints that the runtime model does not consume.
-    schema_report = _validate_bundle_schemas(root)
-    return {
+    report = {
         "valid": True,
         "check": "bundle_integrity",
         "path": str(root),
@@ -168,15 +208,17 @@ def check_bundle_integrity(root: str | Path) -> dict[str, Any]:
         "data_origin": bundle.data_origin,
         "primary_adc": bundle.primary_adc_key,
         "capabilities": list(bundle.capabilities),
+        "resimulation": {
+            "available": bundle.can_resimulate,
+            "issues": list(bundle.resimulation_issues),
+        },
         "required_files": _file_presence(root, CORE_REQUIRED_FILES),
         "optional_files": _file_presence(root, OPTIONAL_FILES),
         "schema_validation": schema_report,
         "sensor": {
             "board_model": bundle.sensor_config.board_model,
             "num_adc_samples": int(bundle.sensor_config.fmcw.num_adc_samples),
-            "num_chirps_per_frame": int(
-                bundle.sensor_config.fmcw.num_chirps_per_frame
-            ),
+            "num_chirps_per_frame": int(bundle.sensor_config.fmcw.num_chirps_per_frame),
             "virtual_channels": int(bundle.sensor().hardware.num_virtual_channels),
             "virtual_channel_order": bundle.sensor_config.virtual_channel_order,
         },
@@ -193,13 +235,15 @@ def check_bundle_integrity(root: str | Path) -> dict[str, Any]:
             "count": len(bundle.frames),
             "motion_times_s": [float(value) for value in bundle.motion_times_s],
         },
-        "background_adc": None
-        if bundle.background_adc is None
-        else {
-            "shape": _shape(bundle.background_adc),
-            "dtype": str(bundle.background_adc.dtype),
-            "finite": True,
-        },
+        "background_adc": (
+            None
+            if bundle.background_adc is None
+            else {
+                "shape": _shape(bundle.background_adc),
+                "dtype": str(bundle.background_adc.dtype),
+                "finite": True,
+            }
+        ),
         "amass_sequence": amass_report,
         "static_target": target_report,
         "target_obj": target_obj_report,
@@ -222,6 +266,7 @@ def check_bundle_integrity(root: str | Path) -> dict[str, Any]:
         "camera_images": camera_report,
         "json_sidecars": sidecar_reports,
     }
+    return bundle, report
 
 
 def _validate_file_boundary(
@@ -290,9 +335,7 @@ def _validate_amass_sequence(path: Path) -> dict[str, Any]:
         if missing:
             raise ValueError(f"{path} missing required SMPL arrays: {missing}")
         array_names = tuple(archive.files)
-        loaded_names = set(REQUIRED_AMASS_ARRAYS).union(
-            OPTIONAL_AMASS_TIMELINES
-        )
+        loaded_names = set(REQUIRED_AMASS_ARRAYS).union(OPTIONAL_AMASS_TIMELINES)
         arrays = {
             name: np.array(archive[name], copy=True)
             for name in array_names
@@ -328,9 +371,7 @@ def _validate_amass_sequence(path: Path) -> dict[str, Any]:
     if faces.size and np.min(faces) < 0:
         raise ValueError(f"{path} faces must contain non-negative vertex indices")
     if faces.size and np.max(faces) >= SMPL_VERTEX_COUNT:
-        raise ValueError(
-            f"{path} faces reference vertices outside base-SMPL topology"
-        )
+        raise ValueError(f"{path} faces reference vertices outside base-SMPL topology")
     return {
         "present": True,
         "poses_shape": _shape(poses),
@@ -338,9 +379,7 @@ def _validate_amass_sequence(path: Path) -> dict[str, Any]:
         "betas_shape": _shape(betas),
         "times_shape": _shape(times),
         "timing_key": timing_key,
-        "timeline_shapes": {
-            key: _shape(value) for key, value in timelines.items()
-        },
+        "timeline_shapes": {key: _shape(value) for key, value in timelines.items()},
         "faces_shape": _shape(faces),
         "optional_arrays": sorted(
             name for name in array_names if name not in REQUIRED_AMASS_ARRAYS
@@ -358,36 +397,9 @@ def _validate_optional_json_object(path: Path) -> dict[str, Any]:
 
 
 def _portable_bundle_path(
-    root: Path,
-    value: Any,
-    *,
-    label: str,
-    missing_kind: str = "environment asset",
+    root: Path, value: Any, *, label: str, missing_kind: str = "environment asset"
 ) -> Path:
-    if not isinstance(value, str) or not value.strip():
-        raise ValueError(f"{label} must be a non-empty relative path")
-    relative = Path(value)
-    if relative.is_absolute() or "\\" in value or any(
-        part in {"", ".", ".."} or ":" in part for part in relative.parts
-    ):
-        raise ValueError(f"{label} must be a safe bundle-relative path")
-    resolved_root = root.resolve(strict=True)
-    candidate = resolved_root / relative
-    cursor = resolved_root
-    for part in relative.parts:
-        cursor = cursor / part
-        if cursor.is_symlink():
-            raise ValueError(f"{label} must not traverse a symlink")
-    try:
-        resolved = candidate.resolve(strict=True)
-        resolved.relative_to(resolved_root)
-    except FileNotFoundError:
-        raise FileNotFoundError(f"Referenced {missing_kind} was not found: {relative}")
-    except ValueError as exc:
-        raise ValueError(f"{label} escapes the bundle directory") from exc
-    if not resolved.is_file():
-        raise FileNotFoundError(f"Referenced {missing_kind} was not found: {relative}")
-    return resolved
+    return safe_bundle_file(root, value, label=label, missing_kind=missing_kind)
 
 
 def _validate_benchmark_camera_images(root: Path) -> dict[str, Any]:
@@ -431,9 +443,7 @@ def _validate_benchmark_camera_images(root: Path) -> dict[str, Any]:
                     image_format = opened.format
                     width, height = opened.size
                     pixel_count = int(width) * int(height)
-                    decoded_bytes = (
-                        pixel_count * max(len(opened.getbands()), 1) * 4
-                    )
+                    decoded_bytes = pixel_count * max(len(opened.getbands()), 1) * 4
                     if pixel_count > _MAX_CAMERA_PIXELS:
                         raise ValueError(
                             f"Referenced {side} camera image exceeds the "
@@ -441,8 +451,7 @@ def _validate_benchmark_camera_images(root: Path) -> dict[str, Any]:
                         )
                     if decoded_bytes > _MAX_CAMERA_DECODED_BYTES:
                         raise ValueError(
-                            f"Referenced {side} camera image exceeds the "
-                            "decoded-byte limit"
+                            f"Referenced {side} camera image exceeds the " "decoded-byte limit"
                         )
                     opened.verify()
                 with Image.open(image) as opened:
@@ -495,28 +504,22 @@ def _validate_scene_xml(root: Path, scene_path: Path) -> dict[str, Any]:
         local_name = str(element.tag).rsplit("}", maxsplit=1)[-1]
         if local_name == "include":
             raise ValueError(
-                "Mitsuba <include> elements are not permitted in portable "
-                "HERMES bundle scenes"
+                "Mitsuba <include> elements are not permitted in portable HERMES bundle scenes"
             )
-        if not (
-            local_name == "string"
-            and element.get("name") == "filename"
-        ):
+        if not (local_name == "string" and element.get("name") == "filename"):
             continue
         scene_asset = element.get("value")
         if not isinstance(scene_asset, str) or not scene_asset.strip():
             raise ValueError("Mitsuba filename references must be non-empty")
-        relative = Path(scene_asset)
-        if relative.is_absolute() or "\\" in scene_asset or any(
-            part in {"", ".", ".."} or ":" in part
-            for part in relative.parts
-        ):
-            raise ValueError("Mitsuba filename must be bundle-relative")
+        try:
+            relative = portable_relative_path(scene_asset, label="Mitsuba filename")
+        except ValueError as exc:
+            raise ValueError("Mitsuba filename must be bundle-relative") from exc
         local_candidate = scene_path.parent / relative
         candidate_value = (
-            local_candidate.resolve(strict=False)
-            if local_candidate.exists()
-            else (root / relative).resolve(strict=False)
+            local_candidate
+            if local_candidate.exists() or local_candidate.is_symlink()
+            else root.resolve() / relative
         )
         try:
             portable_value = candidate_value.relative_to(root.resolve()).as_posix()
@@ -542,9 +545,7 @@ def _preflight_obj_file(path: Path) -> dict[str, Any]:
     with path.open("rb") as handle:
         for line_number, raw_line in enumerate(handle, start=1):
             if len(raw_line) > _MAX_OBJ_LINE_BYTES:
-                raise ValueError(
-                    f"Bundle OBJ line {line_number} exceeds the line-size limit"
-                )
+                raise ValueError(f"Bundle OBJ line {line_number} exceeds the line-size limit")
             parts = raw_line.strip().split()
             if not parts or parts[0].startswith(b"#"):
                 continue
@@ -554,9 +555,7 @@ def _preflight_obj_file(path: Path) -> dict[str, Any]:
                     raise ValueError("Bundle OBJ exceeds the vertex limit")
             elif parts[0] == b"f":
                 if len(parts) < 4:
-                    raise ValueError(
-                        f"Invalid bundle OBJ face at line {line_number}"
-                    )
+                    raise ValueError(f"Invalid bundle OBJ face at line {line_number}")
                 triangles += len(parts) - 3
                 if triangles > _MAX_OBJ_TRIANGLES:
                     raise ValueError("Bundle OBJ exceeds the triangle limit")
@@ -612,13 +611,63 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("bundle", type=Path, help="Path to a prepared bundle")
     parser.add_argument("--json", action="store_true", help="Print the report as JSON")
+    parser.add_argument(
+        "--all-errors", action="store_true", help="Collect independent schema and semantic errors"
+    )
+    parser.add_argument(
+        "--diagnose",
+        type=Path,
+        metavar="DIR",
+        help="Write diagnostic plots and warning-only plausibility results",
+    )
+    parser.add_argument(
+        "--reference-position",
+        nargs=3,
+        type=float,
+        metavar=("X", "Y", "Z"),
+        help="Known world-frame static target centre for range/angle conformance diagnostics",
+    )
     return parser.parse_args(argv)
 
 
 def main(argv: list[str] | None = None) -> int:
     args = _parse_args(argv)
+    loaded = None
     try:
-        report = check_bundle_integrity(args.bundle)
+        completed_reports = []
+        if args.all_errors and not args.diagnose:
+            issues = collect_bundle_errors(args.bundle, _completed_reports=completed_reports)
+            if issues:
+                report = {
+                    "valid": False,
+                    "check": "bundle_integrity",
+                    "path": str(args.bundle),
+                    "errors": issues,
+                }
+                print(
+                    json.dumps(report, indent=2)
+                    if args.json
+                    else "\n".join(
+                        f"{i['file']}:{i['field']} [{i['code']}] {i['message']}" for i in issues
+                    )
+                )
+                return 1
+        if args.diagnose:
+            from mmWaveRadar.measurements import load_bundle
+            from .diagnostics import diagnose_bundle
+
+            loaded = load_bundle(args.bundle)
+            report = dict(loaded.integrity_report)
+            report["diagnostics"] = diagnose_bundle(
+                args.bundle,
+                args.diagnose,
+                reference_position=args.reference_position,
+                loaded=loaded,
+            )
+        else:
+            report = (
+                completed_reports[0] if completed_reports else check_bundle_integrity(args.bundle)
+            )
     except Exception as exc:  # pylint: disable=broad-except
         if args.json:
             print(
@@ -628,6 +677,11 @@ def main(argv: list[str] | None = None) -> int:
                         "check": "bundle_integrity",
                         "path": str(args.bundle),
                         "error": str(exc),
+                        "errors": (
+                            collect_bundle_errors(args.bundle)
+                            if args.all_errors
+                            else [_issue_from_exception(exc)]
+                        ),
                     },
                     indent=2,
                 )
@@ -635,11 +689,158 @@ def main(argv: list[str] | None = None) -> int:
         else:
             print(f"Bundle integrity: ERROR: {exc}", file=sys.stderr)
         return 1
+    finally:
+        if loaded is not None and loaded._temporary_directory is not None:
+            loaded._temporary_directory.cleanup()
     if args.json:
         print(json.dumps(report, indent=2))
     else:
         _print_text_report(report)
+        if "diagnostics" in report:
+            print(f"Diagnostics: {args.diagnose}")
+            for warning in report["diagnostics"]["warnings"]:
+                print(f"Warning [{warning['code']}]: {warning['message']}")
     return 0
+
+
+def _issue_from_exception(exc, *, file="bundle.json", field="", code="bundle.integrity"):
+    message = str(exc)
+    if isinstance(exc, BundleValidationError):
+        return {"file": exc.file, "field": exc.field, "code": exc.code, "message": message}
+    return {"file": file, "field": field, "code": code, "message": message}
+
+
+def collect_bundle_errors(root: str | Path, *, _completed_reports=None) -> list[dict]:
+    """Collect independent failures; skip checks whose prerequisites failed."""
+    root = Path(root)
+    if root.is_file() and root.suffix.lower() == ".zip":
+        from bundle_prepare.archives import extract_bundle_zip
+
+        try:
+            with TemporaryDirectory(prefix="hermes-check-") as directory:
+                extract_bundle_zip(root, Path(directory))
+                issues = collect_bundle_errors(directory, _completed_reports=_completed_reports)
+                if not issues and _completed_reports:
+                    _completed_reports[-1]["path"] = str(root)
+                return issues
+        except (ValueError, OSError) as exc:
+            return [_issue_from_exception(exc, file=root.name, code="archive.invalid")]
+    try:
+        report = check_bundle_integrity(root)
+    except (ValueError, OSError, KeyError, TypeError) as exc:
+        first_issue = _issue_from_exception(exc)
+    else:
+        if _completed_reports is not None:
+            _completed_reports.append(report)
+        return []
+    issues = []
+    schemas = _schema_root()
+    invalid = set()
+    for name, schema_name in _schema_documents(root).items():
+        if name == "environment.json" and not (root / name).exists():
+            continue
+        try:
+            if (root / name).is_symlink():
+                raise ValueError("Bundle sidecars must not be symlinks")
+            document = read_json(safe_bundle_file(root, name, label=name))
+            validator = Draft202012Validator(read_json(schemas / schema_name))
+            errors = sorted(
+                validator.iter_errors(document), key=lambda e: str(list(e.absolute_path))
+            )
+            for error in errors:
+                issues.append(
+                    {
+                        "file": name,
+                        "field": ".".join(map(str, error.absolute_path)),
+                        "code": f"schema.{error.validator}",
+                        "message": error.message,
+                    }
+                )
+            if errors:
+                invalid.add(name)
+        except (ValueError, OSError) as exc:
+            invalid.add(name)
+            issues.append(_issue_from_exception(exc, file=name, code="file.invalid"))
+    if not invalid.intersection(CORE_REQUIRED_FILES):
+        from .contract import BundleSensorConfig, load_adc, validate_required_features
+
+        try:
+            descriptor = load_bundle_descriptor(root)
+            sensor = BundleSensorConfig.from_json(root / "sensor.json")
+            validate_required_features(descriptor, sensor)
+        except (ValueError, OSError, KeyError, TypeError) as exc:
+            issues.append(_issue_from_exception(exc))
+            return issues
+
+        def resource(value, label):
+            return safe_bundle_file(root, value, label=label)
+
+        checks = [
+            ("sensor.json", lambda: sensor.to_sensor()),
+            ("benchmark_metadata.json", lambda: _validate_benchmark_camera_images(root)),
+        ]
+        for name, artifact in descriptor["adcs"].items():
+            value, origin = artifact["path"], artifact["origin"]
+            checks.append(
+                (
+                    value,
+                    lambda v=value, o=origin: load_adc(
+                        resource(v, "ADC artifact"),
+                        allowed_ndim=(3, 4) if o == "background" else (4,),
+                    ),
+                )
+            )
+        motion = descriptor.get("motion") or {}
+        if motion.get("parameters"):
+            value = motion["parameters"]
+            checks.append(
+                (value, lambda v=value: _validate_amass_sequence(resource(v, "motion.parameters")))
+            )
+        if motion.get("evaluated_mesh"):
+            value = motion["evaluated_mesh"]
+            checks.append(
+                (
+                    value,
+                    lambda v=value: MeshSequence.from_npz(
+                        str(resource(v, "motion.evaluated_mesh"))
+                    ),
+                )
+            )
+        target = descriptor.get("target") or {}
+        for key, validate in (("mesh", load_static_target_mesh), ("obj", _preflight_obj_file)):
+            if target.get(key):
+                value = target[key]
+                checks.append(
+                    (value, lambda v=value, fn=validate: fn(resource(v, "target geometry")))
+                )
+        scene = (descriptor.get("scene") or {}).get("file")
+        if scene:
+            checks.append(
+                (scene, lambda: _validate_scene_xml(root, resource(scene, "scene.file")))
+            )
+        environment = descriptor.get("environment") or (
+            "environment.json" if (root / "environment.json").exists() else None
+        )
+        if environment:
+            checks.append(
+                (
+                    environment,
+                    lambda: _validate_environment(
+                        root, read_json(resource(environment, "environment"))
+                    ),
+                )
+            )
+        for name, check in checks:
+            if name in invalid:
+                continue
+            try:
+                check()
+            except (ValueError, OSError, KeyError, TypeError) as exc:
+                issues.append(_issue_from_exception(exc, file=name))
+
+    if not issues:
+        issues.append(first_issue)
+    return issues
 
 
 def _print_text_report(report: Mapping[str, Any]) -> None:
@@ -665,13 +866,10 @@ def _print_text_report(report: Mapping[str, Any]) -> None:
     elif report["static_target"].get("present"):
         target = report["static_target"]
         print(
-            "Static target vertices/faces: "
-            f"{target['vertices_shape']}/{target['faces_shape']}"
+            "Static target vertices/faces: " f"{target['vertices_shape']}/{target['faces_shape']}"
         )
     print(f"Frames: {report['frames']['count']}")
-    optional = [
-        name for name, present in report["optional_files"].items() if present
-    ]
+    optional = [name for name, present in report["optional_files"].items() if present]
     print(f"Optional files: {', '.join(optional) if optional else 'none'}")
 
 

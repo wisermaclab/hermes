@@ -1,8 +1,10 @@
 # Benchmarks
 
-This directory contains synthetic performance and behavior benchmarks for the
-simulator. These are not real-radar validation suites; use `validation/` when
-the goal is to compare simulated ADC against captured radar clips.
+This directory contains performance and behavior benchmarks for the simulator.
+The [6843AOP configuration study](configuration_tradeoffs/README.md) combines
+numerical convergence sweeps with your own measured captures through the existing
+`validation/` runner, and separates results by hardware platform. The other
+benchmarks below use synthetic inputs.
 
 The source checkout includes the CMU walking motion at
 `data/AMASS/walking_poses_cmu_105_02.npz`. Other motion files, every SMPL model,
@@ -17,14 +19,15 @@ that location by default. Set `MMWAVE_SMPL_MODEL_DIR` or pass
 
 ## Human PO
 
-`human_po/run.py` benchmarks human-only physical optics on a precomputed
+`human_po/run.py` benchmarks the PO solver on a human mesh from a precomputed
 `MeshSequence` NPZ containing `vertices`, `faces`, and `times`.
 
 Use it for:
 
 - A quick PO runtime smoke test with `--mode single`
 - Incremental-PO speed/error tradeoff measurements with `--mode sweep`
-- Tuning visibility refresh, geometry-change thresholds, backend, and precision
+- Tuning `po_visibility_refresh_frames`, `po_refresh_on_phase_error_rad`,
+  backend, and precision
 
 Create a mesh sequence from an AMASS motion file:
 
@@ -36,7 +39,9 @@ python tools/amass_to_mesh_sequence.py \
   --force
 ```
 
-Run a single PO benchmark:
+Run a single PO benchmark (exact PO every chirp by default; add
+`--po-refresh-frames 1` for one exact solve per frame with phase updates in
+between):
 
 ```bash
 python benchmarks/human_po/run.py \
@@ -60,32 +65,38 @@ incremental ADC cubes, and diagnostic plots when `--plot` is enabled.
 
 ### What The Incremental PO Sweep Measures
 
-The sweep is a regression and tuning benchmark for the incremental
-human-only PO path. It first runs a full PO baseline with incremental updates
-disabled. That baseline is treated as the reference ADC cube for both runtime
-and numerical-error comparisons.
+The sweep is a regression and tuning benchmark for incremental PO. It first
+runs an exact PO baseline (`po_refresh_frames=0`, exact at every chirp). That
+baseline is treated as the reference ADC cube for both runtime and
+numerical-error comparisons.
 
-Each sweep setting then reruns the same mesh sequence with incremental updates
-enabled. Instead of recomputing PO visibility and facet contributions for every
-face on every chirp, the incremental path updates only faces whose geometry has
-changed enough since the last refresh. The sweep changes these controls:
+Each sweep setting reruns the same mesh sequence with exact solves at frame
+starts by default. Between them phase, delay, and spreading follow the motion,
+and facets whose neglected vertex phase change exceeds the trigger are
+integrated again. The sweep
+changes these controls:
 
-- `K`: visibility refresh period in chirps.
-- `normal_threshold_deg`: face-normal change threshold.
-- `centroid_displacement_threshold_m`: face-centroid displacement threshold.
-- `area_relative_threshold`: relative face-area change threshold.
+- `V`: `po_visibility_refresh_frames`, the visibility cadence in radar frames
+  (`0` = every chirp).
+- `po_refresh_on_phase_error_rad`: wavenumber times the largest change in a
+  vertex's two-way path length relative to its facet centre, measured since
+  the last exact solve. The default is 0.1 rad.
 
 The built-in settings are:
 
-| Label | K | Normal | Centroid | Area |
-| --- | ---: | ---: | ---: | ---: |
-| `k8 nominal n5 d2mm a5pct` | 8 | 5 deg | 0.002 m | 0.05 |
-| `k16 nominal n5 d2mm a5pct` | 16 | 5 deg | 0.002 m | 0.05 |
-| `k32 nominal n5 d2mm a5pct` | 32 | 5 deg | 0.002 m | 0.05 |
-| `k64 nominal n5 d2mm a5pct` | 64 | 5 deg | 0.002 m | 0.05 |
-| `k32 loose n15 d10mm a20pct` | 32 | 15 deg | 0.010 m | 0.20 |
-| `k64 loose n20 d20mm a30pct` | 64 | 20 deg | 0.020 m | 0.30 |
-| `k128 aggressive n30 d50mm a50pct` | 128 | 30 deg | 0.050 m | 0.50 |
+| Label | V | Phase-error trigger [rad] |
+| --- | ---: | ---: |
+| `v0 phase 0.1 rad` | 0 | 0.1 |
+| `v1 phase 0.1 rad` | 1 | 0.1 |
+| `v2 phase 0.1 rad` | 2 | 0.1 |
+| `v0 phase 0.3 rad` | 0 | 0.3 |
+| `v1 phase 0.5 rad` | 1 | 0.5 |
+| `v2 phase 1.0 rad` | 2 | 1.0 |
+
+Keep `po_refresh_frames=1` as the default. On the tutorial walk, a 4-frame
+cadence stays within 0.4% of exact per-chirp PO with the 0.1 rad trigger and
+reaches 5% at 0.5 rad. The trigger does not cover visibility changes, so
+compare against exact per-chirp integration for each scene.
 
 You can replace the built-in sweep with repeated `--setting` values:
 
@@ -93,14 +104,14 @@ You can replace the built-in sweep with repeated `--setting` values:
 python benchmarks/human_po/run.py \
   --mode sweep \
   --mesh-npz /path/to/walking_mesh_sequence.npz \
-  --setting "k32 custom:32:10:0.005:0.10" \
-  --setting "k96 custom:96:20:0.020:0.25"
+  --setting "v1 custom:1:0.1" \
+  --setting "v4 custom:4:0.3"
 ```
 
 The setting format is:
 
 ```text
-label:K:normal_deg:centroid_m:area_rel
+label:visibility_frames:phase_error_rad
 ```
 
 The summary table and CSV report:
@@ -131,67 +142,53 @@ python benchmarks/human_po/run.py \
 
 ## Human RT
 
-`human_rt/run.py` benchmarks RT sensing on an AMASS sequence. It converts
+`human_rt/run.py` benchmarks the RT solver on an AMASS sequence. It converts
 AMASS/SMPL motion internally, places a single virtual radar channel in front of
-the subject, and can run either `rt_retrace` or `rt_coherent_bank`.
+the subject, and runs one RT pass per requested `--rt-refresh-frames` cadence.
 
 Use it for:
 
 - RT runtime smoke tests
-- Ray/path-budget studies with `--samples-per-src` and
-  `--max-num-paths-per-src`
-- Comparing full RT retracing against coherent path-bank updates
-- Checking effects of `--max-depth`, retrace cadence,
-  `--diffuse-reflection`, and `--coupling-mode`
+- Ray/path-budget studies with `--rt-samples-per-source` and
+  `--rt-max-paths-per-source`
+- Comparing retracing every chirp against retracing every N frames with
+  coherent path updates in between
+- Checking effects of `--rt-max-depth`, retrace cadence,
+  `--rt-diffuse-reflection`, and `--rt-human-bounces`
 
-Run a short full-RT retrace benchmark:
+Run a short benchmark that retraces every chirp (the default):
 
 ```bash
 python benchmarks/human_rt/run.py \
   --num-frames 1 \
-  --samples-per-src 20000 \
-  --max-num-paths-per-src 20000
+  --rt-samples-per-source 20000 \
+  --rt-max-paths-per-source 20000
 ```
 
-Compare full retrace with coherent bank under the same default ray budget:
+Compare retracing every chirp with retracing once per frame under the same ray
+budget:
 
 ```bash
 python benchmarks/human_rt/run.py \
   --num-frames 2 \
-  --mode both \
-  --samples-per-src 20000 \
-  --max-num-paths-per-src 20000
+  --rt-refresh-frames 0 1 \
+  --rt-samples-per-source 20000 \
+  --rt-max-paths-per-source 20000
 ```
 
-Run coherent bank with a different retrace cadence:
-
-```bash
-python benchmarks/human_rt/run.py \
-  --num-frames 2 \
-  --mode rt_coherent_bank \
-  --max-depth 2 \
-  --samples-per-src 20000 \
-  --max-num-paths-per-src 20000 \
-  --coherent-bank-retrace-period-chirps 1
-```
-
-`--mode` is `rt_retrace`, `rt_coherent_bank`, or `both`. `--max-depth`,
-`--samples-per-src`, and `--max-num-paths-per-src` are ordinary scalar
-parameters for the RT trace. `--mode both` runs the two RT mobility modes with
-the same trace parameters so their runtime and path-count summaries can be
-compared directly.
+`--rt-refresh-frames` takes one or more cadences in radar frames; `0` retraces
+every chirp. `--rt-max-depth`, `--rt-samples-per-source`, and
+`--rt-max-paths-per-source` are ordinary scalar parameters for the RT trace, so
+all requested cadences share them and their runtime and path-count summaries
+can be compared directly.
 
 The RT runner uses the bundled CMU walking fixture unless `--motion-npz`,
 `MMWAVE_AMASS_NPZ`, or `MMWAVE_DATASET_ROOT` selects another compatible file.
 
 RT-specific controls:
 
-- `--coherent-bank-retrace-period-chirps`: retrace cadence for
-  `rt_coherent_bank`. Omit it, or pass `frame`, `default`, or `none`, for one
-  retrace per frame. An integer period such as `1`, `2`, or `8` retraces at
-  that chirp cadence; it must divide `--num-chirps-per-frame`.
 - `--coherent-transition` / `--no-coherent-transition`: path matching used by
-  `rt_coherent_bank` transition synthesis and diagnostics.
+  retrace transition synthesis and diagnostics.
 - `--coherent-crossfade` / `--no-coherent-crossfade`: force crossfade behavior
   for coherent-bank transitions; omit it to use the simulator policy.
 - `--coherent-match-delay-tolerance-fraction` and
@@ -199,8 +196,8 @@ RT-specific controls:
   coherent RT paths.
 
 The RT runner prints timing and path-count diagnostics and writes `summary.json`
-under its output directory. The JSON has a `runs` list with one entry per RT
-mode. Pass `--output-dir` to choose that directory, or `--json` to write the
+under its output directory. The JSON has a `runs` list with one entry per
+`--rt-refresh-frames` cadence. Pass `--output-dir` to choose that directory, or `--json` to write the
 summary to a specific file.
 
 ## Choosing A Runner
@@ -208,5 +205,5 @@ summary to a specific file.
 - Use `human_po/run.py --mode single` for a fast PO sanity check.
 - Use `human_po/run.py --mode sweep` before changing incremental PO behavior.
 - Use `human_rt/run.py` when the experiment is about RT path tracing, ray
-  budget, diffuse reflection, or coupling behavior.
+  budget, diffuse reflection, retrace cadence, or human-bounce behavior.
 - Use `validation/` instead when comparing simulation against real radar clips.

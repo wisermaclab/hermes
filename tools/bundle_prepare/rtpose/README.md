@@ -88,14 +88,15 @@ auditable. A dataset-local ADC cache must declare its physical RX order (or use
 the older unambiguous `rx_mimo_order` layout name); an ambiguous cache is
 rejected rather than guessed.
 
-For a smaller horizontal aperture, the validation CLI can select physical
-antenna labels:
+For a smaller horizontal aperture, the validation CLI can select antennas by
+zero-based index, where index `i` is the physical label `TX(i+1)` or
+`RX(i+1)`. This selects TX1-TX3, TX10 and RX5-RX12:
 
 ```bash
 python -m validation.cli \
   --clip /path/to/prepared_rtpose_bundle \
-  --subarray-tx 1-3,10 \
-  --subarray-rx 5-12 \
+  --tx-indices 0-2,9 \
+  --rx-indices 4-11 \
   --suite dsp_maps \
   --out /tmp/rtpose_subarray_validation
 ```

@@ -32,29 +32,38 @@ from typing import Any
 
 import numpy as np
 
-
 REPO_ROOT = Path(__file__).resolve().parents[3]
 RTPOSE_TOOL_ROOT = Path(__file__).resolve().parent
-for source_root in (REPO_ROOT / "src", RTPOSE_TOOL_ROOT):
+for source_root in (REPO_ROOT / "src", REPO_ROOT / "tools", RTPOSE_TOOL_ROOT):
     if str(source_root) not in sys.path:
         sys.path.insert(0, str(source_root))
+
+from bundle_prepare.paths import portable_relative_path, safe_bundle_file
+
+from bundle_prepare.adapters import (
+    ArrayArchive,
+    load_array_archive,
+    frame_id,
+    resolve_user_path,
+    resolve_output_root as _resolve_output_root,
+    publish_staged_bundle as _publish_staged_bundle,
+    validate_smpl_arrays,
+    check_bundle_output_integrity,
+    adapter_main,
+)
 
 from rtpose_adc import RTPOSE_MIMO_RX_ORDER, build_measured_adc_cube
 from reconstruct_rtpose_background import reconstruct_background
 
 RTPOSE_ROOT_ENV_VAR = "RTPOSE_ROOT"
 SMPL_MODEL_DIR_ENV_VAR = "MMWAVE_SMPL_MODEL_DIR"
-DEFAULT_OUTPUT_ROOT = (
-    Path(tempfile.gettempdir()) / "hermes-validation-bundles" / "rtpose"
+# How the RT and Hybrid PO solvers should use this bundle's environment.
+ENVIRONMENT_EVALUATION_NOTE = (
+    "Use benchmark_metadata.bundle_contents.environment_geometry.scene_path "
+    "when present; otherwise the bundle is self-contained for human-only "
+    "simulation and measured-ADC DSP validation."
 )
-WINDOWS_RESERVED_NAMES = {
-    "AUX",
-    "CON",
-    "NUL",
-    "PRN",
-    *(f"COM{index}" for index in range(1, 10)),
-    *(f"LPT{index}" for index in range(1, 10)),
-}
+DEFAULT_OUTPUT_ROOT = Path(tempfile.gettempdir()) / "hermes-validation-bundles" / "rtpose"
 # SparseSMPLFit and AMASS serialize a right-handed world with +Z up, -Y
 # forward, and +X pointing toward the subject's left. RT-Pose radar coordinates
 # are [range_forward, lateral_left, up], so [x, y, z] -> [-y, x, z].
@@ -68,35 +77,8 @@ AMASS_TIMING_FIELDS = {
 }
 
 
-class ArrayArchive(dict[str, np.ndarray]):
-    """In-memory, pickle-free replacement for a NumPy ``NpzFile``."""
-
-    @property
-    def files(self) -> tuple[str, ...]:
-        return tuple(self)
-
-
-def load_array_archive(path: Path) -> ArrayArchive:
-    """Loads every NPZ array without permitting executable pickle payloads."""
-
-    data = np.load(path, allow_pickle=False)
-    if not isinstance(data, np.lib.npyio.NpzFile):
-        raise ValueError(f"Expected a NumPy .npz archive: {path}")
-    with data:
-        return ArrayArchive(
-            (key, np.array(data[key], copy=True)) for key in data.files
-        )
-
-
 def main(argv: list[str] | None = None) -> int:
-    parser = build_arg_parser()
-    args = parser.parse_args(argv)
-    try:
-        result = prepare_bundle(args)
-    except (OSError, IndexError, KeyError, ValueError) as exc:
-        parser.error(str(exc))
-    print(json.dumps(result, indent=2, allow_nan=False))
-    return 0
+    return adapter_main(build_arg_parser, prepare_bundle, argv)
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -107,8 +89,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         type=Path,
         default=default_rtpose_root(),
         help=(
-            "RT-Pose checkout root or its Data directory. Defaults to "
-            f"${RTPOSE_ROOT_ENV_VAR}."
+            "RT-Pose checkout root or its Data directory. Defaults to " f"${RTPOSE_ROOT_ENV_VAR}."
         ),
     )
     parser.add_argument("--sequence", required=True)
@@ -138,10 +119,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--smpl-model-dir",
         type=Path,
         default=default_smpl_model_dir(),
-        help=(
-            "Licensed SMPL model directory. Defaults to "
-            f"${SMPL_MODEL_DIR_ENV_VAR}."
-        ),
+        help=("Licensed SMPL model directory. Defaults to " f"${SMPL_MODEL_DIR_ENV_VAR}."),
     )
     parser.add_argument(
         "--environment-geometry",
@@ -241,9 +219,7 @@ def prepare_bundle(args: argparse.Namespace) -> dict[str, Any]:
         raise ValueError(f"Refusing to replace directory not owned by this tool: {bundle_dir}")
 
     output_root.mkdir(parents=True, exist_ok=True)
-    staging_root = Path(
-        tempfile.mkdtemp(prefix=f".{bundle_name}.", dir=output_root)
-    )
+    staging_root = Path(tempfile.mkdtemp(prefix=f".{bundle_name}.", dir=output_root))
     staged_args = argparse.Namespace(**vars(args))
     staged_args.output_root = staging_root
     staged_args.force = False
@@ -264,6 +240,11 @@ def prepare_bundle(args: argparse.Namespace) -> dict[str, Any]:
 
 
 def _prepare_bundle_unstaged(args: argparse.Namespace) -> dict[str, Any]:
+    tools_path = str(REPO_ROOT / "tools")
+    if tools_path not in sys.path:
+        sys.path.insert(0, tools_path)
+    from bundle_prepare.contract import make_bundle_descriptor
+
     rtpose_root = resolve_rtpose_root(args.rtpose_root)
     sequence = sequence_id(args.sequence)
     radar_frame_id = frame_id(args.radar_frame_id)
@@ -277,9 +258,7 @@ def _prepare_bundle_unstaged(args: argparse.Namespace) -> dict[str, Any]:
     )
     source_smpl_archive = portable_provenance_path(amass_npz, rtpose_root, REPO_ROOT)
     source_smpl_segment = (
-        amass_npz.parent.name
-        if re.fullmatch(r"segment_\d+", amass_npz.parent.name)
-        else None
+        amass_npz.parent.name if re.fullmatch(r"segment_\d+", amass_npz.parent.name) else None
     )
     selection_kind = "segment" if source_smpl_segment is not None else "archive"
     print(
@@ -450,19 +429,11 @@ def _prepare_bundle_unstaged(args: argparse.Namespace) -> dict[str, Any]:
     )
     (bundle_dir / "bundle.json").write_text(
         json.dumps(
-            {
-                "schema_version": 1,
-                "profile": "hermes",
-                "primary_adc": "primary",
-                "adcs": {
-                    "primary": {
-                        "path": "radar_adc.npz",
-                        "origin": "measurement",
-                    }
-                },
-                "motion": {"parameters": "amass_sequence.npz"},
-                "environment": "environment.json",
-            },
+            make_bundle_descriptor(
+                primary_origin="measurement",
+                motion_parameters="amass_sequence.npz",
+                environment=None if environment_json is None else "environment.json",
+            ),
             indent=2,
             allow_nan=False,
         )
@@ -503,9 +474,7 @@ def _prepare_bundle_unstaged(args: argparse.Namespace) -> dict[str, Any]:
         "amass_sequence_relative_times_s": [float(v) for v in motion_times],
         "amass_sequence_timing": f"amass_{pose_timing_source}",
         "amass_sequence_timing_fields": AMASS_TIMING_FIELDS,
-        "simulation_motion": (
-            "AMASSSMPLMotionSequence joint-angle SLERP from amass_sequence.npz"
-        ),
+        "simulation_motion": ("AMASSSMPLMotionSequence joint-angle SLERP from amass_sequence.npz"),
         "sensor_metadata": sensor_metadata,
         "geometry_outputs": portable_geometry_outputs(
             geometry_outputs,
@@ -531,97 +500,21 @@ def _prepare_bundle_unstaged(args: argparse.Namespace) -> dict[str, Any]:
     return summary
 
 
-def check_bundle_output_integrity(bundle_dir: Path) -> dict[str, Any]:
-    """Check the completed standard files before reporting success."""
-
-    src_path = REPO_ROOT / "src"
-    for path in (src_path, REPO_ROOT / "tools"):
-        if str(path) not in sys.path:
-            sys.path.insert(0, str(path))
-    from bundle_prepare.integrity import check_bundle_integrity
-
-    report = check_bundle_integrity(bundle_dir)
-    return {
-        "valid": bool(report["valid"]),
-        "radar_adc_shape": report["primary_adc_artifact"]["shape"],
-        "amass_poses_shape": report["amass_sequence"]["poses_shape"],
-        "frame_count": report["frames"]["count"],
-    }
-
-
 def _path_exists(path: Path) -> bool:
     return path.exists() or path.is_symlink()
 
 
 def publish_staged_bundle(
-    staged: Path,
-    bundle_dir: Path,
-    *,
-    force: bool,
-    sequence: str,
-    radar_frame_id: str,
+    staged: Path, bundle_dir: Path, *, force: bool, sequence: str, radar_frame_id: str
 ) -> None:
-    """Reserve the destination and retain an owned previous bundle for rollback."""
-
-    backup_container: Path | None = None
-    backup: Path | None = None
-    try:
-        try:
-            bundle_dir.mkdir()
-        except FileExistsError:
-            if not force:
-                raise FileExistsError(
-                    f"{bundle_dir} appeared while preparing the bundle; pass --force to replace it"
-                )
-            if not replaceable_bundle(
-                bundle_dir,
-                sequence=sequence,
-                radar_frame_id=radar_frame_id,
-            ):
-                raise ValueError(
-                    f"Refusing to replace directory not owned by this tool: {bundle_dir}"
-                )
-            backup_container = Path(
-                tempfile.mkdtemp(prefix=f".{bundle_dir.name}.backup.", dir=bundle_dir.parent)
-            )
-            backup = backup_container / "previous"
-            os.replace(bundle_dir, backup)
-            if not replaceable_bundle(
-                backup,
-                sequence=sequence,
-                radar_frame_id=radar_frame_id,
-            ):
-                os.replace(backup, bundle_dir)
-                raise ValueError(
-                    f"Refusing to replace directory whose ownership changed: {bundle_dir}"
-                )
-            try:
-                bundle_dir.mkdir()
-            except BaseException:
-                if not _path_exists(bundle_dir):
-                    os.replace(backup, bundle_dir)
-                raise
-
-        try:
-            os.replace(staged, bundle_dir)
-        except BaseException:
-            try:
-                bundle_dir.rmdir()
-            except OSError:
-                pass
-            if backup is not None and _path_exists(backup) and not _path_exists(bundle_dir):
-                os.replace(backup, bundle_dir)
-            raise
-
-        if backup is not None and _path_exists(backup):
-            shutil.rmtree(backup)
-    finally:
-        if backup_container is not None and backup_container.exists():
-            try:
-                backup_container.rmdir()
-            except OSError:
-                # Do not delete a retained previous bundle if restoration failed.
-                pass
+    _publish_staged_bundle(
+        staged,
+        bundle_dir,
+        force=force,
+        ownership_check=replaceable_bundle,
+        sequence=sequence,
+        radar_frame_id=radar_frame_id,
+    )
 
 
 def resolve_amass_npz(
@@ -690,7 +583,8 @@ def resolve_amass_npz(
             candidate
             for candidate in matching
             if candidate.parent == smpl_dir
-            and candidate.name in {
+            and candidate.name
+            in {
                 "rtpose_best_gender_smpl_amass_like.npz",
                 "fit.npz",
             }
@@ -764,25 +658,17 @@ def segment_manifest_archives(
         output_path = segment.get("output_path") if isinstance(segment, dict) else None
         if not isinstance(output_path, str) or not output_path.strip():
             raise ValueError(f"Segment {index} in {manifest} has no output_path")
-        relative = Path(output_path)
-        if relative.is_absolute() or "\\" in output_path or any(
-            part in {"", ".", ".."} or ":" in part for part in relative.parts
-        ):
-            raise ValueError(f"Segment {index} has unsafe output_path {output_path!r}")
-        candidate = (smpl_dir / relative).resolve()
-        try:
-            candidate.relative_to(root)
-        except ValueError as exc:
-            raise ValueError(f"Segment {index} output escapes the SMPL directory") from exc
-        if candidate.is_symlink() or not candidate.is_file():
-            raise FileNotFoundError(f"Segment archive was not found: {candidate}")
+        candidate = safe_bundle_file(
+            smpl_dir,
+            output_path,
+            label=f"Segment {index} output_path",
+            missing_kind="Segment archive",
+        )
         if candidate.suffix.lower() != ".npz":
             raise ValueError(f"Segment output must be an NPZ archive: {candidate}")
         archives.append(candidate)
     if len(set(archives)) != len(archives):
-        raise ValueError(
-            f"SparseSMPLFit segment manifest contains duplicate outputs: {manifest}"
-        )
+        raise ValueError(f"SparseSMPLFit segment manifest contains duplicate outputs: {manifest}")
     return archives
 
 
@@ -818,9 +704,7 @@ def resolve_labels_path(rtpose_root: Path) -> Path:
     for candidate in candidates:
         if candidate.is_file():
             return candidate.resolve()
-    raise FileNotFoundError(
-        "RT-Pose Train.json was not found below the dataset directory"
-    )
+    raise FileNotFoundError("RT-Pose Train.json was not found below the dataset directory")
 
 
 def resolve_filemeta_path(rtpose_root: Path) -> Path:
@@ -833,9 +717,7 @@ def resolve_filemeta_path(rtpose_root: Path) -> Path:
     for candidate in candidates:
         if candidate.is_file():
             return candidate.resolve()
-    raise FileNotFoundError(
-        "RT-Pose Data/filemeta.txt was not found below the dataset directory"
-    )
+    raise FileNotFoundError("RT-Pose Data/filemeta.txt was not found below the dataset directory")
 
 
 def load_rtpose_sequence_metadata(path: Path, sequence: str) -> dict[str, str]:
@@ -857,9 +739,7 @@ def load_rtpose_sequence_metadata(path: Path, sequence: str) -> dict[str, str]:
             if isinstance(value, str) and value.strip():
                 return value.strip()
         choices = ", ".join(repr(name) for name in names)
-        raise ValueError(
-            f"Sequence {sequence!r} in {path} is missing string field {choices}"
-        )
+        raise ValueError(f"Sequence {sequence!r} in {path} is missing string field {choices}")
 
     return {
         "activity": required_text("Activity"),
@@ -884,14 +764,9 @@ def copy_rtpose_camera_frame(
     normalized_frame_id = frame_id(camera_frame_id)
     copied: dict[str, str] = {}
     for side in ("left", "right"):
-        source = (
-            rtpose_root
-            / f"Data/sequences/{sequence}/camera/{side}/{normalized_frame_id}.png"
-        )
+        source = rtpose_root / f"Data/sequences/{sequence}/camera/{side}/{normalized_frame_id}.png"
         if source.is_symlink() or not source.is_file():
-            raise FileNotFoundError(
-                f"RT-Pose {side} camera frame was not found: {source}"
-            )
+            raise FileNotFoundError(f"RT-Pose {side} camera frame was not found: {source}")
         with source.open("rb") as stream:
             if stream.read(8) != b"\x89PNG\r\n\x1a\n":
                 raise ValueError(f"RT-Pose camera frame is not a PNG file: {source}")
@@ -904,25 +779,9 @@ def copy_rtpose_camera_frame(
 
 
 def resolve_output_root(sequence: str, path: Path | None) -> Path:
-    if path is not None:
-        return resolve_user_path(path)
-    return (DEFAULT_OUTPUT_ROOT / f"sequence_{sequence}" / "bundles").resolve()
-
-
-def resolve_user_path(path: Path) -> Path:
-    """Resolves user-provided output paths without tying them to the dataset."""
-
-    out = path.expanduser()
-    return out.resolve() if out.is_absolute() else (Path.cwd() / out).resolve()
-
-
-def frame_id(value: str | int) -> str:
-    text = str(value).strip()
-    if text.lower().startswith("frame"):
-        text = text[5:]
-    if not text.isdecimal():
-        raise ValueError(f"Invalid frame ID {value!r}; expected a non-negative integer")
-    return f"{int(text):06d}"
+    return _resolve_output_root(
+        sequence, path, default_root=DEFAULT_OUTPUT_ROOT, prefix="sequence_"
+    )
 
 
 def rtpose_frame_name(value: str | int) -> str:
@@ -938,64 +797,7 @@ def validate_smpl_sequence(
 ) -> None:
     """Validate the pose-only AMASS-like handoff used by this adapter."""
 
-    missing = [
-        key
-        for key in (
-            "poses",
-            "trans",
-            "betas",
-            "gender",
-            "world_up_axis",
-            "world_forward_axis",
-        )
-        if key not in data
-    ]
-    if missing:
-        raise ValueError(f"SMPL archive is missing required fields: {missing}")
-    poses = np.asarray(data["poses"])
-    trans = np.asarray(data["trans"])
-    betas = np.asarray(data["betas"]).reshape(-1)
-    if poses.ndim != 2 or poses.shape[1] != 72 or poses.shape[0] == 0:
-        raise ValueError("SMPL poses must have shape (T, 72) with T > 0")
-    if trans.shape != (poses.shape[0], 3):
-        raise ValueError("SMPL trans must have shape (T, 3) matching poses")
-    if betas.shape != (10,):
-        raise ValueError("SMPL betas must have shape (10,)")
-    for name, values in (("poses", poses), ("trans", trans), ("betas", betas)):
-        if values.dtype.kind not in {"i", "u", "f"} or not np.all(np.isfinite(values)):
-            raise ValueError(f"SMPL {name} must contain only finite real values")
-        with np.errstate(over="ignore", invalid="ignore"):
-            narrowed = np.asarray(values, dtype=np.float32)
-        if not np.all(np.isfinite(narrowed)):
-            raise ValueError(f"SMPL {name} values must be representable as float32")
-    gender = np.asarray(data["gender"])
-    if gender.ndim != 0 or str(npz_scalar_to_py(gender)).lower() not in {
-        "neutral",
-        "male",
-        "female",
-    }:
-        raise ValueError("SMPL gender must be a scalar neutral, male, or female string")
-    world_up = str(npz_scalar_to_py(data["world_up_axis"])).strip().lower()
-    world_forward = str(npz_scalar_to_py(data["world_forward_axis"])).strip().lower()
-    if (world_up, world_forward) != ("z", "-y"):
-        raise ValueError(
-            "SMPL archive must use canonical AMASS world axes: "
-            "world_up_axis='z' and world_forward_axis='-y'"
-        )
-    if "profile" in data:
-        profile = np.asarray(data["profile"])
-        if profile.ndim != 0:
-            raise ValueError("SMPL profile provenance must be a scalar string")
-        profile_name = str(npz_scalar_to_py(profile)).strip().lower()
-        if profile_name and profile_name != "rtpose":
-            raise ValueError(f"SMPL archive profile must be rtpose, got {profile_name!r}")
-    if "model_type" in data:
-        model_type = np.asarray(data["model_type"])
-        if model_type.ndim != 0:
-            raise ValueError("SMPL model_type must be a scalar string")
-        model_name = str(npz_scalar_to_py(model_type)).strip().lower()
-        if model_name != "smpl":
-            raise ValueError(f"SMPL model_type must be 'smpl', got {model_name!r}")
+    validate_smpl_arrays(data, profile="rtpose", flatten_betas=True)
     if expected_sequence is not None and "source_sequence_id" in data:
         source_sequence = np.asarray(data["source_sequence_id"])
         if source_sequence.ndim != 0:
@@ -1126,9 +928,7 @@ def load_rtpose_frame_mapping(
             "lidar_valid": lidar_valid,
         }
     if not mapping:
-        raise IndexError(
-            f"Sequence {sequence} has no annotations at object index {object_index}"
-        )
+        raise IndexError(f"Sequence {sequence} has no annotations at object index {object_index}")
     return mapping
 
 
@@ -1203,9 +1003,7 @@ def select_center_smpl_index(
     if len(hits) == 0:
         raise ValueError(f"Radar frame {radar_frame_id} has no fitted pose in RT-Pose labels")
     if len(hits) > 1:
-        raise ValueError(
-            f"Radar frame {radar_frame_id} maps to multiple fitted poses"
-        )
+        raise ValueError(f"Radar frame {radar_frame_id} maps to multiple fitted poses")
     return int(hits[0])
 
 
@@ -1270,8 +1068,7 @@ def load_or_build_measured_adc(
     """Load a prepared cube or decode it directly from the measured capture."""
 
     cache = (
-        rtpose_root
-        / f"Data/sequences/{sequence}/radar/npy_raw/"
+        rtpose_root / f"Data/sequences/{sequence}/radar/npy_raw/"
         f"frame{int(radar_frame_id):04d}_adc.npz"
     )
     if cache.exists() or cache.is_symlink():
@@ -1357,9 +1154,7 @@ def normalize_adc_rx_order(
 
     source_value = metadata.get("source_rx_order", current_order)
     if not isinstance(source_value, (list, tuple)) or len(source_value) != rx_count:
-        raise ValueError(
-            f"ADC metadata source_rx_order must contain {rx_count} entries"
-        )
+        raise ValueError(f"ADC metadata source_rx_order must contain {rx_count} entries")
     source_order = tuple(
         strict_metadata_integer(value, label="ADC metadata source_rx_order entry")
         for value in source_value
@@ -1411,9 +1206,7 @@ def load_adc_cube(path: Path) -> tuple[np.ndarray, dict[str, Any]]:
 def validate_adc_cube(value: Any, *, label: str) -> np.ndarray:
     adc_cube = np.asarray(value)
     if adc_cube.ndim != 4 or any(size <= 0 for size in adc_cube.shape):
-        raise ValueError(
-            f"{label} must have non-empty [samples, loops, rx, tx] axes"
-        )
+        raise ValueError(f"{label} must have non-empty [samples, loops, rx, tx] axes")
     if not np.issubdtype(adc_cube.dtype, np.number) or not np.all(np.isfinite(adc_cube)):
         raise ValueError(f"{label} must contain finite numeric values")
     with np.errstate(over="ignore", invalid="ignore"):
@@ -1565,13 +1358,19 @@ def build_center_mesh(
         subset = tmpdir / "center_smpl.npz"
         np.savez(
             subset,
-            poses=np.asarray(smpl_data["poses"][center_index : center_index + 1], dtype=np.float32),
-            trans=np.asarray(smpl_data["trans"][center_index : center_index + 1], dtype=np.float32),
+            poses=np.asarray(
+                smpl_data["poses"][center_index : center_index + 1], dtype=np.float32
+            ),
+            trans=np.asarray(
+                smpl_data["trans"][center_index : center_index + 1], dtype=np.float32
+            ),
             betas=np.asarray(smpl_data["betas"], dtype=np.float32),
             gender=smpl_data["gender"],
-            mocap_framerate=np.asarray(smpl_data["mocap_framerate"])
-            if "mocap_framerate" in smpl_data.files
-            else np.asarray(15.0, dtype=np.float32),
+            mocap_framerate=(
+                np.asarray(smpl_data["mocap_framerate"])
+                if "mocap_framerate" in smpl_data.files
+                else np.asarray(15.0, dtype=np.float32)
+            ),
             source_amass_npz=str(amass_npz),
         )
         faces, vertices, _ = amass_to_mesh_npz(
@@ -1583,8 +1382,7 @@ def build_center_mesh(
     from mmWaveRadar.targets.mesh import ensure_outward_face_winding
 
     vertices = (
-        np.asarray(vertices, dtype=np.float32)[..., AMASS_TO_RTPOSE_AXES]
-        * AMASS_TO_RTPOSE_SIGNS
+        np.asarray(vertices, dtype=np.float32)[..., AMASS_TO_RTPOSE_AXES] * AMASS_TO_RTPOSE_SIGNS
     )
     faces = ensure_outward_face_winding(
         vertices,
@@ -1649,9 +1447,7 @@ def write_amass_sequence(
         "world_up_axis": np.asarray(smpl_data["world_up_axis"]),
         "world_forward_axis": np.asarray(smpl_data["world_forward_axis"]),
         "frame_ids": np.asarray(pose_frame_ids[indices]).astype(str),
-        "source_capture_times": np.asarray(
-            source_capture_times[indices], dtype=np.float64
-        ),
+        "source_capture_times": np.asarray(source_capture_times[indices], dtype=np.float64),
         "bundle_times": np.asarray(bundle_times, dtype=np.float64),
         "faces": np.asarray(faces, dtype=np.uint32),
         "model_type": np.asarray("smpl"),
@@ -1664,16 +1460,12 @@ def write_amass_sequence(
         "selected_window_index": np.asarray(int(center_hits[0]), dtype=np.int64),
         "selected_source_smpl_index": np.asarray(int(center_index), dtype=np.int64),
         "selected_frame_id": np.asarray(pose_frame_ids[center_index]).astype(str),
-        "selected_radar_frame_id": np.asarray(
-            radar_frame_ids[center_index]
-        ).astype(str),
+        "selected_radar_frame_id": np.asarray(radar_frame_ids[center_index]).astype(str),
         "source_amass_npz": np.asarray(source_amass_npz_label),
         "output_axes": AMASS_TO_RTPOSE_AXES,
         "output_signs": AMASS_TO_RTPOSE_SIGNS,
         "coordinate_frame": np.asarray("canonical AMASS; RT-Pose transform metadata"),
-        "face_winding_note": np.asarray(
-            "corrected_with_smpl_model_faces_to_rtpose_frame"
-        ),
+        "face_winding_note": np.asarray("corrected_with_smpl_model_faces_to_rtpose_frame"),
         "timing_reference": np.asarray(
             "times=source segment-local; source_capture_times=source absolute; "
             "bundle_times=selected radar frame at t=0"
@@ -1777,24 +1569,16 @@ def copy_provided_environment_geometry(
         copy_portable_scene_assets(source, destination)
         copied["scene_path"] = "environment_geometry/environment_scene.xml"
     elif source.is_file() and source.suffix.lower() == ".npz":
-        destination = (
-            bundle_dir / "environment_geometry/environment_mesh_sequence.npz"
-        )
+        destination = bundle_dir / "environment_geometry/environment_mesh_sequence.npz"
         destination.parent.mkdir(parents=True, exist_ok=True)
         repack_environment_mesh_sequence(source, destination)
         copied = {
-            "environment_mesh_sequence": (
-                "environment_geometry/environment_mesh_sequence.npz"
-            )
+            "environment_mesh_sequence": ("environment_geometry/environment_mesh_sequence.npz")
         }
     else:
-        raise ValueError(
-            "--environment-geometry must name a directory, scene XML, or mesh NPZ"
-        )
+        raise ValueError("--environment-geometry must name a directory, scene XML, or mesh NPZ")
     if not copied:
-        raise ValueError(
-            f"Provided geometry contains no supported environment assets: {source}"
-        )
+        raise ValueError(f"Provided geometry contains no supported environment assets: {source}")
     copied["geometry_source"] = "provided"
     return copied
 
@@ -1806,9 +1590,7 @@ def copy_environment_geometry_directory(
     """Copy the portable, supported subset of an environment directory."""
 
     if source_dir.is_symlink() or not source_dir.is_dir():
-        raise ValueError(
-            f"Environment geometry source must be a regular directory: {source_dir}"
-        )
+        raise ValueError(f"Environment geometry source must be a regular directory: {source_dir}")
     dest_dir = bundle_dir / "environment_geometry"
     copied: dict[str, Any] = {}
     for filename in (
@@ -1833,17 +1615,14 @@ def copy_environment_geometry_directory(
         if not json_source.exists():
             continue
         if json_source.is_symlink() or not json_source.is_file():
-            raise ValueError(
-                f"Environment asset is not a safe regular file: {json_source}"
-            )
+            raise ValueError(f"Environment asset is not a safe regular file: {json_source}")
         try:
             payload = json.loads(json_source.read_text(encoding="utf-8"))
         except (json.JSONDecodeError, UnicodeDecodeError) as exc:
             raise ValueError(f"Invalid environment JSON: {json_source}") from exc
         dest_dir.mkdir(parents=True, exist_ok=True)
         (dest_dir / json_source.name).write_text(
-            json.dumps(sanitize_environment_json(payload), indent=2, allow_nan=False)
-            + "\n",
+            json.dumps(sanitize_environment_json(payload), indent=2, allow_nan=False) + "\n",
             encoding="utf-8",
             newline="\n",
         )
@@ -1851,9 +1630,7 @@ def copy_environment_geometry_directory(
     mesh_sequence = source_dir / "environment_mesh_sequence.npz"
     if mesh_sequence.exists():
         if mesh_sequence.is_symlink() or not mesh_sequence.is_file():
-            raise ValueError(
-                f"Environment asset is not a safe regular file: {mesh_sequence}"
-            )
+            raise ValueError(f"Environment asset is not a safe regular file: {mesh_sequence}")
         dest_dir.mkdir(parents=True, exist_ok=True)
         repack_environment_mesh_sequence(
             mesh_sequence,
@@ -1867,13 +1644,9 @@ def copy_environment_geometry_directory(
     if (dest_dir / "environment_scene.xml").exists():
         copied["scene_path"] = "environment_geometry/environment_scene.xml"
     if (dest_dir / "environment_mesh_sequence.npz").exists():
-        copied["environment_mesh_sequence"] = (
-            "environment_geometry/environment_mesh_sequence.npz"
-        )
+        copied["environment_mesh_sequence"] = "environment_geometry/environment_mesh_sequence.npz"
     if (dest_dir / "reconstruction_stats.json").exists():
-        copied["reconstruction_stats"] = (
-            "environment_geometry/reconstruction_stats.json"
-        )
+        copied["reconstruction_stats"] = "environment_geometry/reconstruction_stats.json"
     return copied
 
 
@@ -1905,14 +1678,9 @@ def repack_environment_mesh_sequence(source: Path, destination: Path) -> None:
         if not isinstance(archive, np.lib.npyio.NpzFile):
             raise ValueError("expected an NPZ archive")
         with archive:
-            missing = [
-                key for key in ("vertices", "faces", "times")
-                if key not in archive.files
-            ]
+            missing = [key for key in ("vertices", "faces", "times") if key not in archive.files]
             if missing:
-                raise ValueError(
-                    f"Environment mesh sequence is missing fields: {missing}"
-                )
+                raise ValueError(f"Environment mesh sequence is missing fields: {missing}")
             vertices = np.array(archive["vertices"], copy=True)
             faces = np.array(archive["faces"], copy=True)
             times = np.array(archive["times"], copy=True)
@@ -1936,9 +1704,7 @@ def repack_environment_mesh_sequence(source: Path, destination: Path) -> None:
     if times.shape != (vertices.shape[0],) or times.dtype.kind not in {"i", "u", "f"}:
         raise ValueError("Environment times must have shape (T,) and be real numeric")
     times = np.asarray(times, dtype=np.float64)
-    if not np.all(np.isfinite(times)) or (
-        len(times) > 1 and np.any(np.diff(times) <= 0.0)
-    ):
+    if not np.all(np.isfinite(times)) or (len(times) > 1 and np.any(np.diff(times) <= 0.0)):
         raise ValueError("Environment times must be finite and strictly increasing")
     np.savez_compressed(
         destination,
@@ -1968,8 +1734,7 @@ def sanitize_staged_environment_geometry(bundle_dir: Path) -> None:
         except (json.JSONDecodeError, UnicodeDecodeError) as exc:
             raise ValueError(f"Invalid environment JSON: {json_path}") from exc
         json_path.write_text(
-            json.dumps(sanitize_environment_json(payload), indent=2, allow_nan=False)
-            + "\n",
+            json.dumps(sanitize_environment_json(payload), indent=2, allow_nan=False) + "\n",
             encoding="utf-8",
             newline="\n",
         )
@@ -1996,9 +1761,7 @@ def find_sequence_environment_geometry_dir(
 ) -> Path | None:
     """Find legacy fitted sequence-level environment geometry, if present."""
 
-    candidates = (
-        rtpose_root / f"Data/sequences/{sequence}/map/environment_geometry",
-    )
+    candidates = (rtpose_root / f"Data/sequences/{sequence}/map/environment_geometry",)
     for candidate in candidates:
         if candidate.exists():
             return candidate
@@ -2037,17 +1800,22 @@ def stage_scene_path(
     if raw_scene is None:
         return None
     scene = Path(str(raw_scene)).expanduser()
-    if not scene.is_absolute():
-        scene = bundle_dir / scene
-    if not scene.is_file() or scene.is_symlink():
-        raise FileNotFoundError(f"Prepared scene file was not found or is unsafe: {scene}")
-    scene = scene.resolve()
+    if scene.is_absolute():
+        # Generated geometry may name an absolute file, but it must still be
+        # inside staging. Do not resolve the file before checking symlinks.
+        for root in (bundle_dir.absolute(), bundle_dir.resolve()):
+            try:
+                name = scene.relative_to(root).as_posix()
+                break
+            except ValueError:
+                continue
+        else:
+            raise ValueError("Prepared scene must be inside the staged bundle")
+    else:
+        name = str(raw_scene)
+    scene = safe_bundle_file(bundle_dir, name, label="Prepared scene")
     if scene.suffix.lower() != ".xml":
         raise ValueError("Prepared scene must be an XML file")
-    try:
-        scene.relative_to(bundle_dir.resolve())
-    except ValueError as exc:
-        raise ValueError("Prepared scene must be inside the staged bundle") from exc
     copy_portable_scene_assets(scene, scene)
     geometry_outputs["scene_path"] = str(scene)
     return scene
@@ -2056,22 +1824,20 @@ def stage_scene_path(
 def copy_portable_scene_assets(source: Path, destination: Path) -> None:
     """Copy an XML scene and its local file references into one portable tree."""
 
-    source = source.resolve()
-    source_root = source.parent
+    source_root = source.absolute().parent.resolve()
+    source = safe_bundle_file(source_root, source.name, label="Scene source")
     destination = destination.resolve()
     destination_root = destination.parent
     visited: set[Path] = set()
 
     def copy_asset(asset: Path, relative: Path) -> None:
-        resolved = asset.resolve()
         try:
-            resolved.relative_to(source_root)
+            source_name = asset.relative_to(source_root).as_posix()
         except ValueError as exc:
             raise ValueError(f"Scene asset escapes its source directory: {asset}") from exc
+        resolved = safe_bundle_file(source_root, source_name, label="Scene asset")
         if resolved in visited:
             return
-        if asset.is_symlink() or not resolved.is_file():
-            raise FileNotFoundError(f"Scene asset was not found or is unsafe: {asset}")
         visited.add(resolved)
         target = destination_root / relative
         target.parent.mkdir(parents=True, exist_ok=True)
@@ -2096,22 +1862,13 @@ def copy_portable_scene_assets(source: Path, destination: Path) -> None:
 
 
 def safe_scene_reference(value: str) -> Path:
-    """Return a normalized, bundle-relative scene asset path."""
-
-    text = value.strip()
-    if not text or "\\" in text or Path(text).is_absolute() or re.match(
-        r"^[A-Za-z][A-Za-z0-9+.-]*:", text
-    ):
-        raise ValueError(f"Scene contains a non-portable asset reference: {value!r}")
-    path = Path(text)
-    if any(
-        part in {"", ".", ".."}
-        or part.endswith(".")
-        or part.split(".", maxsplit=1)[0].upper() in WINDOWS_RESERVED_NAMES
-        for part in path.parts
-    ):
-        raise ValueError(f"Scene contains an unsafe asset reference: {value!r}")
-    return path
+    """Validate a portable scene resource using the shared path policy."""
+    try:
+        return Path(portable_relative_path(value.strip(), windows_names=True))
+    except ValueError as exc:
+        raise ValueError(
+            f"Scene contains a non-portable asset reference; unsafe asset reference: {value!r}"
+        ) from exc
 
 
 def scene_xml_references(path: Path) -> list[str]:
@@ -2225,12 +1982,9 @@ def build_benchmark_metadata(
         "environment_is_clean": scenario_key == "clean",
         "environment_is_cluttered": scenario_key == "cluttered",
         "evaluation_notes": {
-            "po_human_only": "Use amass_sequence.npz and an empty scene.",
-            "rt_with_environment": (
-                "Use benchmark_metadata.bundle_contents.environment_geometry.scene_path "
-                "when present; otherwise the bundle is self-contained for human-only "
-                "simulation and measured-ADC DSP validation."
-            ),
+            "po": "Use amass_sequence.npz; the PO solver ignores the scene.",
+            "rt": ENVIRONMENT_EVALUATION_NOTE,
+            "hybrid_po": ENVIRONMENT_EVALUATION_NOTE,
         },
         "motion": {
             "file": "amass_sequence.npz",
@@ -2309,9 +2063,7 @@ def write_frames_json(
         "source_radar_time_s": frame_mapping["source_radar_time_s"],
         "source_smpl_index": frame_mapping["source_smpl_index"],
         "source_smpl_time_s": frame_mapping["source_smpl_time_s"],
-        "pose_to_real_radar_time_offset_s": frame_mapping[
-            "pose_to_real_radar_time_offset_s"
-        ],
+        "pose_to_real_radar_time_offset_s": frame_mapping["pose_to_real_radar_time_offset_s"],
     }
     frames = {
         "frames": [
@@ -2361,10 +2113,8 @@ def write_sensor_json(
     ramp_end = float(params.get("chirp_ramp_end_time", 60.0e-6))
     idle = float(params.get("chirp_idle_time", 5.0e-6))
     chirp_ramp_time = samples / sample_rate
-    carrier = start_freq + (adc_start + chirp_ramp_time / 2.0) * slope
-    velocity_resolution = (3.0e8 / carrier) / (
-        2.0 * loops * (ramp_end + idle) * tx_count
-    )
+    carrier = start_freq + adc_start * slope
+    velocity_resolution = (3.0e8 / carrier) / (2.0 * loops * (ramp_end + idle) * tx_count)
 
     metadata = {
         "benchmark": benchmark_metadata,
@@ -2433,9 +2183,7 @@ def write_sensor_json(
         ),
     }
     metadata["amass_motion_timing"] = motion_timing
-    metadata["amass_motion_relative_times_s"] = [
-        float(value) for value in motion_times
-    ]
+    metadata["amass_motion_relative_times_s"] = [float(value) for value in motion_times]
     if scene_path is not None:
         metadata["scene_path"] = portable_provenance_path(
             scene_path,
@@ -2454,6 +2202,7 @@ def write_sensor_json(
         },
         "fmcw": {
             "carrier_frequency_hz": carrier,
+            "carrier_reference": "first_adc_sample",
             "start_frequency_hz": start_freq,
             "slope_hz_per_s": slope,
             "chirp_duration_s": ramp_end,
@@ -2464,7 +2213,7 @@ def write_sensor_json(
             "num_chirps_per_frame": loops,
             "frame_period_s": 0.1,
             "num_tx": tx_count,
-            "tdm_enabled": True,
+            "tx_schedule": "tdm",
         },
         "metadata": metadata,
     }
@@ -2528,16 +2277,12 @@ def prepare_environment_geometry(
             reconstruction.background_ply,
             bundle_dir,
         )
-        stats_destination = (
-            bundle_dir / "environment_geometry/reconstruction_stats.json"
-        )
+        stats_destination = bundle_dir / "environment_geometry/reconstruction_stats.json"
         shutil.copy2(reconstruction.stats_path, stats_destination)
         outputs.update(
             {
                 "geometry_source": "reconstructed_lidar_stereo",
-                "reconstruction_stats": (
-                    "environment_geometry/reconstruction_stats.json"
-                ),
+                "reconstruction_stats": ("environment_geometry/reconstruction_stats.json"),
                 "source_background_ply": reconstruction.background_ply.name,
             }
         )
@@ -2577,9 +2322,7 @@ def fit_background_environment(
     }
     missing = [name for name, output in expected.items() if not output.is_file()]
     if missing:
-        raise FileNotFoundError(
-            f"Environment fitting did not create expected outputs: {missing}"
-        )
+        raise FileNotFoundError(f"Environment fitting did not create expected outputs: {missing}")
     return {name: str(output) for name, output in expected.items()}
 
 
@@ -2591,10 +2334,8 @@ def find_background_lidar_cloud(
 ) -> Path | None:
     filename = f"{source_frame_id}_background_lidar_colored.ply"
     candidates = (
-        rtpose_root
-        / f"Data/sequences/{sequence}/map/background_reconstruction/{filename}",
-        rtpose_root
-        / f"Data/sequences/{sequence}/background_reconstruction/"
+        rtpose_root / f"Data/sequences/{sequence}/map/background_reconstruction/{filename}",
+        rtpose_root / f"Data/sequences/{sequence}/background_reconstruction/"
         f"frame{source_frame_id}/{filename}",
     )
     for candidate in candidates:

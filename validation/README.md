@@ -2,21 +2,29 @@
 
 `validation/` contains the real-radar validation harness. It loads a standard
 clip bundle, derives DSP maps from measured ADC, optionally runs simulator
-modes for the same clip, and writes comparable metrics, maps, and plots.
+solvers for the same clip, and writes comparable metrics, maps, and plots.
 
 Use this directory when the question is:
 
 - Does simulated ADC match a captured radar clip?
 - Do range-time or range-Doppler maps align with the measured data?
-- Does a PO, RT, or hybrid mobility mode perform better for a specific clip?
+- Does the PO, RT, or Hybrid PO solver perform better for a specific clip?
 
-Use `benchmarks/` instead for synthetic runtime and behavior benchmarks that do
-not compare against measured radar ADC.
+Use `benchmarks/` for synthetic runtime and behavior benchmarks. For configurable
+numerical/measurement sweeps and M4 Pro versus RTX 5090 timing, see the
+[6843AOP configuration study](../benchmarks/configuration_tradeoffs/README.md).
+It uses this runner and the existing simulation entry points. Run
+`mmwave-validation-benchmark study --config configs/benchmark_6843aop.json --plan`
+from the repository root, or use `tools/run_benchmark_study.py` without installing.
 
 Bundle construction, loading, and structural integrity are owned separately by
 `tools/bundle_prepare/`. The validation CLI runs the same complete integrity
 check as `mmwave-check-bundle` before scientific validation; the standalone
 command remains useful for checking a bundle without running metrics.
+
+The runner delegates channel selection, simulation/TDM, caching and DSP products
+to focused modules. See [code organization](../docs/code_organization.md) for
+their import paths and compatibility aliases.
 
 ## Universal Bundle Contract
 
@@ -28,7 +36,7 @@ names are provenance metadata, not dispatch keys. New datasets do not require
 changes to the validation runner.
 
 The normative, versioned public contract is
-[HERMES Bundle v1](BUNDLE_SPEC.md). It defines one `hermes` profile for measured
+[HERMES Bundle contract](BUNDLE_SPEC.md). It defines one `hermes` profile for measured
 and simulated ADC artifacts, parameterized or evaluated motion, target
 geometry, scene metadata, manifests, and diagnostics. Machine-readable JSON
 Schemas for the bundle sidecars live under [`validation/schema/`](schema/).
@@ -73,74 +81,42 @@ SMPL model. The RT-Pose example includes synchronized
 stereo setup images with opaque face masks; the mmRadPose source has no
 camera image. See each fixture's `NOTICE.md` before redistribution.
 
-## Human-Measurement Clip Layout
+## Bundle resources
 
-A validation clip is a directory containing:
+Follow the normative [bundle specification](BUNDLE_SPEC.md) for the descriptor,
+sensor, ADC axes, scene assets, timing, coordinate/phase conventions, and
+optional static or moving targets. Motion is optional: static targets and
+evaluated motion do not require SMPL. Parameterized human motion requires a
+separately licensed model when meshes are evaluated.
 
-- `sensor.json`
-- `radar_adc.npz`
-- `frames.json`
-- `amass_sequence.npz`
-- optional `background_adc.npz`
-- optional `environment.json`
-- optional `benchmark_metadata.json`
-- optional `bundle_summary.json`
-
-Required array shapes:
-
-- `radar_adc.npz`: `adc [frames, chirps, adc_samples, virtual_channels]`
-- optional `radar_adc.npz/times`: `[frames, chirps]`
-- optional `background_adc.npz/adc`: `[F,M,N,C]`, `[M,N,C]`, or `[1,M,N,C]`
-
-`amass_sequence.npz` is the required and only body-motion source. Its required
-pickle-free arrays are:
-
-- finite `poses [T,3*K]`, with `T > 0`;
-- finite `trans [T,3]`;
-- finite `betas [B]`, with `B >= 10`;
-- strictly increasing finite source `times [T]`; and
-- integer base-SMPL `faces [F,3]`, with indices in `[0,6890)`.
-
-When `bundle_times [T]` is present, it must also be strictly increasing and is
-the timeline used by bundle loading, simulation, and `frames.json`. Otherwise,
-`times` is used. Reference-adapter outputs additionally retain `gender`,
-`model_type`, `mocap_framerate`, frame IDs, coordinate convention, output
-transform, selected-frame, and source-provenance fields. RT-Pose prepared
-bundles also include:
-
-- `source_capture_times [T]`: absolute source capture times;
-- `bundle_times [T]`: motion times relative to the selected radar frame at
-  `t=0`, used by validation and simulation;
-- `radar_frame_ids [T]` and `radar_capture_times [T]`; and
-- source indices, selected-frame identifiers, topology, and output-transform
-  metadata.
-
-These values are sliced directly from the selected source segment without
-refitting. Meshes are generated from them and a separately licensed SMPL model
-when simulation is run. `amass_sequence.npz` is the only accepted body-motion
-archive; baked mesh files and alternate parameter filenames are not loaded.
-
-`sensor.json` must define the board model and FMCW settings. It can use
-`board_model` or `hardware_model`, and either an explicit `fmcw` object or a
-known board `fmcw_profile`/`profile`. The optional boolean
-`fmcw.tdm_enabled` defaults to false and is the canonical declaration that
-the channelized ADC stores per-transmitter TDM slow-time samples.
-
-`frames.json` can be a list of frame records or `{"frames": [...]}`. Its length
-must match the ADC frame count. Every record must include finite
-`motion_time_s` within the selected AMASS timeline and may include source frame
-IDs and metadata. Bundle or benchmark indices must be contiguous from zero.
-Simulation anchors every radar frame at its explicit `motion_time_s` and adds
-the physical chirp offset within that frame. The AMASS window must therefore
-extend through the final chirp of every selected radar acquisition; validation
-rejects a motion window that would otherwise be clamped at its endpoint.
-
-`environment.json` can provide `scene_path`; the runner uses it when simulation
-runs and `--scene` is not supplied. `environment_mesh_sequence`, when present,
-is optional static scene geometry; it is not a body-motion alternative to
-`amass_sequence.npz`.
+Use `mmwave-prepare-bundle --config prepare.json` to package normalized inputs.
+The [measurement tutorial](../tools/bundle_prepare/BRING_YOUR_OWN.md) includes
+an installed, redistributable synthetic static-target example and the measured
+conformance milestone. Check directories or ZIPs with
+`mmwave-check-bundle PATH --all-errors --json`; add `--diagnose OUTPUT_DIR`
+for warning-only capture plots. The validation CLI's `--clip` argument accepts
+either a bundle directory or a ZIP file.
 
 ## Run Validation
+
+Run simulation and compare it with the measurements directly from a ZIP:
+
+```bash
+mmwave-validation-benchmark \
+  --clip /path/to/capture-bundle.zip \
+  --solvers po hybrid_po \
+  --suite dsp_maps \
+  --out /path/to/validation-results \
+  --progress
+```
+
+Without `--simulated-adc`, the runner generates ADC using the bundled sensor,
+scene, target geometry or motion, and target material, then compares it with
+the primary measured ADC. Outputs include `metrics.json`, `maps.npz`, simulated
+ADC caches and comparison plots. ZIP resources are extracted to a temporary
+directory for the run and removed afterwards; the source ZIP is unchanged.
+In `metrics.json`, bundled scene paths use `capture-bundle.zip!/path/in/bundle`
+to identify the scene without referring to the temporary directory.
 
 Write outputs to a temporary directory:
 
@@ -153,15 +129,16 @@ python -m validation.cli \
   --out "$OUT_DIR"
 ```
 
-The default simulation modes are `human_only_po` and `rt_coherent_bank`. To run
-specific modes:
+The default solvers are `po` and `rt`. To run specific solvers, here PO and
+an RT that retraces every chirp:
 
 ```bash
 python -m validation.cli \
   --clip /path/to/clip_bundle \
   --suite dsp_maps \
   --out "$OUT_DIR" \
-  --mobility-mode human_only_po rt_retrace
+  --solvers po rt \
+  --rt-refresh-frames 0
 ```
 
 To validate a precomputed simulation cube without running simulation:
@@ -193,28 +170,36 @@ python -m validation.cli \
 - `dsp_maps`: full default suite, including range-time, range-Doppler,
   pose-range metadata, and angle-map diagnostics when possible.
 
-## Simulation Modes
+## Solvers
 
-Supported `--mobility-mode` values are:
+Supported `--solvers` values are the solver names shared by every HERMES entry
+point:
 
-- `human_only_po`
-- `rt_retrace`
-- `rt_coherent_bank`
-- `hybrid_static_env_po`
+- `po`: physical optics on the human only; the room and human-room coupling
+  are ignored.
+- `rt`: ray tracing of the whole scene. `--rt-refresh-frames N` retraces at the
+  start of every N radar frames and phase-updates the traced paths in between;
+  `0` retraces every chirp. The default is 1.
+- `hybrid_po`: RT for the static room and PO for the human, with body blocking
+  and human-room coupling.
 
-When more than one mode is selected, the runner writes per-mode comparisons and
-uses a primary simulation label for top-level summary fields.
+When more than one solver is selected, the runner writes per-solver comparisons
+and uses a primary simulation label for top-level summary fields.
 
 ### Hybrid PO Calibration
 
-Validation enables RT-reference calibration for `hybrid_static_env_po` by
-default. The default `--hybrid-po-calibration rt_first_pose` runs a full-scene
+Validation enables RT-reference calibration for `hybrid_po` by default. The
+default `--hybrid-calibration rt_first_pose` runs a full-scene
 RT baseline for the first frame, extracts its single-human-only reference, and
-fits an amplitude gain between that reference and the direct-human PO ADC. The
-gain is applied to direct-human PO and to both human-environment coupling
-orders; the static-environment RT component is not rescaled. Calibration fits
-ADC RMS power and therefore does not require individual range-profile peaks to
-be identical.
+fits one amplitude gain between that reference and the direct-human PO ADC.
+Power is averaged across all chirps, virtual channels, and ADC samples of the
+first simulated radar frame: `gain = sqrt(P_rt_human / P_po_human)`. This is
+first-frame averaging, rather than a fit using only the first chirp. The same
+gain is reused for every frame and chirp, scaling direct-human PO and both
+human-environment coupling orders; the static-environment RT component is not
+rescaled. The fit excludes static-room and coupling returns and is not repeated
+on later chirps. Calibration uses ADC RMS power and therefore does not require
+individual range-profile peaks to be identical.
 
 This calibration gain is separate from the radar antenna pattern. Direct-human
 PO and RT paths use the configured hardware gain and pattern. The experimental
@@ -226,7 +211,8 @@ are combined monostatic Tx/Rx cuts.
 The available policies are:
 
 - `rt_first_pose` (default): fit one amplitude gain from the first-frame RT
-  baseline.
+  and human-only PO ADC powers, averaged over the whole frame and reused for
+  the entire run.
 - `rt_sequence`: fit from selected RT/PO path-power samples across the
   available sequence.
 - `none`: skip the RT calibration baseline and leave PO gain at unity.
@@ -239,15 +225,16 @@ changing it rebuilds an incompatible cached hybrid cube.
 
 ## Channel Selection
 
-Use 1-based TX/RX selectors to validate a subarray while preserving channel
-ordering from the source ADC:
+Use the zero-based TX/RX selectors `--tx-indices` and `--rx-indices` to
+validate a subarray while preserving channel ordering from the source ADC.
+Index `i` is the physical label `TX(i+1)` or `RX(i+1)`:
 
 ```bash
 python -m validation.cli \
   --clip /path/to/clip_bundle \
   --out "$OUT_DIR" \
-  --subarray-tx 1-3 \
-  --subarray-rx 1,2,3,4
+  --tx-indices 0-2 \
+  --rx-indices 0,1,2,3
 ```
 
 Prepared RT-Pose bundles normalize the source MIMO receiver permutation to
@@ -257,11 +244,11 @@ physical `RX1..RX16` order. A compact horizontal cascade selection is:
 python -m validation.cli \
   --clip /path/to/prepared_rtpose_bundle \
   --out "$OUT_DIR" \
-  --subarray-tx 1-3,10 \
-  --subarray-rx 5-12
+  --tx-indices 0-2,9 \
+  --rx-indices 4-11
 ```
 
-These are physical antenna labels. RT-Pose's RX labels are not spatially
+This selects the physical labels TX1-TX3 and TX10 and RX5-RX12. RT-Pose's RX labels are not spatially
 ordered; the selected RX set becomes `9,10,11,12,5,6,7,8` when sorted by
 horizontal position and has half-wavelength spacing. The selected TX set has
 half-wavelength horizontal projections but differing elevations. The runner
@@ -281,12 +268,12 @@ The two policies are:
 
 | Behavior | Default (without the flag) | With `--ignore-tdm-timing` |
 |---|---|---|
-| Simulator calls per mobility mode | One per selected physical TX | One total |
+| Simulator calls per solver | One per selected physical TX | One total |
 | Mesh timestamp | `t_frame[f] + (m*N_TX + s)*T_chirp` | `t_frame[f] + m*N_TX*T_chirp` for every selected TX |
 | Mesh update | Vertices are sampled/interpolated separately at every selected slot time; triangle indices stay fixed | Vertices are sampled/interpolated once per loop; every selected TX sees the same pose |
 | Simulated hardware | One selected TX and the complete physical RX array per call; only requested RX outputs are retained | All selected TX and only selected RX elements in one sensor |
-| Human-only PO | A separate PO sequence per selected TX; the PO surface term uses that TX and the full-RX phase center, followed by per-RX phase, spreading, delay, and hardware corrections | One PO sequence; the PO surface term uses the mean selected-TX and mean selected-RX phase centers, followed by per-virtual-channel phase, spreading, delay, and hardware corrections |
-| Coherent RT | A separate multi-RX path bank per selected TX; the configured retrace/update policy runs independently for each slot | One joint selected-TX/selected-RX path bank; the same retrace/update policy runs once for the joint bank |
+| PO | A separate PO sequence per selected TX; the PO surface term uses that TX and the full-RX phase center, followed by per-RX phase, spreading, delay, and hardware corrections | One PO sequence; the PO surface term uses the mean selected-TX and mean selected-RX phase centers, followed by per-virtual-channel phase, spreading, delay, and hardware corrections |
+| RT | A separate multi-RX path bank per selected TX; the configured retrace/update cadence runs independently for each slot | One joint selected-TX/selected-RX path bank; the same retrace/update cadence runs once for the joint bank |
 | Hybrid PO calibration | Each selected-TX hybrid invocation fits its own RT-reference gain for that slot sensor | The one joint hybrid invocation fits one gain for the selected TX/RX sensor |
 | Slow-time/Doppler PRI | Full source TDM-cycle interval, `N_TX*T_chirp` | The same full-cycle interval; it is not shortened to the selected-TX count |
 | Output channel order | Reassembled in the measured ADC's source order | Reordered to the same measured ADC source order |
@@ -299,11 +286,11 @@ free-space spreading, and beat delay. The flag changes which antennas share
 the common PO phase-center evaluation as shown in the table; it does not merely
 remove a phase factor after a default TDM run.
 
-For `rt_coherent_bank`, "one run" does not mean one slow-time calculation. The
-joint path bank is still updated at every chirp loop, and retracing follows the
-normal configuration. With the default one-frame retrace schedule, a one-frame
-clip normally has one joint trace followed by coherent updates across all 64
-loops. `rt_retrace` likewise retains its own retrace policy.
+For `rt`, "one run" does not mean one slow-time calculation. The joint path
+bank is still updated at every chirp loop, and retracing follows
+`--rt-refresh-frames`. With the default one-frame cadence, a one-frame clip
+normally has one joint trace followed by coherent updates across all 64 loops;
+with `--rt-refresh-frames 0` every loop is retraced.
 
 For the RT-Pose profile (`N_TX=12`, `T_chirp=65 us`), both policies retain a
 `780 us` slow-time interval. Without the flag, the bundled reverse schedule
@@ -318,8 +305,8 @@ To select the simultaneous approximation:
 python -m validation.cli \
   --clip /path/to/prepared_rtpose_bundle \
   --out "$OUT_DIR" \
-  --subarray-tx 1-3,10 \
-  --subarray-rx 1-4 \
+  --tx-indices 0-2,9 \
+  --rx-indices 0-3 \
   --ignore-tdm-timing
 ```
 
@@ -327,6 +314,17 @@ The timing policy is included in `metrics.json` and the simulated-ADC cache
 fingerprint. Switching the flag while reusing an output directory invalidates
 and rebuilds `simulated_adc_<label>.npz`; the two variants do not coexist under
 different filenames.
+
+The core simulator supports consecutive slots in local hardware TX order.
+Passing `bundle.sensor()` directly to it with omitted or reordered slots now
+raises an actionable error. Use this bundle-aware validation runner for those
+schedules; its per-slot path preserves physical TX identity and acquisition time.
+
+Simulation caches use bundle-relative resource names and content hashes, so
+running the same ZIP again with the same output directory reuses the cache
+despite a different temporary extraction directory. Changing scene dependencies,
+motion, sensor settings, model files, or solver controls invalidates the cache.
+Older cache-schema versions are rebuilt once after this update.
 
 ## Outputs
 
@@ -338,13 +336,12 @@ The runner writes:
 - `subarray_adc.npz`: selected ADC channels when subarray selection is active.
 - PNG diagnostic plots unless `--no-plots` is passed.
 
-Plot filenames contain every simulated mobility mode in command-line order.
-For example, `--mobility-mode human_only_po rt_retrace` writes
-`range_time_real_vs_human_only_po_vs_rt_retrace.png` and corresponding
-range-profile, range-Doppler, and angle-FFT files. Panel titles and range-profile
-legend entries use the same complete mobility-mode names. A user-supplied
-`--simulated-adc` retains the shorter `real_vs_sim` filename convention because
-no simulator mobility mode was run.
+Plot filenames contain every simulated solver in command-line order. For
+example, `--solvers po rt` writes `range_time_real_vs_po_vs_rt.png` and
+corresponding range-profile, range-Doppler, and angle-FFT files. Panel titles
+and range-profile legend entries use the solver labels (PO, RT, Hybrid PO). A
+user-supplied `--simulated-adc` retains the shorter `real_vs_sim` filename
+convention because no solver was run.
 
 Primary metrics include normalized correlation, peak range error, and energy
 ratios inside the mesh-derived range gate.
@@ -367,9 +364,12 @@ scenario-specific acceptance thresholds on held-out frames.
   `mean` subtracts the per-range-bin/channel slow-time mean after range FFT;
   `none` leaves DSP maps unchanged.
 - `--scene /path/to/scene.xml`: override the clip environment scene.
-- `--no-diffuse-reflection`: disable diffuse reflection for generated RT.
-- `--human-specular-reflection`: enable human specular reflection.
-- `--hybrid-po-calibration none|rt_first_pose|rt_sequence`: select the
-  RT-reference PO calibration used by `hybrid_static_env_po`; the default is
+- `--rt-refresh-frames N`: RT retrace cadence in radar frames; `0` retraces
+  every chirp.
+- `--no-rt-diffuse-reflection`: disable RT diffuse reflection.
+- `--rt-refraction`: enable RT refraction.
+- `--rt-human-specular-reflection`: enable RT specular reflection on the human.
+- `--hybrid-calibration none|rt_first_pose|rt_sequence`: select the
+  RT-reference PO calibration used by `hybrid_po`; the default is
   `rt_first_pose`.
 - `--no-plots`: skip PNG output for faster CI-style runs.

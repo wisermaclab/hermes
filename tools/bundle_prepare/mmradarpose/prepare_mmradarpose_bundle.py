@@ -26,13 +26,25 @@ import zipfile
 
 import numpy as np
 
-
 REPO_ROOT = Path(__file__).resolve().parents[3]
 SRC_PATH = REPO_ROOT / "src"
 TOOL_ROOT = Path(__file__).resolve().parent
-for source_root in (Path(__file__).resolve().parents[1], TOOL_ROOT):
+for source_root in (SRC_PATH, REPO_ROOT / "tools", TOOL_ROOT):
     if str(source_root) not in sys.path:
         sys.path.insert(0, str(source_root))
+
+from bundle_prepare.adapters import (
+    ArrayArchive,
+    load_array_archive,
+    frame_id,
+    resolve_user_path,
+    resolve_output_root as _resolve_output_root,
+    publish_staged_bundle as _publish_staged_bundle,
+    validate_smpl_arrays,
+    scalar_archive_text,
+    check_bundle_output_integrity,
+    adapter_main,
+)
 
 from mmradarpose_environment import (
     environment_payload,
@@ -42,9 +54,12 @@ from mmradarpose_environment import (
 
 MMRADARPOSE_ROOT_ENV_VAR = "MMRADARPOSE_ROOT"
 SMPL_MODEL_DIR_ENV_VAR = "MMWAVE_SMPL_MODEL_DIR"
-DEFAULT_OUTPUT_ROOT = (
-    Path(tempfile.gettempdir()) / "hermes-validation-bundles" / "mmradarpose"
+# How the RT and Hybrid PO solvers should use this bundle's environment.
+ENVIRONMENT_EVALUATION_NOTE = (
+    "Use the packaged environment.json when present; otherwise the bundle "
+    "contains no separately selected environment sidecar."
 )
+DEFAULT_OUTPUT_ROOT = Path(tempfile.gettempdir()) / "hermes-validation-bundles" / "mmradarpose"
 TRIAL_PATTERN = re.compile(
     r"p(?P<participant>\d+)_an(?P<angle>\d+)_ac(?P<activity>\d+)_r(?P<recording>\d+)"
 )
@@ -81,9 +96,8 @@ AMASS_TIMING_FIELDS = {
     "source_capture_times": "Absolute source capture times in seconds.",
     "bundle_times": "Times relative to the selected radar frame, which is t=0.",
 }
-MMRADARPOSE_CHIRP_REPETITION_TIME_S = (
-    MMRADARPOSE_MEASUREMENT_DURATION_S
-    / (MMRADARPOSE_SLOW_TIME_LOOPS * MMRADARPOSE_NUM_TX)
+MMRADARPOSE_CHIRP_REPETITION_TIME_S = MMRADARPOSE_MEASUREMENT_DURATION_S / (
+    MMRADARPOSE_SLOW_TIME_LOOPS * MMRADARPOSE_NUM_TX
 )
 # Base-SMPL is evaluated internally in its native +Y-up/+Z-forward frame.
 # AMASS archives rotate that world to +Z-up/-Y-forward before serialization.
@@ -95,9 +109,7 @@ Y_UP_TO_AMASS_WORLD = np.asarray(
     ],
     dtype=np.float64,
 )
-MMRADARPOSE_SLOPE_HZ_PER_S = (
-    MMRADARPOSE_BANDWIDTH_HZ / MMRADARPOSE_CHIRP_DURATION_S
-)
+MMRADARPOSE_SLOPE_HZ_PER_S = MMRADARPOSE_BANDWIDTH_HZ / MMRADARPOSE_CHIRP_DURATION_S
 IWR6843AOP_TX_MAJOR_VIRTUAL_CHANNELS = [
     {
         "channel": int(index),
@@ -124,14 +136,6 @@ IWR6843AOP_TX_MAJOR_VIRTUAL_CHANNELS = [
         )
     )
 ]
-
-
-class ArrayArchive(dict[str, np.ndarray]):
-    """In-memory, pickle-free replacement for a NumPy ``NpzFile``."""
-
-    @property
-    def files(self) -> tuple[str, ...]:
-        return tuple(self)
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -216,28 +220,12 @@ def trial_parts(trial: str) -> dict[str, int]:
     return {name: int(value) for name, value in match.groupdict().items()}
 
 
-def frame_id(frame: int | str) -> str:
-    text = str(frame).strip()
-    if text.lower().startswith("frame"):
-        text = text[5:]
-    if not text.isdecimal():
-        raise ValueError(f"Invalid frame {frame!r}; expected a non-negative integer")
-    return f"{int(text):06d}"
-
-
 def frame_name(frame: int | str) -> str:
     return f"frame{int(frame_id(frame)):04d}"
 
 
-def resolve_user_path(path: Path) -> Path:
-    out = path.expanduser()
-    return out.resolve() if out.is_absolute() else (Path.cwd() / out).resolve()
-
-
 def resolve_output_root(trial: str, output_root: Path | None) -> Path:
-    if output_root is not None:
-        return resolve_user_path(output_root)
-    return (DEFAULT_OUTPUT_ROOT / trial / "bundles").resolve()
+    return _resolve_output_root(trial, output_root, default_root=DEFAULT_OUTPUT_ROOT)
 
 
 def _is_relative_to(path: Path, root: Path) -> bool:
@@ -358,11 +346,9 @@ def build_benchmark_metadata(
         "source": source_label,
         "note": note,
         "evaluation_notes": {
-            "po_human_only": "Use amass_sequence.npz and an empty scene.",
-            "rt_with_environment": (
-                "Use the packaged environment.json when present; otherwise the bundle "
-                "contains no separately selected environment sidecar."
-            ),
+            "po": "Use amass_sequence.npz; the PO solver ignores the scene.",
+            "rt": ENVIRONMENT_EVALUATION_NOTE,
+            "hybrid_po": ENVIRONMENT_EVALUATION_NOTE,
         },
         "motion": {
             "file": "amass_sequence.npz",
@@ -418,97 +404,19 @@ def _path_exists(path: Path) -> bool:
 
 
 def publish_staged_bundle(
-    staging: Path,
-    bundle_dir: Path,
-    *,
-    force: bool,
-    trial: str,
-    frame: str,
+    staging: Path, bundle_dir: Path, *, force: bool, trial: str, frame: str
 ) -> None:
-    """Publish ``staging`` without losing a prior owned bundle on failure.
-
-    An empty destination placeholder closes the final check-to-rename window.
-    When replacing an owned bundle, the old directory is retained as a backup
-    until the staged bundle has been published successfully.
-    """
-
-    backup_container: Path | None = None
-    backup: Path | None = None
-    try:
-        try:
-            bundle_dir.mkdir()
-        except FileExistsError:
-            if not force:
-                raise FileExistsError(
-                    f"{bundle_dir} appeared while preparing the bundle; pass --force to replace it"
-                )
-            if not _replaceable_output(bundle_dir, trial=trial, frame=frame):
-                raise ValueError(
-                    f"Refusing to replace directory not owned by this tool: {bundle_dir}"
-                )
-            backup_container = Path(
-                tempfile.mkdtemp(prefix=f".{bundle_dir.name}.backup.", dir=bundle_dir.parent)
-            )
-            backup = backup_container / "previous"
-            os.replace(bundle_dir, backup)
-            if not _replaceable_output(backup, trial=trial, frame=frame):
-                os.replace(backup, bundle_dir)
-                raise ValueError(
-                    f"Refusing to replace directory not owned by this tool: {bundle_dir}"
-                )
-            try:
-                bundle_dir.mkdir()
-            except BaseException:
-                if not _path_exists(bundle_dir):
-                    os.replace(backup, bundle_dir)
-                raise
-
-        try:
-            os.replace(staging, bundle_dir)
-        except BaseException:
-            try:
-                bundle_dir.rmdir()
-            except OSError:
-                pass
-            if backup is not None and _path_exists(backup) and not _path_exists(bundle_dir):
-                os.replace(backup, bundle_dir)
-            raise
-
-        if backup is not None and _path_exists(backup):
-            shutil.rmtree(backup)
-    finally:
-        if backup_container is not None and backup_container.exists():
-            try:
-                backup_container.rmdir()
-            except OSError:
-                # Preserve an old bundle that could not be restored rather than
-                # deleting the only remaining copy during cleanup.
-                pass
+    _publish_staged_bundle(
+        staging,
+        bundle_dir,
+        force=force,
+        ownership_check=_replaceable_output,
+        trial=trial,
+        frame=frame,
+    )
 
 
-def load_array_archive(path: Path) -> ArrayArchive:
-    """Load every NPZ member without permitting executable pickle payloads."""
-
-    loaded = np.load(path, allow_pickle=False)
-    if not isinstance(loaded, np.lib.npyio.NpzFile):
-        raise ValueError(f"Expected a NumPy .npz archive: {path}")
-    with loaded:
-        return ArrayArchive(
-            (name, np.array(loaded[name], copy=True)) for name in loaded.files
-        )
-
-
-def _scalar_archive_text(data: Mapping[str, np.ndarray], name: str) -> str:
-    value = np.asarray(data[name])
-    if value.ndim != 0 or value.dtype.kind not in {"S", "U"}:
-        raise ValueError(f"SMPL {name} must be a scalar string")
-    item = value.item()
-    if isinstance(item, bytes):
-        try:
-            return item.decode("utf-8")
-        except UnicodeDecodeError as exc:
-            raise ValueError(f"SMPL {name} must be valid UTF-8") from exc
-    return str(item)
+_scalar_archive_text = scalar_archive_text
 
 
 def validate_smpl_sequence(
@@ -518,63 +426,13 @@ def validate_smpl_sequence(
 ) -> None:
     """Validate the pose-only AMASS-like handoff used by this adapter."""
 
-    missing = [
-        name
-        for name in (
-            "poses",
-            "trans",
-            "betas",
-            "gender",
-            "world_up_axis",
-            "world_forward_axis",
-        )
-        if name not in data
-    ]
-    if missing:
-        raise ValueError(f"SMPL archive is missing required fields: {missing}")
-    poses = np.asarray(data["poses"])
-    translations = np.asarray(data["trans"])
-    betas = np.asarray(data["betas"])
-    if poses.ndim != 2 or poses.shape[0] == 0 or poses.shape[1] != 72:
-        raise ValueError("SMPL poses must have shape (T, 72) with T > 0")
-    if translations.shape != (poses.shape[0], 3):
-        raise ValueError("SMPL trans must have shape (T, 3) matching poses")
-    if betas.shape != (10,):
-        raise ValueError("SMPL betas must have shape (10,)")
-    for name, values in (("poses", poses), ("trans", translations), ("betas", betas)):
-        if values.dtype.kind not in {"i", "u", "f"} or not np.all(np.isfinite(values)):
-            raise ValueError(f"SMPL {name} must contain only finite real values")
-        with np.errstate(over="ignore", invalid="ignore"):
-            narrowed = np.asarray(values, dtype=np.float32)
-        if not np.all(np.isfinite(narrowed)):
-            raise ValueError(f"SMPL {name} values must be representable as float32")
-    if _scalar_archive_text(data, "gender").strip().lower() not in {
-        "neutral",
-        "male",
-        "female",
-    }:
-        raise ValueError("SMPL gender must be neutral, male, or female")
-    world_up = _scalar_archive_text(data, "world_up_axis").strip().lower()
-    world_forward = _scalar_archive_text(data, "world_forward_axis").strip().lower()
-    if (world_up, world_forward) != ("z", "-y"):
-        raise ValueError(
-            "SMPL archive must use canonical AMASS world axes: "
-            "world_up_axis='z' and world_forward_axis='-y'"
-        )
-    if "profile" in data:
-        profile = _scalar_archive_text(data, "profile").strip().lower()
-        if profile and profile != "mmradarpose":
-            raise ValueError(
-                f"SMPL archive profile must be mmradarpose, got {profile!r}"
-            )
+    validate_smpl_arrays(data, profile="mmradarpose")
     if "source_sequence_id" in data:
         sequence = _scalar_archive_text(data, "source_sequence_id").strip()
         if sequence and sequence != expected_trial:
             raise ValueError(
                 f"SMPL source sequence {sequence!r} does not match trial {expected_trial!r}"
             )
-    if "model_type" in data and _scalar_archive_text(data, "model_type").lower() != "smpl":
-        raise ValueError("SMPL model_type must be 'smpl'")
     pose_frame_ids(data)
     pose_times(data)
 
@@ -663,12 +521,8 @@ def direct_input_paths(
     args: argparse.Namespace,
 ) -> dict[str, Path]:
     return {
-        "radar_npz": (
-            dataset_dir / "radar" / f"data_cube_parsed_{trial}.npz"
-        ).resolve(),
-        "alignment_json": (
-            dataset_dir / "radar_to_smpl_alignment_inferred.json"
-        ).resolve(),
+        "radar_npz": (dataset_dir / "radar" / f"data_cube_parsed_{trial}.npz").resolve(),
+        "alignment_json": (dataset_dir / "radar_to_smpl_alignment_inferred.json").resolve(),
         "amass_npz": resolve_user_path(args.amass_npz),
         "smpl_model_dir": resolve_user_path(args.smpl_model_dir),
     }
@@ -707,9 +561,7 @@ def load_mmradarpose_frame(
                     raise ValueError("mmRadarPose radar cube must use C-contiguous NPY storage")
                 candidate = (info, shape, dtype)
         if candidate is None:
-            raise ValueError(
-                f"{path} must contain exactly one radar cube shaped (T,4,4,S,L)"
-            )
+            raise ValueError(f"{path} must contain exactly one radar cube shaped (T,4,4,S,L)")
         info, source_shape, dtype = candidate
         expected_tail = (
             4,
@@ -760,7 +612,12 @@ def _read_npy_header(
         shape, fortran_order, dtype = np.lib.format.read_array_header_2_0(stream)
     else:
         raise ValueError(f"Unsupported NPY version {version}")
-    return tuple(int(value) for value in shape), bool(fortran_order), np.dtype(dtype), stream.tell()
+    return (
+        tuple(int(value) for value in shape),
+        bool(fortran_order),
+        np.dtype(dtype),
+        stream.tell(),
+    )
 
 
 def export_mmradarpose_adc(cube_frame: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
@@ -861,12 +718,12 @@ def load_alignment(
     signs = radar_from_amass[np.arange(3), axes]
     signed_permutation = np.zeros((3, 3), dtype=np.float64)
     signed_permutation[np.arange(3), axes] = signs
-    if sorted(axes.tolist()) != [0, 1, 2] or not np.allclose(
-        radar_from_amass, signed_permutation, atol=1e-6
-    ) or not np.allclose(np.abs(signs), 1.0, atol=1e-6):
-        raise ValueError(
-            "radar-to-AMASS rotation must invert to an axis permutation with signs"
-        )
+    if (
+        sorted(axes.tolist()) != [0, 1, 2]
+        or not np.allclose(radar_from_amass, signed_permutation, atol=1e-6)
+        or not np.allclose(np.abs(signs), 1.0, atol=1e-6)
+    ):
+        raise ValueError("radar-to-AMASS rotation must invert to an axis permutation with signs")
     metadata: dict[str, Any] = {
         key: value
         for key, value in payload.items()
@@ -897,19 +754,22 @@ def build_direct_center_mesh(
 ) -> tuple[np.ndarray, np.ndarray]:
     from mmWaveRadar.targets.smpl import amass_to_mesh_npz
 
-    adjusted_translation = (
-        np.asarray(smpl_data["trans"][center_index : center_index + 1], dtype=np.float32)
-        - np.asarray(translation, dtype=np.float32)
-    )
+    adjusted_translation = np.asarray(
+        smpl_data["trans"][center_index : center_index + 1], dtype=np.float32
+    ) - np.asarray(translation, dtype=np.float32)
     with tempfile.TemporaryDirectory(prefix="mmradarpose_bundle_") as tmp:
         subset = Path(tmp) / "center_smpl.npz"
         np.savez(
             subset,
-            poses=np.asarray(smpl_data["poses"][center_index : center_index + 1], dtype=np.float32),
+            poses=np.asarray(
+                smpl_data["poses"][center_index : center_index + 1], dtype=np.float32
+            ),
             trans=adjusted_translation,
             betas=np.asarray(smpl_data["betas"], dtype=np.float32),
             gender=smpl_data["gender"],
-            mocap_framerate=np.asarray(smpl_data.get("mocap_framerate", MMRADARPOSE_FRAME_RATE_HZ)),
+            mocap_framerate=np.asarray(
+                smpl_data.get("mocap_framerate", MMRADARPOSE_FRAME_RATE_HZ)
+            ),
             source_amass_npz=np.asarray(amass_npz.name),
         )
         faces, vertices, _ = amass_to_mesh_npz(
@@ -917,9 +777,7 @@ def build_direct_center_mesh(
             str(smpl_model_dir),
             out_npz_path=None,
         )
-    vertices = (
-        np.asarray(vertices, dtype=np.float32)[..., output_axes] * output_signs
-    )
+    vertices = np.asarray(vertices, dtype=np.float32)[..., output_axes] * output_signs
     from mmWaveRadar.targets.mesh import ensure_outward_face_winding
 
     faces = ensure_outward_face_winding(vertices, np.asarray(faces, dtype=np.uint32))
@@ -1065,6 +923,8 @@ def write_direct_sensor_json(
             },
             "fmcw": {
                 "carrier_frequency_hz": MMRADARPOSE_CARRIER_FREQUENCY_HZ,
+                "carrier_reference": "first_adc_sample",
+                "carrier_frequency_status": "nominal_first_sample_assumption; source ADC start delay unavailable",
                 "bandwidth_hz": MMRADARPOSE_BANDWIDTH_HZ,
                 "slope_hz_per_s": MMRADARPOSE_SLOPE_HZ_PER_S,
                 "chirp_duration_s": MMRADARPOSE_CHIRP_DURATION_S,
@@ -1074,7 +934,7 @@ def write_direct_sensor_json(
                 "num_chirps_per_frame": MMRADARPOSE_SLOW_TIME_LOOPS,
                 "frame_period_s": 1.0 / MMRADARPOSE_FRAME_RATE_HZ,
                 "num_tx": MMRADARPOSE_NUM_TX,
-                "tdm_enabled": True,
+                "tx_schedule": "tdm",
                 "physical_num_tx": MMRADARPOSE_NUM_TX,
                 "num_rx": MMRADARPOSE_NUM_RX,
                 "exported_virtual_channels": int(adc_shape[3]),
@@ -1129,22 +989,12 @@ def write_direct_frames_json(
     )
 
 
-def check_bundle_output_integrity(bundle_dir: Path) -> dict[str, Any]:
-    for path in (SRC_PATH, REPO_ROOT / "tools"):
-        if str(path) not in sys.path:
-            sys.path.insert(0, str(path))
-    from bundle_prepare.integrity import check_bundle_integrity
-
-    report = check_bundle_integrity(bundle_dir)
-    return {
-        "valid": bool(report["valid"]),
-        "radar_adc_shape": report["primary_adc_artifact"]["shape"],
-        "amass_poses_shape": report["amass_sequence"]["poses_shape"],
-        "frame_count": report["frames"]["count"],
-    }
-
-
 def _prepare_direct_bundle(args: argparse.Namespace) -> dict[str, Any]:
+    tools_path = str(REPO_ROOT / "tools")
+    if tools_path not in sys.path:
+        sys.path.insert(0, tools_path)
+    from bundle_prepare.contract import make_bundle_descriptor
+
     trial = str(args.trial).strip()
     parts = trial_parts(trial)
     radar_frame = frame_id(args.frame)
@@ -1180,9 +1030,7 @@ def _prepare_direct_bundle(args: argparse.Namespace) -> dict[str, Any]:
     if missing:
         raise FileNotFoundError(f"Missing mmRadarPose bundle inputs: {missing}")
     if not paths["smpl_model_dir"].is_dir():
-        raise FileNotFoundError(
-            f"SMPL model directory was not found: {paths['smpl_model_dir']}"
-        )
+        raise FileNotFoundError(f"SMPL model directory was not found: {paths['smpl_model_dir']}")
     if bundle_dir.exists() and not args.force:
         raise FileExistsError(f"{bundle_dir} exists; pass --force to replace it")
     if (bundle_dir.exists() or bundle_dir.is_symlink()) and not _replaceable_output(
@@ -1229,9 +1077,7 @@ def _prepare_direct_bundle(args: argparse.Namespace) -> dict[str, Any]:
         paths["alignment_json"],
         trial=trial,
     )
-    relative_times = (
-        motion_times[window_indices] - float(motion_times[center_index])
-    )
+    relative_times = motion_times[window_indices] - float(motion_times[center_index])
     mesh_vertices, mesh_faces = build_direct_center_mesh(
         smpl_data=smpl_data,
         amass_npz=paths["amass_npz"],
@@ -1313,19 +1159,11 @@ def _prepare_direct_bundle(args: argparse.Namespace) -> dict[str, Any]:
         )
         write_json(
             staging / "bundle.json",
-            {
-                "schema_version": 1,
-                "profile": "hermes",
-                "primary_adc": "primary",
-                "adcs": {
-                    "primary": {
-                        "path": "radar_adc.npz",
-                        "origin": "measurement",
-                    }
-                },
-                "motion": {"parameters": "amass_sequence.npz"},
-                "environment": "environment.json",
-            },
+            make_bundle_descriptor(
+                primary_origin="measurement",
+                motion_parameters="amass_sequence.npz",
+                environment="environment.json",
+            ),
         )
         integrity = check_bundle_output_integrity(staging)
         summary = {
@@ -1397,14 +1235,7 @@ def activity_label(activity: int) -> str:
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = build_arg_parser()
-    args = parser.parse_args(argv)
-    try:
-        result = prepare_bundle(args)
-    except (OSError, IndexError, KeyError, ValueError) as exc:
-        parser.error(str(exc))
-    print(json.dumps(result, indent=2, allow_nan=False))
-    return 0
+    return adapter_main(build_arg_parser, prepare_bundle, argv)
 
 
 if __name__ == "__main__":

@@ -13,6 +13,20 @@ from typing import Callable
 
 import numpy as np
 
+from .settings import (
+    ArraySettings,
+    RadarSettings,
+    StaticExecutionSettings,
+    StaticPOSettings,
+    StaticRayTracingSettings,
+    StaticTargetGeometrySettings,
+    StaticTargetSettings,
+    StaticTargetSolverSettings,
+)
+from .radar import RadarSettings, build_radar
+
+from ..geometry import rotation_matrix
+
 from bundle_prepare.safe_npz import (
     DEFAULT_NPZ_LIMITS,
     preflight_npz,
@@ -21,7 +35,9 @@ from bundle_prepare.safe_npz import (
 
 from ..dsp import range_fft, range_profile_from_cube
 from ..materials import human_skin_material
-from ..radar import FMCWConfig, RadarHardware, RadarSensor, get_ti_board_spec
+from ..naming import saved_tx_schedule, validate_array_groups, validate_array_model
+from ..simulation.subarray import group_pairs, local_array_groups, subarray_radar
+from ..radar import FMCWConfig, RadarSensor, get_ti_board_spec
 from ..simulation import (
     MmWaveRadarSimulator,
     PhysicalOpticsMaterial,
@@ -40,7 +56,6 @@ from .solver_diagnostics import (
     summarize_po_surface,
     summarize_rt_paths,
 )
-
 
 TARGET_TYPES = ("plate", "trihedral", "human_mesh")
 MATERIAL_PRESETS = ("pec", "aluminum", "concrete")
@@ -115,6 +130,8 @@ class PhysicsMicroscopeResult:
     visible_face_count: int
     radar_position: np.ndarray
     rt_path_count: int
+    po_channel_range_profile_power: np.ndarray | None = None
+    rt_channel_range_profile_power: np.ndarray | None = None
 
     @property
     def adc(self) -> np.ndarray:
@@ -149,28 +166,8 @@ def _finite(name: str, value: float) -> float:
     return scalar
 
 
-def _rotation_matrix(
-    yaw_deg: float,
-    pitch_deg: float,
-    roll_deg: float,
-) -> np.ndarray:
-    angles = np.asarray((yaw_deg, pitch_deg, roll_deg), dtype=float)
-    if not np.all(np.isfinite(angles)):
-        raise ValueError("orientation angles must be finite")
-    yaw, pitch, roll = np.deg2rad(angles)
-    rz = np.asarray(
-        ((np.cos(yaw), -np.sin(yaw), 0), (np.sin(yaw), np.cos(yaw), 0), (0, 0, 1)),
-        dtype=float,
-    )
-    ry = np.asarray(
-        ((np.cos(pitch), 0, np.sin(pitch)), (0, 1, 0), (-np.sin(pitch), 0, np.cos(pitch))),
-        dtype=float,
-    )
-    rx = np.asarray(
-        ((1, 0, 0), (0, np.cos(roll), -np.sin(roll)), (0, np.sin(roll), np.cos(roll))),
-        dtype=float,
-    )
-    return rz @ ry @ rx
+def _rotation_matrix(yaw_deg: float, pitch_deg: float, roll_deg: float) -> np.ndarray:
+    return rotation_matrix((yaw_deg, pitch_deg, roll_deg), degrees=True)
 
 
 def _tessellated_quad(
@@ -390,25 +387,19 @@ def _parse_obj(text: str) -> tuple[np.ndarray, np.ndarray]:
     faces: list[tuple[int, int, int]] = []
     for line_number, raw in enumerate(StringIO(text), start=1):
         if len(raw) > 4 * 1024**2:
-            raise ValueError(
-                f"OBJ line {line_number} exceeds the 4 MiB line-size limit"
-            )
+            raise ValueError(f"OBJ line {line_number} exceeds the 4 MiB line-size limit")
         line = raw.strip()
         if not line or line.startswith("#"):
             continue
         parts = line.split()
         if parts[0] == "v" and len(parts) >= 4:
             if len(vertices) >= _MAX_HUMAN_OBJ_VERTICES:
-                raise ValueError(
-                    "human mesh OBJ exceeds the 2,000,000-vertex limit"
-                )
+                raise ValueError("human mesh OBJ exceeds the 2,000,000-vertex limit")
             vertices.append(tuple(float(value) for value in parts[1:4]))
         elif parts[0] == "f" and len(parts) >= 4:
             triangle_count = len(parts) - 3
             if len(faces) + triangle_count > _MAX_HUMAN_OBJ_TRIANGLES:
-                raise ValueError(
-                    "human mesh OBJ exceeds the 4,000,000-triangle limit"
-                )
+                raise ValueError("human mesh OBJ exceeds the 4,000,000-triangle limit")
             polygon: list[int] = []
             for token in parts[1:]:
                 index = int(token.split("/", maxsplit=1)[0])
@@ -459,68 +450,36 @@ def _radar(
     chirp_duration_s: float,
     chirp_repetition_time_s: float,
     sampling_frequency_hz: float,
+    adc_mode: str = "complex1x",
+    if_bandwidth_hz: float | None = None,
     num_adc_samples: int,
     num_chirps_per_frame: int,
     frame_period_s: float,
-    tdm_enabled: bool,
+    tx_schedule: str,
     selected_tx_indices: tuple[int, ...] | list[int] | None = None,
     selected_rx_indices: tuple[int, ...] | list[int] | None = None,
 ) -> RadarSensor:
-    board_spec = get_ti_board_spec(board_model)
-    orientation_deg = np.asarray((yaw_deg, pitch_deg, roll_deg), dtype=float)
-    if not np.all(np.isfinite(orientation_deg)):
-        raise ValueError("radar orientation angles must be finite")
-    pattern_mode = str(antenna_pattern_mode).casefold().replace("-", "_")
-    if pattern_mode not in {"digitized", "none", "cosine"}:
-        raise ValueError(
-            "antenna_pattern_mode must be 'digitized', 'none', or 'cosine'"
-        )
-    beamwidth_deg = float(cosine_3db_beamwidth_deg)
-    if not np.isfinite(beamwidth_deg) or not 0.0 < beamwidth_deg < 180.0:
-        raise ValueError(
-            "cosine_3db_beamwidth_deg must be between 0 and 180 degrees"
-        )
-    hardware = RadarHardware.from_ti_board(
-        board_model,
-        pattern_mode=pattern_mode,
-        cosine_half_power_angle_deg=0.5 * beamwidth_deg,
-    )
-    if not isinstance(tdm_enabled, (bool, np.bool_)):
-        raise ValueError("tdm_enabled must be a boolean")
-    tx_indices = (
-        tuple(range(hardware.num_tx))
-        if selected_tx_indices is None
-        else tuple(selected_tx_indices)
-    )
-    rx_indices = (
-        tuple(range(hardware.num_rx))
-        if selected_rx_indices is None
-        else tuple(selected_rx_indices)
-    )
-    hardware = hardware.subset_tx(tx_indices).subset_rx(rx_indices)
-    fmcw = FMCWConfig(
-        carrier_frequency=(
-            float(board_spec.design_frequency_hz)
-            if carrier_frequency_hz is None
-            else carrier_frequency_hz
+    return build_radar(
+        RadarSettings(
+            board_model=board_model,
+            antenna_pattern_mode=antenna_pattern_mode,
+            cosine_3db_beamwidth_deg=cosine_3db_beamwidth_deg,
+            carrier_frequency_hz=carrier_frequency_hz,
+            slope_hz_per_s=slope_hz_per_s,
+            chirp_duration_s=chirp_duration_s,
+            chirp_repetition_time_s=chirp_repetition_time_s,
+            sampling_frequency_hz=sampling_frequency_hz,
+            adc_mode=adc_mode,
+            if_bandwidth_hz=if_bandwidth_hz,
+            num_adc_samples=num_adc_samples,
+            num_chirps_per_frame=num_chirps_per_frame,
+            frame_period_s=frame_period_s,
+            tx_schedule=tx_schedule,
+            selected_tx_indices=selected_tx_indices,
+            selected_rx_indices=selected_rx_indices,
+            orientation_deg=(yaw_deg, pitch_deg, roll_deg),
         ),
-        slope=slope_hz_per_s,
-        chirp_duration=chirp_duration_s,
-        chirp_repetition_time=chirp_repetition_time_s,
-        sampling_frequency=sampling_frequency_hz,
-        num_adc_samples=num_adc_samples,
-        num_chirps_per_frame=num_chirps_per_frame,
-        frame_period=frame_period_s,
-        num_tx=hardware.num_tx,
-        tdm_enabled=bool(tdm_enabled),
-    )
-    return RadarSensor(
         name="radar",
-        hardware=hardware,
-        fmcw=fmcw,
-        position=(0.0, 0.0, 0.0),
-        orientation=tuple(np.deg2rad(orientation_deg)),
-        tx_power_dbm=board_spec.tx_power_dbm,
     )
 
 
@@ -570,9 +529,11 @@ def _po_cube(
     visibility_samples: int,
     integration_mode: str,
     quadrature_phase_span_scale_rad: float,
+    curvature_error_rad: float,
     quadrature_max_refinement_depth: int,
     quadrature_max_subfaces_per_parent: int,
     compute_backend: str,
+    diagnostics=None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     result = po_channel(
         vertices=vertices,
@@ -582,33 +543,41 @@ def _po_cube(
         frequency_hz=radar.fmcw.carrier_frequency,
         material=material,
         visibility="none",
-        visibility_samples_per_face=visibility_samples,
-        visibility_fade_chirps=1,
+        po_visibility_samples_per_face=visibility_samples,
         po_integration_mode=integration_mode,
         po_quadrature_phase_span_scale_rad=quadrature_phase_span_scale_rad,
+        po_curvature_error_rad=curvature_error_rad,
         po_quadrature_max_refinement_depth=quadrature_max_refinement_depth,
-        po_quadrature_max_subfaces_per_parent=(
-            quadrature_max_subfaces_per_parent
-        ),
+        po_quadrature_max_subfaces_per_parent=(quadrature_max_subfaces_per_parent),
         compute_backend=compute_backend,
         compute_precision="float32",
+        receiver_fmcw=radar.fmcw,
+        max_frequency_offset_hz=(
+            radar.fmcw.slope * (radar.fmcw.num_adc_samples - 1) / radar.fmcw.sampling_frequency
+        ),
     )
     azimuth_deg, elevation_deg = radar.local_azimuth_elevation(result.face_centroids)
     coefficients = np.asarray(result.coefficients, dtype=np.complex64)
-    coefficients *= radar.hardware.channel_gain(
+    hardware_gains = radar.hardware.channel_gain(
         azimuth_deg=azimuth_deg,
         elevation_deg=elevation_deg,
         frequency_hz=radar.fmcw.carrier_frequency,
     )
+    coefficients *= hardware_gains
+    delay_response = result.delay_response
+    if delay_response is not None:
+        delay_response = delay_response.with_channel_gains(
+            delay_response.channel_gains * hardware_gains
+        )
     delays = np.asarray(result.delays_s, dtype=float)
-    valid = np.any(np.abs(coefficients) > 0.0, axis=0)
-    valid &= np.any(delays >= 0.0, axis=0) if delays.ndim == 2 else delays >= 0.0
     chirp_adc = synthesize_adc_from_paths(
-        coefficients[:, valid],
-        delays[:, valid] if delays.ndim == 2 else delays[valid],
+        coefficients,
+        delays,
         radar.fmcw,
         backend=compute_backend,
         precision="float32",
+        delay_response=delay_response,
+        diagnostics=diagnostics,
     )
     adc = np.repeat(
         chirp_adc[None, None, :, :],
@@ -635,7 +604,7 @@ def _profile(adc: np.ndarray, fmcw: FMCWConfig) -> tuple[np.ndarray, np.ndarray]
     range_cube, ranges_m = range_fft(adc[0], fmcw=fmcw, nfft_mult=4)
     power = range_profile_from_cube(
         range_cube,
-        combine_antennas="sum_power",
+        combine_antennas="none",
         combine_chirps="mean",
     )
     return np.asarray(power, dtype=float), np.asarray(ranges_m, dtype=float)
@@ -656,7 +625,7 @@ def run_static_target_experiment(
     material_name: str = "pec",
     human_mesh: str | Path | bytes | None = None,
     human_mesh_filename: str | None = None,
-    diffuse_reflection_coefficient: float = 0.35,
+    rt_human_diffuse_coefficient: float = 0.35,
     fidelity: str = "preview",
     board_model: str = "IWR6843AOPEVM",
     carrier_frequency_hz: float | None = None,
@@ -664,10 +633,12 @@ def run_static_target_experiment(
     chirp_duration_s: float = 58e-6,
     chirp_repetition_time_s: float = 65e-6,
     sampling_frequency_hz: float = 4.5e6,
+    adc_mode: str = "complex1x",
+    if_bandwidth_hz: float | None = None,
     num_adc_samples: int = 225,
     num_chirps_per_frame: int | None = None,
     frame_period_s: float = 50e-3,
-    tdm_enabled: bool = False,
+    tx_schedule: str = "simultaneous",
     selected_tx_indices: tuple[int, ...] | list[int] | None = None,
     selected_rx_indices: tuple[int, ...] | list[int] | None = None,
     radar_yaw_deg: float = 0.0,
@@ -677,372 +648,576 @@ def run_static_target_experiment(
     cosine_3db_beamwidth_deg: float = 60.0,
     po_integration_mode: str = "parent_face_quadrature",
     po_quadrature_phase_span_scale_rad: float = 1.0,
+    po_curvature_error_rad: float = 0.005,
     po_quadrature_max_refinement_depth: int = 2,
     po_quadrature_max_subfaces_per_parent: int = 16,
     rt_samples_per_source: int = 100_000,
     rt_max_paths_per_source: int = 5_000,
     rt_max_depth: int = 3,
+    array_model: str = "phase_center",
+    array_tx_groups: list[list[int]] | None = None,
+    array_rx_groups: list[list[int]] | None = None,
     compute_backend: str = "numpy",
     cancel_check: Callable[[], bool] | None = None,
 ) -> PhysicsMicroscopeResult:
-    """Simulate one static target with both physical optics and ray tracing."""
+    """Simulate one static target with both physical optics and ray tracing.
 
-    if cancel_check is not None and not callable(cancel_check):
-        raise ValueError("cancel_check must be callable or None")
+    With ``array_model="subarray"`` both solvers run once per pair of a Tx
+    group and an Rx group (zero-based board indices, like
+    ``selected_tx_indices``).
+    """
+    return simulate_static_target(
+        StaticTargetSettings(
+            target=StaticTargetGeometrySettings(
+                target_type=target_type,
+                range_m=range_m,
+                target_y_m=target_y_m,
+                target_z_m=target_z_m,
+                width_m=width_m,
+                height_m=height_m,
+                corner_edge_m=corner_edge_m,
+                yaw_deg=yaw_deg,
+                pitch_deg=pitch_deg,
+                roll_deg=roll_deg,
+                material_name=material_name,
+                human_mesh=human_mesh,
+                human_mesh_filename=human_mesh_filename,
+                fidelity=fidelity,
+            ),
+            radar=RadarSettings(
+                board_model=board_model,
+                carrier_frequency_hz=carrier_frequency_hz,
+                slope_hz_per_s=slope_hz_per_s,
+                chirp_duration_s=chirp_duration_s,
+                chirp_repetition_time_s=chirp_repetition_time_s,
+                sampling_frequency_hz=sampling_frequency_hz,
+                adc_mode=adc_mode,
+                if_bandwidth_hz=if_bandwidth_hz,
+                num_adc_samples=num_adc_samples,
+                num_chirps_per_frame=num_chirps_per_frame,
+                frame_period_s=frame_period_s,
+                tx_schedule=tx_schedule,
+                selected_tx_indices=selected_tx_indices,
+                selected_rx_indices=selected_rx_indices,
+                antenna_pattern_mode=antenna_pattern_mode,
+                cosine_3db_beamwidth_deg=cosine_3db_beamwidth_deg,
+                orientation_deg=(
+                    radar_yaw_deg,
+                    radar_pitch_deg,
+                    radar_roll_deg,
+                ),
+            ),
+            solver=StaticTargetSolverSettings(
+                array=ArraySettings(
+                    array_model=array_model,
+                    array_tx_groups=array_tx_groups,
+                    array_rx_groups=array_rx_groups,
+                ),
+                rt=StaticRayTracingSettings(
+                    rt_human_diffuse_coefficient=rt_human_diffuse_coefficient,
+                    rt_samples_per_source=rt_samples_per_source,
+                    rt_max_paths_per_source=rt_max_paths_per_source,
+                    rt_max_depth=rt_max_depth,
+                ),
+                po=StaticPOSettings(
+                    po_integration_mode=po_integration_mode,
+                    po_quadrature_phase_span_scale_rad=po_quadrature_phase_span_scale_rad,
+                    po_curvature_error_rad=po_curvature_error_rad,
+                    po_quadrature_max_refinement_depth=po_quadrature_max_refinement_depth,
+                    po_quadrature_max_subfaces_per_parent=po_quadrature_max_subfaces_per_parent,
+                ),
+                execution=StaticExecutionSettings(
+                    compute_backend=compute_backend, cancel_check=cancel_check
+                ),
+            ),
+        )
+    )
 
-    def check_cancelled() -> None:
-        if cancel_check is not None and bool(cancel_check()):
+
+def simulate_static_target(settings: StaticTargetSettings) -> PhysicsMicroscopeResult:
+    """Run with grouped settings; the legacy keyword entry point remains supported."""
+    if not isinstance(settings, StaticTargetSettings):
+        raise TypeError("settings must be a StaticTargetSettings")
+    return _StaticTargetRun(settings).run()
+
+
+class _StaticTargetRun:
+    """Per-run preparation, solver passes and result construction."""
+
+    def __init__(self, settings: StaticTargetSettings):
+        self.settings = settings
+        self.array_model = self.settings.solver.array.array_model
+        self.array_rx_groups = self.settings.solver.array.array_rx_groups
+        self.array_tx_groups = self.settings.solver.array.array_tx_groups
+        self.material_name = self.settings.target.material_name
+        self.target_type = self.settings.target.target_type
+        self.fidelity = self.settings.target.fidelity
+        self.board_model = self.settings.radar.board_model
+        self.radar_yaw_deg = self.settings.radar.orientation_deg[0]
+        self.radar_pitch_deg = self.settings.radar.orientation_deg[1]
+        self.radar_roll_deg = self.settings.radar.orientation_deg[2]
+        self.po_integration_mode = self.settings.solver.po.po_integration_mode
+        self.compute_backend = self.settings.solver.execution.compute_backend
+        self.cancel_check = self.settings.solver.execution.cancel_check
+
+    def check_cancelled(self):
+        if self.cancel_check is not None and bool(self.cancel_check()):
             raise InterruptedError("Simulation cancelled by user")
 
-    check_cancelled()
+    def _stage_prepare(self):
+        """Prepare this run using its settings and prior stage outputs."""
+        self.array_model = validate_array_model(self.array_model)
+        self.array_tx_groups = validate_array_groups(self.array_tx_groups, name="array_tx_groups")
+        self.array_rx_groups = validate_array_groups(self.array_rx_groups, name="array_rx_groups")
+        if self.array_model == "phase_center" and (
+            self.array_tx_groups is not None or self.array_rx_groups is not None
+        ):
+            raise ValueError("array_tx_groups and array_rx_groups need array_model='subarray'")
+        if self.cancel_check is not None and not callable(self.cancel_check):
+            raise ValueError("cancel_check must be callable or None")
 
-    if target_type not in TARGET_TYPES:
-        raise ValueError(f"target_type must be one of {TARGET_TYPES}")
-    if fidelity not in ("preview", "high_fidelity"):
-        raise ValueError("fidelity must be 'preview' or 'high_fidelity'")
-    if po_integration_mode not in (
-        "face_centroid",
-        "parent_face_quadrature",
-        "parent_face_far_field_analytic",
-    ):
-        raise ValueError(
-            "po_integration_mode must be 'face_centroid', "
-            "'parent_face_quadrature', or 'parent_face_far_field_analytic'"
-        )
-    po_phase_span = float(po_quadrature_phase_span_scale_rad)
-    if not np.isfinite(po_phase_span) or po_phase_span <= 0.0:
-        raise ValueError(
-            "po_quadrature_phase_span_scale_rad must be finite and positive"
-        )
-    po_refinement_depth = int(po_quadrature_max_refinement_depth)
-    if (
-        po_refinement_depth != po_quadrature_max_refinement_depth
-        or po_refinement_depth < 0
-    ):
-        raise ValueError(
-            "po_quadrature_max_refinement_depth must be a non-negative integer"
-        )
-    po_subface_cap = int(po_quadrature_max_subfaces_per_parent)
-    if (
-        po_subface_cap != po_quadrature_max_subfaces_per_parent
-        or po_subface_cap < 0
-    ):
-        raise ValueError(
-            "po_quadrature_max_subfaces_per_parent must be a non-negative integer"
-        )
-    rt_samples = int(rt_samples_per_source)
-    if rt_samples != rt_samples_per_source or rt_samples <= 0:
-        raise ValueError("rt_samples_per_source must be a positive integer")
-    rt_path_cap = int(rt_max_paths_per_source)
-    if rt_path_cap != rt_max_paths_per_source or rt_path_cap <= 0:
-        raise ValueError("rt_max_paths_per_source must be a positive integer")
-    rt_depth = int(rt_max_depth)
-    if rt_depth != rt_max_depth or rt_depth <= 0:
-        raise ValueError("rt_max_depth must be a positive integer")
-    diffuse = float(diffuse_reflection_coefficient)
-    if not np.isfinite(diffuse) or diffuse < 0.0 or diffuse > 1.0:
-        raise ValueError("diffuse_reflection_coefficient must be in [0, 1]")
-    resolved_pattern_mode = (
-        str(antenna_pattern_mode).casefold().replace("-", "_")
-    )
-    resolved_cosine_beamwidth_deg = float(cosine_3db_beamwidth_deg)
-    target_position = np.asarray(
-        (
-            _positive("range_m", range_m),
-            _finite("target_y_m", target_y_m),
-            _finite("target_z_m", target_z_m),
-        ),
-        dtype=float,
-    )
-    mesh_edge_m = 0.02 if fidelity == "preview" else 0.0075
-    visibility_samples = 1 if fidelity == "preview" else 4
-    num_chirps = (
-        16 if fidelity == "preview" else 32
-    ) if num_chirps_per_frame is None else num_chirps_per_frame
-    if target_type == "plate":
-        vertices, faces = make_rectangular_plate_mesh(
-            range_m=target_position[0],
-            lateral_m=target_position[1],
-            vertical_m=target_position[2],
-            width_m=width_m,
-            height_m=height_m,
-            aspect_deg=yaw_deg,
-            pitch_deg=pitch_deg,
-            roll_deg=roll_deg,
-            max_edge_m=mesh_edge_m,
-        )
-        parameters: dict[str, object] = {
-            "width_m": float(width_m),
-            "height_m": float(height_m),
-        }
-    elif target_type == "trihedral":
-        vertices, faces = make_trihedral_corner_mesh(
-            range_m=target_position[0],
-            lateral_m=target_position[1],
-            vertical_m=target_position[2],
-            edge_m=corner_edge_m,
-            yaw_deg=yaw_deg,
-            pitch_deg=pitch_deg,
-            roll_deg=roll_deg,
-            max_edge_m=mesh_edge_m,
-        )
-        parameters = {"edge_m": float(corner_edge_m)}
-    else:
-        if human_mesh is None:
-            raise ValueError("human_mesh is required for target_type='human_mesh'")
-        vertices, faces = load_human_mesh(
-            human_mesh,
-            filename=human_mesh_filename,
-        )
-        vertices = _place_loaded_mesh(
-            vertices,
-            range_m=target_position[0],
-            lateral_m=target_position[1],
-            vertical_m=target_position[2],
-            yaw_deg=yaw_deg,
-            pitch_deg=pitch_deg,
-            roll_deg=roll_deg,
-        )
-        parameters = {
-            "mesh_filename": Path(human_mesh_filename or str(human_mesh)).name,
-            "diffuse_reflection_coefficient": diffuse,
-            "face_winding": "normalized_outward_at_load",
-        }
-        material_name = "human_tissue"
-    parameters.update(
-        {
-            "position_m": [float(value) for value in target_position],
-            "range_m": float(target_position[0]),
-            "target_y_m": float(target_position[1]),
-            "target_z_m": float(target_position[2]),
-            "distance_to_radar_m": float(np.linalg.norm(target_position)),
-            "yaw_deg": float(yaw_deg),
-            "pitch_deg": float(pitch_deg),
-            "roll_deg": float(roll_deg),
-            "mesh_max_edge_m": float(mesh_edge_m),
-            "material": material_name,
-        }
-    )
-    if target_type == "human_mesh":
-        parameters.update(
-            {
-                "relative_permittivity": 38.0,
-                "conductivity_s_per_m": 1.5,
-                "thickness_m": 0.01,
-                "rt_diffuse_reflection_coefficient": diffuse,
-                "rt_backscattering_lambda": 0.35,
-            }
-        )
-    else:
-        preset = _MATERIALS[material_name]
-        parameters.update(
-            {
-                "relative_permittivity": preset["relative_permittivity"],
-                "conductivity_s_per_m": preset["conductivity_s_per_m"],
-                "thickness_m": preset["thickness_m"],
-                "rt_diffuse_reflection_coefficient": preset[
-                    "diffuse_coefficient"
-                ],
-                "rt_backscattering_lambda": preset[
-                    "backscattering_lambda"
-                ],
-            }
-        )
-    radar = _radar(
-        board_model,
-        yaw_deg=radar_yaw_deg,
-        pitch_deg=radar_pitch_deg,
-        roll_deg=radar_roll_deg,
-        antenna_pattern_mode=resolved_pattern_mode,
-        cosine_3db_beamwidth_deg=resolved_cosine_beamwidth_deg,
-        carrier_frequency_hz=carrier_frequency_hz,
-        slope_hz_per_s=slope_hz_per_s,
-        chirp_duration_s=chirp_duration_s,
-        chirp_repetition_time_s=chirp_repetition_time_s,
-        sampling_frequency_hz=sampling_frequency_hz,
-        num_adc_samples=num_adc_samples,
-        num_chirps_per_frame=num_chirps,
-        frame_period_s=frame_period_s,
-        tdm_enabled=tdm_enabled,
-        selected_tx_indices=selected_tx_indices,
-        selected_rx_indices=selected_rx_indices,
-    )
-    effective_tx_indices = (
-        list(range(get_ti_board_spec(board_model).num_tx))
-        if selected_tx_indices is None
-        else [int(value) for value in selected_tx_indices]
-    )
-    effective_rx_indices = (
-        list(range(get_ti_board_spec(board_model).num_rx))
-        if selected_rx_indices is None
-        else [int(value) for value in selected_rx_indices]
-    )
-    po_material, rt_material = _materials(target_type, material_name, diffuse)
+        self.check_cancelled()
 
-    check_cancelled()
-    po_started = time.perf_counter()
-    po_adc, face_power, face_visibility = _po_cube(
-        vertices,
-        faces,
-        radar,
-        po_material,
-        visibility_samples=visibility_samples,
-        integration_mode=po_integration_mode,
-        quadrature_phase_span_scale_rad=po_phase_span,
-        quadrature_max_refinement_depth=po_refinement_depth,
-        quadrature_max_subfaces_per_parent=po_subface_cap,
-        compute_backend=compute_backend,
-    )
-    po_runtime = time.perf_counter() - po_started
-    check_cancelled()
-
-    from sionna.rt import load_scene  # pylint: disable=import-outside-toplevel
-
-    target = MeshTarget(
-        name=f"gui_{target_type}",
-        mesh_sequence=MeshSequence(
-            vertices=vertices[None, :, :],
-            faces=faces,
-            times=np.asarray([0.0]),
-        ),
-        material=rt_material,
-    )
-    rt_simulator = MmWaveRadarSimulator(
-        mobility_mode="rt_retrace",
-        max_depth=rt_depth,
-        samples_per_src=rt_samples,
-        max_num_paths_per_src=rt_path_cap,
-        coupling_mode="unrestricted",
-        diffuse_reflection=True,
-        human_specular_reflection=True,
-        retrace_once_per_frame=True,
-        seed=42,
-        compute_backend=compute_backend,
-        compute_precision="float32",
-        adc_compute_precision="float32",
-        cancel_check=cancel_check,
-    )
-    rt_started = time.perf_counter()
-    rt_cube = rt_simulator.run(load_scene(), radar, [target], num_frames=1)
-    rt_runtime = time.perf_counter() - rt_started
-    check_cancelled()
-    rt_adc = np.asarray(rt_cube.adc)
-    po_profile, ranges_m = _profile(po_adc, radar.fmcw)
-    rt_profile, rt_ranges = _profile(rt_adc, radar.fmcw)
-    if not np.allclose(ranges_m, rt_ranges):
-        raise RuntimeError("RT and PO range axes do not match")
-    manifest = ExperimentManifest(
-        name=f"Static target RT/PO: {target_type}",
-        scene=SceneExperimentConfig(
-            scenario=f"static_{target_type}",
-            parameters=parameters,
-        ),
-        radar=RadarExperimentConfig(
-            board_model=board_model,
-            profile=f"gui_static_{radar.fmcw.carrier_frequency / 1e9:g}ghz",
-            parameters={
-                "carrier_frequency_hz": float(radar.fmcw.carrier_frequency),
-                "slope_hz_per_s": float(radar.fmcw.slope),
-                "chirp_duration_s": float(radar.fmcw.chirp_duration),
-                "chirp_repetition_time_s": float(
-                    radar.fmcw.chirp_repetition_time
-                ),
-                "sampling_frequency_hz": float(
-                    radar.fmcw.sampling_frequency
-                ),
-                "num_adc_samples": int(radar.fmcw.num_adc_samples),
-                "num_chirps_per_frame": int(radar.fmcw.num_chirps_per_frame),
-                "frame_period_s": float(radar.fmcw.frame_period),
-                "tdm_enabled": bool(tdm_enabled),
-                "tx_indices_zero_based": effective_tx_indices,
-                "rx_indices_zero_based": effective_rx_indices,
-                "radar_yaw_deg": float(radar_yaw_deg),
-                "radar_pitch_deg": float(radar_pitch_deg),
-                "radar_roll_deg": float(radar_roll_deg),
-                "antenna_pattern_mode": resolved_pattern_mode,
-                "cosine_3db_beamwidth_deg": float(
-                    resolved_cosine_beamwidth_deg
-                ),
-            },
-        ),
-        solver=SolverExperimentConfig(
-            mode="hybrid_rt_po",
-            fidelity=fidelity,
-            parameters={
-                "solvers": ["rt", "po"],
-                "rt_max_depth": rt_depth,
-                "rt_samples_per_source": rt_samples,
-                "rt_max_paths_per_source": rt_path_cap,
-                "po_visibility_samples_per_face": visibility_samples,
-                "po_integration_mode": po_integration_mode,
-                "po_quadrature_phase_span_scale_rad": po_phase_span,
-                "po_quadrature_max_refinement_depth": po_refinement_depth,
-                "po_quadrature_max_subfaces_per_parent": po_subface_cap,
-                "compute_backend": compute_backend,
-                "amplitude_calibration": "none",
-            },
-        ),
-    )
-    sensor_parameters = {
-        "board_model": board_model,
-        "position": [float(value) for value in radar.position],
-        "orientation": [float(value) for value in radar.orientation],
-        "orientation_deg": [
-            float(radar_yaw_deg),
-            float(radar_pitch_deg),
-            float(radar_roll_deg),
-        ],
-        "pattern_mode": resolved_pattern_mode,
-        "cosine_3db_beamwidth_deg": resolved_cosine_beamwidth_deg,
-        "tdm_enabled": bool(tdm_enabled),
-        "tx_indices_zero_based": effective_tx_indices,
-        "rx_indices_zero_based": effective_rx_indices,
-        "fmcw": {
-            "carrier_frequency_hz": float(radar.fmcw.carrier_frequency),
-            "slope_hz_per_s": float(radar.fmcw.slope),
-            "chirp_duration_s": float(radar.fmcw.chirp_duration),
-            "chirp_repetition_time_s": float(
-                radar.fmcw.chirp_repetition_time
+        if self.target_type not in TARGET_TYPES:
+            raise ValueError(f"target_type must be one of {TARGET_TYPES}")
+        if self.fidelity not in ("preview", "high_fidelity"):
+            raise ValueError("fidelity must be 'preview' or 'high_fidelity'")
+        if self.po_integration_mode not in (
+            "face_centroid",
+            "parent_face_quadrature",
+            "parent_face_adaptive_analytic",
+            "parent_face_far_field_analytic",
+        ):
+            raise ValueError(
+                "po_integration_mode must be 'face_centroid', "
+                "'parent_face_quadrature', 'parent_face_adaptive_analytic', or 'parent_face_far_field_analytic'"
+            )
+        self.po_phase_span = float(self.settings.solver.po.po_quadrature_phase_span_scale_rad)
+        if not np.isfinite(self.po_phase_span) or self.po_phase_span <= 0.0:
+            raise ValueError("po_quadrature_phase_span_scale_rad must be finite and positive")
+        self.po_refinement_depth = int(self.settings.solver.po.po_quadrature_max_refinement_depth)
+        self.curvature_error = float(self.settings.solver.po.po_curvature_error_rad)
+        if not np.isfinite(self.curvature_error) or self.curvature_error <= 0.0:
+            raise ValueError("po_curvature_error_rad must be finite and positive")
+        if (
+            self.po_refinement_depth != self.settings.solver.po.po_quadrature_max_refinement_depth
+            or self.po_refinement_depth < 0
+        ):
+            raise ValueError("po_quadrature_max_refinement_depth must be a non-negative integer")
+        self.po_subface_cap = int(self.settings.solver.po.po_quadrature_max_subfaces_per_parent)
+        if (
+            self.po_subface_cap != self.settings.solver.po.po_quadrature_max_subfaces_per_parent
+            or self.po_subface_cap < 0
+        ):
+            raise ValueError(
+                "po_quadrature_max_subfaces_per_parent must be a non-negative integer"
+            )
+        self.rt_samples = int(self.settings.solver.rt.rt_samples_per_source)
+        if (
+            self.rt_samples != self.settings.solver.rt.rt_samples_per_source
+            or self.rt_samples <= 0
+        ):
+            raise ValueError("rt_samples_per_source must be a positive integer")
+        self.rt_path_cap = int(self.settings.solver.rt.rt_max_paths_per_source)
+        if (
+            self.rt_path_cap != self.settings.solver.rt.rt_max_paths_per_source
+            or self.rt_path_cap <= 0
+        ):
+            raise ValueError("rt_max_paths_per_source must be a positive integer")
+        self.rt_depth = int(self.settings.solver.rt.rt_max_depth)
+        if self.rt_depth != self.settings.solver.rt.rt_max_depth or self.rt_depth <= 0:
+            raise ValueError("rt_max_depth must be a positive integer")
+        diffuse = float(self.settings.solver.rt.rt_human_diffuse_coefficient)
+        if not np.isfinite(diffuse) or diffuse < 0.0 or diffuse > 1.0:
+            raise ValueError("rt_human_diffuse_coefficient must be in [0, 1]")
+        self.resolved_pattern_mode = (
+            str(self.settings.radar.antenna_pattern_mode).casefold().replace("-", "_")
+        )
+        self.resolved_cosine_beamwidth_deg = float(self.settings.radar.cosine_3db_beamwidth_deg)
+        target_position = np.asarray(
+            (
+                _positive("range_m", self.settings.target.range_m),
+                _finite("target_y_m", self.settings.target.target_y_m),
+                _finite("target_z_m", self.settings.target.target_z_m),
             ),
-            "sampling_frequency_hz": float(radar.fmcw.sampling_frequency),
-            "num_adc_samples": int(radar.fmcw.num_adc_samples),
-            "num_chirps_per_frame": int(radar.fmcw.num_chirps_per_frame),
-            "frame_period_s": float(radar.fmcw.frame_period),
-            "num_tx": int(radar.fmcw.num_tx),
-            "tdm_enabled": bool(radar.fmcw.tdm_enabled),
-        },
-    }
-    path_counts = np.asarray(rt_cube.metadata.path_counts)
-    rt_face_hit_counts = np.asarray(
-        rt_simulator.last_target_face_hit_counts.get(
-            target.name,
-            np.zeros(faces.shape[0], dtype=np.int64),
-        ),
-        dtype=np.int64,
-    )
-    return PhysicsMicroscopeResult(
-        manifest=manifest,
-        target_type=target_type,
-        material_name=material_name,
-        target_parameters=parameters,
-        sensor_parameters=sensor_parameters,
-        vertices=vertices,
-        faces=faces,
-        face_power=face_power,
-        face_visibility=face_visibility,
-        rt_face_hit_counts=rt_face_hit_counts,
-        po_adc=po_adc,
-        rt_adc=rt_adc,
-        adc_times_s=np.asarray(rt_cube.times),
-        ranges_m=ranges_m,
-        po_range_profile_power=po_profile,
-        rt_range_profile_power=rt_profile,
-        po_runtime_s=float(po_runtime),
-        rt_runtime_s=float(rt_runtime),
-        visible_face_count=int(np.count_nonzero(face_visibility > 0.0)),
-        radar_position=np.asarray(radar.position, dtype=float),
-        rt_path_count=int(np.max(path_counts)) if path_counts.size else 0,
-    )
+            dtype=float,
+        )
+        mesh_edge_m = 0.02 if self.fidelity == "preview" else 0.0075
+        self.visibility_samples = 1 if self.fidelity == "preview" else 4
+        num_chirps = (
+            (16 if self.fidelity == "preview" else 32)
+            if self.settings.radar.num_chirps_per_frame is None
+            else self.settings.radar.num_chirps_per_frame
+        )
+        if self.target_type == "plate":
+            self.vertices, self.faces = make_rectangular_plate_mesh(
+                range_m=target_position[0],
+                lateral_m=target_position[1],
+                vertical_m=target_position[2],
+                width_m=self.settings.target.width_m,
+                height_m=self.settings.target.height_m,
+                aspect_deg=self.settings.target.yaw_deg,
+                pitch_deg=self.settings.target.pitch_deg,
+                roll_deg=self.settings.target.roll_deg,
+                max_edge_m=mesh_edge_m,
+            )
+            self.parameters: dict[str, object] = {
+                "width_m": float(self.settings.target.width_m),
+                "height_m": float(self.settings.target.height_m),
+            }
+        elif self.target_type == "trihedral":
+            self.vertices, self.faces = make_trihedral_corner_mesh(
+                range_m=target_position[0],
+                lateral_m=target_position[1],
+                vertical_m=target_position[2],
+                edge_m=self.settings.target.corner_edge_m,
+                yaw_deg=self.settings.target.yaw_deg,
+                pitch_deg=self.settings.target.pitch_deg,
+                roll_deg=self.settings.target.roll_deg,
+                max_edge_m=mesh_edge_m,
+            )
+            self.parameters = {"edge_m": float(self.settings.target.corner_edge_m)}
+        else:
+            if self.settings.target.human_mesh is None:
+                raise ValueError("human_mesh is required for target_type='human_mesh'")
+            self.vertices, self.faces = load_human_mesh(
+                self.settings.target.human_mesh,
+                filename=self.settings.target.human_mesh_filename,
+            )
+            self.vertices = _place_loaded_mesh(
+                self.vertices,
+                range_m=target_position[0],
+                lateral_m=target_position[1],
+                vertical_m=target_position[2],
+                yaw_deg=self.settings.target.yaw_deg,
+                pitch_deg=self.settings.target.pitch_deg,
+                roll_deg=self.settings.target.roll_deg,
+            )
+            self.parameters = {
+                "mesh_filename": Path(
+                    self.settings.target.human_mesh_filename
+                    or str(self.settings.target.human_mesh)
+                ).name,
+                "rt_human_diffuse_coefficient": diffuse,
+                "face_winding": "normalized_outward_at_load",
+            }
+            self.material_name = "human_tissue"
+        self.parameters.update(
+            {
+                "position_m": [float(value) for value in target_position],
+                "range_m": float(target_position[0]),
+                "target_y_m": float(target_position[1]),
+                "target_z_m": float(target_position[2]),
+                "distance_to_radar_m": float(np.linalg.norm(target_position)),
+                "yaw_deg": float(self.settings.target.yaw_deg),
+                "pitch_deg": float(self.settings.target.pitch_deg),
+                "roll_deg": float(self.settings.target.roll_deg),
+                "mesh_max_edge_m": float(mesh_edge_m),
+                "material": self.material_name,
+            }
+        )
+        if self.target_type == "human_mesh":
+            self.parameters.update(
+                {
+                    "relative_permittivity": 38.0,
+                    "conductivity_s_per_m": 1.5,
+                    "thickness_m": 0.01,
+                    "rt_diffuse_reflection_coefficient": diffuse,
+                    "rt_backscattering_lambda": 0.35,
+                }
+            )
+        else:
+            preset = _MATERIALS[self.material_name]
+            self.parameters.update(
+                {
+                    "relative_permittivity": preset["relative_permittivity"],
+                    "conductivity_s_per_m": preset["conductivity_s_per_m"],
+                    "thickness_m": preset["thickness_m"],
+                    "rt_diffuse_reflection_coefficient": preset["diffuse_coefficient"],
+                    "rt_backscattering_lambda": preset["backscattering_lambda"],
+                }
+            )
+        self.radar = _radar(
+            self.board_model,
+            yaw_deg=self.radar_yaw_deg,
+            pitch_deg=self.radar_pitch_deg,
+            roll_deg=self.radar_roll_deg,
+            antenna_pattern_mode=self.resolved_pattern_mode,
+            cosine_3db_beamwidth_deg=self.resolved_cosine_beamwidth_deg,
+            carrier_frequency_hz=self.settings.radar.carrier_frequency_hz,
+            slope_hz_per_s=self.settings.radar.slope_hz_per_s,
+            chirp_duration_s=self.settings.radar.chirp_duration_s,
+            chirp_repetition_time_s=self.settings.radar.chirp_repetition_time_s,
+            sampling_frequency_hz=self.settings.radar.sampling_frequency_hz,
+            adc_mode=self.settings.radar.adc_mode,
+            if_bandwidth_hz=self.settings.radar.if_bandwidth_hz,
+            num_adc_samples=self.settings.radar.num_adc_samples,
+            num_chirps_per_frame=num_chirps,
+            frame_period_s=self.settings.radar.frame_period_s,
+            tx_schedule=self.settings.radar.tx_schedule,
+            selected_tx_indices=self.settings.radar.selected_tx_indices,
+            selected_rx_indices=self.settings.radar.selected_rx_indices,
+        )
+        self.effective_tx_indices = (
+            list(range(get_ti_board_spec(self.board_model).num_tx))
+            if self.settings.radar.selected_tx_indices is None
+            else [int(value) for value in self.settings.radar.selected_tx_indices]
+        )
+        self.effective_rx_indices = (
+            list(range(get_ti_board_spec(self.board_model).num_rx))
+            if self.settings.radar.selected_rx_indices is None
+            else [int(value) for value in self.settings.radar.selected_rx_indices]
+        )
+        self.local_tx_groups = local_array_groups(
+            self.array_tx_groups,
+            self.effective_tx_indices,
+            name="array_tx_groups",
+        )
+        self.local_rx_groups = local_array_groups(
+            self.array_rx_groups,
+            self.effective_rx_indices,
+            name="array_rx_groups",
+        )
+        self.po_material, self.rt_material = _materials(
+            self.target_type, self.material_name, diffuse
+        )
+
+    def _stage_solve_po(self):
+        """Solve po this run using its settings and prior stage outputs."""
+        self.check_cancelled()
+        po_started = time.perf_counter()
+        self.po_filter_diagnostics = {}
+
+        def po_cube_for(po_radar: RadarSensor):
+            return _po_cube(
+                self.vertices,
+                self.faces,
+                po_radar,
+                self.po_material,
+                visibility_samples=self.visibility_samples,
+                integration_mode=self.po_integration_mode,
+                quadrature_phase_span_scale_rad=self.po_phase_span,
+                curvature_error_rad=self.curvature_error,
+                quadrature_max_refinement_depth=self.po_refinement_depth,
+                quadrature_max_subfaces_per_parent=self.po_subface_cap,
+                compute_backend=self.compute_backend,
+                diagnostics=self.po_filter_diagnostics,
+            )
+
+        if self.array_model == "subarray":
+            # One PO integration per Tx/Rx group pair, written back by channel;
+            # face power is averaged over the pairs.
+            pairs = group_pairs(self.radar, self.local_tx_groups, self.local_rx_groups)
+            self.po_adc = self.face_power = self.face_visibility = None
+            for pair in pairs:
+                self.check_cancelled()
+                pair_adc, pair_power, pair_visibility = po_cube_for(
+                    subarray_radar(self.radar, pair)
+                )
+                if self.po_adc is None:
+                    self.po_adc = np.zeros(
+                        pair_adc.shape[:-1] + (self.radar.hardware.num_virtual_channels,),
+                        dtype=pair_adc.dtype,
+                    )
+                    self.face_power = np.zeros_like(pair_power)
+                    self.face_visibility = np.zeros_like(pair_visibility)
+                self.po_adc[..., pair.channels] = pair_adc
+                self.face_power += pair_power / len(pairs)
+                self.face_visibility = np.maximum(self.face_visibility, pair_visibility)
+        else:
+            self.po_adc, self.face_power, self.face_visibility = po_cube_for(self.radar)
+        self.po_runtime = time.perf_counter() - po_started
+        self.check_cancelled()
+
+    def _stage_solve_rt(self):
+        """Solve rt this run using its settings and prior stage outputs."""
+        from sionna.rt import load_scene  # pylint: disable=import-outside-toplevel
+
+        self.target = MeshTarget(
+            name=f"gui_{self.target_type}",
+            mesh_sequence=MeshSequence(
+                vertices=self.vertices[None, :, :],
+                faces=self.faces,
+                times=np.asarray([0.0]),
+            ),
+            material=self.rt_material,
+        )
+        self.rt_simulator = MmWaveRadarSimulator(
+            solver="rt",
+            array_model=self.array_model,
+            array_tx_groups=self.local_tx_groups,
+            array_rx_groups=self.local_rx_groups,
+            rt_max_depth=self.rt_depth,
+            rt_samples_per_source=self.rt_samples,
+            rt_max_paths_per_source=self.rt_path_cap,
+            # A corner reflector's main return touches the target three times.
+            rt_human_bounces="any",
+            # The target is static, so one trace per frame is exact.
+            rt_refresh_frames=1,
+            rt_diffuse_reflection=True,
+            rt_human_specular_reflection=True,
+            compute_backend=self.compute_backend,
+            compute_precision="float32",
+            adc_compute_precision="float32",
+            cancel_check=self.cancel_check,
+        )
+        rt_started = time.perf_counter()
+        self.rt_cube = self.rt_simulator.run(load_scene(), self.radar, [self.target], num_frames=1)
+        self.rt_runtime = time.perf_counter() - rt_started
+        self.check_cancelled()
+
+    def _stage_products(self):
+        """Products this run using its settings and prior stage outputs."""
+        self.rt_adc = np.asarray(self.rt_cube.adc)
+        self.po_channel_profiles, self.ranges_m = _profile(self.po_adc, self.radar.fmcw)
+        self.rt_channel_profiles, rt_ranges = _profile(self.rt_adc, self.radar.fmcw)
+        self.po_profile = np.sum(self.po_channel_profiles, axis=-1)
+        self.rt_profile = np.sum(self.rt_channel_profiles, axis=-1)
+        if not np.allclose(self.ranges_m, rt_ranges):
+            raise RuntimeError("RT and PO range axes do not match")
+
+    def _stage_manifest(self):
+        """Manifest this run using its settings and prior stage outputs."""
+        self.manifest = ExperimentManifest(
+            name=f"Static target RT/PO: {self.target_type}",
+            scene=SceneExperimentConfig(
+                scenario=f"static_{self.target_type}",
+                parameters=self.parameters,
+            ),
+            radar=RadarExperimentConfig(
+                board_model=self.board_model,
+                profile=f"gui_static_{self.radar.fmcw.carrier_frequency / 1e9:g}ghz",
+                parameters={
+                    "carrier_frequency_hz": float(self.radar.fmcw.carrier_frequency),
+                    "slope_hz_per_s": float(self.radar.fmcw.slope),
+                    "chirp_duration_s": float(self.radar.fmcw.chirp_duration),
+                    "chirp_repetition_time_s": float(self.radar.fmcw.chirp_repetition_time),
+                    "adc_mode": self.radar.fmcw.adc_mode,
+                    "if_bandwidth_hz": self.radar.fmcw.if_bandwidth_hz,
+                    "effective_if_cutoff_hz": self.radar.fmcw.effective_if_cutoff_hz,
+                    "sampling_frequency_hz": float(self.radar.fmcw.sampling_frequency),
+                    "num_adc_samples": int(self.radar.fmcw.num_adc_samples),
+                    "num_chirps_per_frame": int(self.radar.fmcw.num_chirps_per_frame),
+                    "frame_period_s": float(self.radar.fmcw.frame_period),
+                    "tx_schedule": self.radar.fmcw.tx_schedule,
+                    "tx_indices_zero_based": self.effective_tx_indices,
+                    "rx_indices_zero_based": self.effective_rx_indices,
+                    "radar_yaw_deg": float(self.radar_yaw_deg),
+                    "radar_pitch_deg": float(self.radar_pitch_deg),
+                    "radar_roll_deg": float(self.radar_roll_deg),
+                    "antenna_pattern_mode": self.resolved_pattern_mode,
+                    "cosine_3db_beamwidth_deg": float(self.resolved_cosine_beamwidth_deg),
+                },
+            ),
+            solver=SolverExperimentConfig(
+                solvers=("rt", "po"),
+                fidelity=self.fidelity,
+                parameters={
+                    "solvers": ["rt", "po"],
+                    "array_model": self.array_model,
+                    "array_tx_groups": (
+                        None
+                        if self.array_tx_groups is None
+                        else [list(group) for group in self.array_tx_groups]
+                    ),
+                    "array_rx_groups": (
+                        None
+                        if self.array_rx_groups is None
+                        else [list(group) for group in self.array_rx_groups]
+                    ),
+                    "rt_human_bounces": "any",
+                    "rt_max_depth": self.rt_depth,
+                    "rt_samples_per_source": self.rt_samples,
+                    "rt_max_paths_per_source": self.rt_path_cap,
+                    "po_visibility_samples_per_face": self.visibility_samples,
+                    "po_integration_mode": self.po_integration_mode,
+                    "po_curvature_error_rad": self.curvature_error,
+                    "po_quadrature_phase_span_scale_rad": self.po_phase_span,
+                    "po_quadrature_max_refinement_depth": self.po_refinement_depth,
+                    "po_quadrature_max_subfaces_per_parent": self.po_subface_cap,
+                    "compute_backend": self.compute_backend,
+                    "amplitude_calibration": "none",
+                },
+            ),
+        )
+        self.sensor_parameters = {
+            "board_model": self.board_model,
+            "position": [float(value) for value in self.radar.position],
+            "orientation": [float(value) for value in self.radar.orientation],
+            "orientation_deg": [
+                float(self.radar_yaw_deg),
+                float(self.radar_pitch_deg),
+                float(self.radar_roll_deg),
+            ],
+            "pattern_mode": self.resolved_pattern_mode,
+            "cosine_3db_beamwidth_deg": self.resolved_cosine_beamwidth_deg,
+            "tx_schedule": self.radar.fmcw.tx_schedule,
+            "tx_indices_zero_based": self.effective_tx_indices,
+            "rx_indices_zero_based": self.effective_rx_indices,
+            "fmcw": {
+                "carrier_frequency_hz": float(self.radar.fmcw.carrier_frequency),
+                "slope_hz_per_s": float(self.radar.fmcw.slope),
+                "chirp_duration_s": float(self.radar.fmcw.chirp_duration),
+                "chirp_repetition_time_s": float(self.radar.fmcw.chirp_repetition_time),
+                "adc_mode": self.radar.fmcw.adc_mode,
+                "if_bandwidth_hz": self.radar.fmcw.if_bandwidth_hz,
+                "effective_if_cutoff_hz": self.radar.fmcw.effective_if_cutoff_hz,
+                "sampling_frequency_hz": float(self.radar.fmcw.sampling_frequency),
+                "num_adc_samples": int(self.radar.fmcw.num_adc_samples),
+                "num_chirps_per_frame": int(self.radar.fmcw.num_chirps_per_frame),
+                "frame_period_s": float(self.radar.fmcw.frame_period),
+                "num_tx": int(self.radar.fmcw.num_tx),
+                "tx_schedule": self.radar.fmcw.tx_schedule,
+            },
+        }
+        self.sensor_parameters["adc_if_filter"] = {
+            "po": self.po_filter_diagnostics,
+            "rt": self.rt_cube.metadata.adc_if_filter,
+        }
+
+    def _stage_result(self):
+        """Result this run using its settings and prior stage outputs."""
+        path_counts = np.asarray(self.rt_cube.metadata.path_counts)
+        rt_face_hit_counts = np.asarray(
+            self.rt_simulator.last_target_face_hit_counts.get(
+                self.target.name,
+                np.zeros(self.faces.shape[0], dtype=np.int64),
+            ),
+            dtype=np.int64,
+        )
+        return PhysicsMicroscopeResult(
+            manifest=self.manifest,
+            target_type=self.target_type,
+            material_name=self.material_name,
+            target_parameters=self.parameters,
+            sensor_parameters=self.sensor_parameters,
+            vertices=self.vertices,
+            faces=self.faces,
+            face_power=self.face_power,
+            face_visibility=self.face_visibility,
+            rt_face_hit_counts=rt_face_hit_counts,
+            po_adc=self.po_adc,
+            rt_adc=self.rt_adc,
+            adc_times_s=np.asarray(self.rt_cube.times),
+            ranges_m=self.ranges_m,
+            po_range_profile_power=self.po_profile,
+            rt_range_profile_power=self.rt_profile,
+            po_channel_range_profile_power=self.po_channel_profiles,
+            rt_channel_range_profile_power=self.rt_channel_profiles,
+            po_runtime_s=float(self.po_runtime),
+            rt_runtime_s=float(self.rt_runtime),
+            visible_face_count=int(np.count_nonzero(self.face_visibility > 0.0)),
+            radar_position=np.asarray(self.radar.position, dtype=float),
+            rt_path_count=int(np.max(path_counts)) if path_counts.size else 0,
+        )
+
+    def run(self):
+        self._stage_prepare()
+        self._stage_solve_po()
+        self._stage_solve_rt()
+        self._stage_products()
+        self._stage_manifest()
+        return self._stage_result()
 
 
 def run_static_target_diagnostics(
@@ -1085,37 +1260,27 @@ def run_static_target_diagnostics(
         if rt_max_paths_per_source is None
         else rt_max_paths_per_source
     )
-    depth = int(
-        solver_parameters.get("rt_max_depth", 3)
-        if rt_max_depth is None
-        else rt_max_depth
-    )
+    depth = int(solver_parameters.get("rt_max_depth", 3) if rt_max_depth is None else rt_max_depth)
     radar = _radar(
         str(sensor["board_model"]),
         yaw_deg=float(orientation_deg[0]),
         pitch_deg=float(orientation_deg[1]),
         roll_deg=float(orientation_deg[2]),
         antenna_pattern_mode=str(sensor.get("pattern_mode", "cosine")),
-        cosine_3db_beamwidth_deg=float(
-            sensor.get("cosine_3db_beamwidth_deg", 60.0)
-        ),
+        cosine_3db_beamwidth_deg=float(sensor.get("cosine_3db_beamwidth_deg", 60.0)),
         carrier_frequency_hz=float(fmcw["carrier_frequency_hz"]),
         slope_hz_per_s=float(fmcw["slope_hz_per_s"]),
         chirp_duration_s=float(fmcw["chirp_duration_s"]),
         chirp_repetition_time_s=float(fmcw["chirp_repetition_time_s"]),
         sampling_frequency_hz=float(fmcw["sampling_frequency_hz"]),
+        adc_mode=fmcw.get("adc_mode", "complex1x"),
+        if_bandwidth_hz=fmcw.get("if_bandwidth_hz"),
         num_adc_samples=int(fmcw["num_adc_samples"]),
         num_chirps_per_frame=int(fmcw["num_chirps_per_frame"]),
         frame_period_s=float(fmcw["frame_period_s"]),
-        tdm_enabled=bool(sensor.get("tdm_enabled", False)),
-        selected_tx_indices=tuple(
-            sensor.get("tx_indices_zero_based", ())
-        )
-        or None,
-        selected_rx_indices=tuple(
-            sensor.get("rx_indices_zero_based", ())
-        )
-        or None,
+        tx_schedule=saved_tx_schedule(sensor),
+        selected_tx_indices=tuple(sensor.get("tx_indices_zero_based", ())) or None,
+        selected_rx_indices=tuple(sensor.get("rx_indices_zero_based", ())) or None,
     )
     diffuse = float(
         result.target_parameters.get(
@@ -1138,14 +1303,13 @@ def run_static_target_diagnostics(
         material=rt_material,
     )
     simulator = MmWaveRadarSimulator(
-        mobility_mode="rt_retrace",
-        max_depth=depth,
-        samples_per_src=samples,
-        max_num_paths_per_src=path_cap,
-        coupling_mode="unrestricted",
-        diffuse_reflection=True,
-        human_specular_reflection=True,
-        seed=42,
+        solver="rt",
+        rt_max_depth=depth,
+        rt_samples_per_source=samples,
+        rt_max_paths_per_source=path_cap,
+        rt_human_bounces="any",
+        rt_diffuse_reflection=True,
+        rt_human_specular_reflection=True,
         compute_backend="numpy",
         compute_precision="float32",
         adc_compute_precision="float32",
@@ -1156,9 +1320,7 @@ def run_static_target_diagnostics(
     paths = simulator.trace_paths(load_scene(), radar, [target], time=0.0)
     if cancel_check is not None and bool(cancel_check()):
         raise InterruptedError("Simulation cancelled by user")
-    object_id = int(
-        np.asarray(target.ensure_scene_object().object_id).reshape(-1)[0]
-    )
+    object_id = int(np.asarray(target.ensure_scene_object().object_id).reshape(-1)[0])
     return SolverDiagnostics(
         rt=summarize_rt_paths(
             paths,

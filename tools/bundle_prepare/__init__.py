@@ -4,6 +4,7 @@
 """Dataset-neutral bundle contract and preparation integrity checks."""
 
 from .contract import Bundle, BundleSensorConfig, FrameRecord
+from .writer import BundleWriter
 
 
 def check_bundle_integrity(*args, **kwargs):
@@ -13,9 +14,11 @@ def check_bundle_integrity(*args, **kwargs):
 
     return check(*args, **kwargs)
 
+
 __all__ = [
     "Bundle",
     "BundleSensorConfig",
     "FrameRecord",
+    "BundleWriter",
     "check_bundle_integrity",
 ]

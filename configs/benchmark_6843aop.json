@@ -1,0 +1,446 @@
+{
+  "schema_version": 1,
+  "name": "6843aop-tradeoffs",
+  "board_model": "IWR6843AOPEVM",
+  "output_root": "../benchmarks/configuration_tradeoffs/results",
+  "seeds": [
+    0,
+    1,
+    2,
+    3,
+    4
+  ],
+  "maximum_jobs": 2000,
+  "settings": {
+    "array_model": "phase_center",
+    "compute_backend": "auto",
+    "compute_precision": "float32",
+    "adc_compute_precision": "float32",
+    "rt_samples_per_source": 100000,
+    "rt_max_paths_per_source": 100000,
+    "rt_max_depth": 3,
+    "rt_human_bounces": "single",
+    "rt_diffuse_reflection": false,
+    "rt_human_specular_reflection": true,
+    "rt_refresh_frames": 1,
+    "rt_visibility_refresh_frames": 1,
+    "po_integration_mode": "parent_face_adaptive_analytic",
+    "po_quadrature_phase_span_scale_rad": 6.0,
+    "po_curvature_error_rad": 0.005,
+    "po_quadrature_max_refinement_depth": 3,
+    "po_quadrature_max_subfaces_per_parent": 64,
+    "po_refresh_frames": 1,
+    "po_refresh_on_phase_error_rad": 0.1,
+    "po_visibility_refresh_frames": 1,
+    "po_visibility_samples_per_face": 1,
+    "hybrid_calibration": "none",
+    "hybrid_coupling": true,
+    "hybrid_max_reflectors": 4,
+    "hybrid_reflector_cutoff_db": -20.0,
+    "po_refresh_on_area_fraction": 0.3,
+    "po_refresh_on_normal_deg": 20.0,
+    "po_adaptive_visibility_sampling": true,
+    "po_adaptive_visibility_edge_margin": 0.15
+  },
+  "reference": {
+    "settings": {
+      "rt_samples_per_source": 1000000,
+      "rt_max_paths_per_source": 1000000,
+      "rt_max_depth": 4,
+      "rt_human_bounces": "any",
+      "rt_refresh_frames": 0,
+      "rt_visibility_refresh_frames": 0,
+      "po_refresh_frames": 0,
+      "po_visibility_refresh_frames": 0,
+      "po_visibility_samples_per_face": 16,
+      "po_adaptive_visibility_sampling": false,
+      "po_integration_mode": "parent_face_adaptive_analytic",
+      "po_quadrature_phase_span_scale_rad": 1.0,
+      "po_curvature_error_rad": 0.001,
+      "po_quadrature_max_refinement_depth": 8,
+      "po_quadrature_max_subfaces_per_parent": 4096
+    }
+  },
+  "calibration": {
+    "settings": {
+      "rt_samples_per_source": 1000000,
+      "rt_max_paths_per_source": 1000000,
+      "rt_diffuse_reflection": true,
+      "po_integration_mode": "parent_face_adaptive_analytic",
+      "po_curvature_error_rad": 0.001,
+      "po_quadrature_max_refinement_depth": 8,
+      "po_quadrature_max_subfaces_per_parent": 4096
+    }
+  },
+  "timing": {
+    "warmups": 1,
+    "repetitions": 5,
+    "minimum_seconds": 10.0,
+    "maximum_repetitions": 1000
+  },
+  "cases": [
+    {
+      "id": "plate",
+      "scenario": "plate",
+      "bundle": "../data/measurements/6843aop/plate",
+      "ignore_tdm_timing": false,
+      "require_valid_array": true,
+      "target_material": {
+        "relative_permittivity": 1.0,
+        "conductivity": 35000000.0,
+        "thickness": 0.002,
+        "scattering_coefficient": 0.0
+      }
+    },
+    {
+      "id": "stationary-human",
+      "scenario": "stationary_human",
+      "bundle": "../data/measurements/6843aop/stationary-human",
+      "calibration_bundle": "../data/measurements/6843aop/calibration-human",
+      "require_frozen_gain": true,
+      "ignore_tdm_timing": false,
+      "require_valid_array": true,
+      "metadata": {
+        "subject_id": "replace-with-subject-id"
+      }
+    },
+    {
+      "id": "walking-human",
+      "scenario": "walking",
+      "bundle": "../data/measurements/6843aop/walking-human",
+      "calibration_bundle": "../data/measurements/6843aop/calibration-human",
+      "require_frozen_gain": true,
+      "ignore_tdm_timing": false,
+      "require_valid_array": true,
+      "metadata": {
+        "subject_id": "replace-with-subject-id",
+        "trajectory": "replace-with-trajectory"
+      }
+    }
+  ],
+  "experiments": [
+    {
+      "id": "baseline",
+      "track": "physical",
+      "solvers": [
+        "po",
+        "rt",
+        "hybrid_po"
+      ]
+    },
+    {
+      "id": "ray-budget",
+      "track": "numerical",
+      "solvers": [
+        "rt",
+        "hybrid_po"
+      ],
+      "sweep": {
+        "rt_samples_per_source": [
+          1000,
+          10000,
+          100000,
+          1000000
+        ],
+        "rt_max_paths_per_source": [
+          5000,
+          100000,
+          1000000
+        ]
+      }
+    },
+    {
+      "id": "interaction-truncation",
+      "track": "numerical",
+      "solvers": [
+        "rt",
+        "hybrid_po"
+      ],
+      "sweep": {
+        "rt_max_depth": [
+          2,
+          3,
+          4
+        ],
+        "rt_human_bounces": [
+          "single",
+          "any"
+        ]
+      }
+    },
+    {
+      "id": "po-integration",
+      "track": "numerical",
+      "solvers": [
+        "po",
+        "hybrid_po"
+      ],
+      "sweep": {
+        "po_integration_mode": [
+          "face_centroid",
+          "parent_face_quadrature",
+          "parent_face_adaptive_analytic"
+        ],
+        "po_curvature_error_rad": [
+          0.001,
+          0.005,
+          0.01
+        ],
+        "po_quadrature_phase_span_scale_rad": [
+          1.0,
+          3.0,
+          6.0
+        ]
+      }
+    },
+    {
+      "id": "po-refinement-budget",
+      "track": "numerical",
+      "scenarios": [
+        "stationary_human",
+        "walking"
+      ],
+      "solvers": [
+        "po",
+        "hybrid_po"
+      ],
+      "sweep": {
+        "po_quadrature_max_refinement_depth": [
+          2,
+          3,
+          6
+        ],
+        "po_quadrature_max_subfaces_per_parent": [
+          16,
+          64,
+          256
+        ]
+      }
+    },
+    {
+      "id": "rt-motion",
+      "track": "numerical",
+      "scenarios": [
+        "walking"
+      ],
+      "solvers": [
+        "rt"
+      ],
+      "sweep": {
+        "rt_refresh_frames": [
+          0,
+          1,
+          4
+        ],
+        "rt_refresh_on_displacement": [
+          null,
+          0.001,
+          0.005
+        ]
+      }
+    },
+    {
+      "id": "po-motion",
+      "track": "numerical",
+      "scenarios": [
+        "walking"
+      ],
+      "solvers": [
+        "po",
+        "hybrid_po"
+      ],
+      "sweep": {
+        "po_refresh_frames": [
+          0,
+          1,
+          4
+        ],
+        "po_refresh_on_phase_error_rad": [
+          0.03,
+          0.1,
+          0.5
+        ],
+        "po_refresh_on_area_fraction": [
+          0.02,
+          0.3
+        ],
+        "po_refresh_on_normal_deg": [
+          1.0,
+          20.0
+        ]
+      }
+    },
+    {
+      "id": "visibility",
+      "track": "numerical",
+      "solvers": [
+        "po",
+        "hybrid_po"
+      ],
+      "design": "grid",
+      "sweep": {
+        "po_visibility_samples_per_face": [
+          1,
+          4,
+          16
+        ],
+        "po_adaptive_visibility_sampling": [
+          false,
+          true
+        ]
+      }
+    },
+    {
+      "id": "visibility-motion",
+      "track": "numerical",
+      "scenarios": [
+        "walking"
+      ],
+      "solvers": [
+        "hybrid_po"
+      ],
+      "sweep": {
+        "po_visibility_refresh_frames": [
+          0,
+          1,
+          4
+        ],
+        "rt_visibility_refresh_frames": [
+          0,
+          1,
+          4
+        ]
+      }
+    },
+    {
+      "id": "reflector-budget",
+      "track": "numerical",
+      "scenarios": [
+        "stationary_human",
+        "walking"
+      ],
+      "solvers": [
+        "hybrid_po"
+      ],
+      "sweep": {
+        "hybrid_max_reflectors": [
+          1,
+          2,
+          4
+        ],
+        "hybrid_reflector_cutoff_db": [
+          -10.0,
+          -20.0,
+          -40.0
+        ]
+      },
+      "reference_settings": {
+        "hybrid_max_reflectors": 4,
+        "hybrid_reflector_cutoff_db": -40.0
+      }
+    },
+    {
+      "id": "coupling-model",
+      "track": "physical",
+      "scenarios": [
+        "stationary_human",
+        "walking"
+      ],
+      "solvers": [
+        "hybrid_po"
+      ],
+      "sweep": {
+        "hybrid_coupling": [
+          true,
+          false
+        ]
+      }
+    },
+    {
+      "id": "diffuse-model",
+      "track": "physical",
+      "scenarios": [
+        "stationary_human",
+        "walking"
+      ],
+      "solvers": [
+        "rt",
+        "hybrid_po"
+      ],
+      "sweep": {
+        "rt_diffuse_reflection": [
+          false,
+          true
+        ]
+      }
+    },
+    {
+      "id": "subarray-check",
+      "track": "numerical",
+      "enabled": false,
+      "solvers": [
+        "po",
+        "rt"
+      ],
+      "settings": {
+        "array_model": "subarray"
+      },
+      "sweep": {
+        "array_rx_groups": [
+          [
+            [
+              0,
+              1
+            ],
+            [
+              2,
+              3
+            ]
+          ],
+          [
+            [
+              0
+            ],
+            [
+              1
+            ],
+            [
+              2
+            ],
+            [
+              3
+            ]
+          ]
+        ]
+      },
+      "reference_settings": {
+        "array_model": "subarray",
+        "array_tx_groups": [
+          [
+            0
+          ],
+          [
+            1
+          ],
+          [
+            2
+          ]
+        ],
+        "array_rx_groups": [
+          [
+            0
+          ],
+          [
+            1
+          ],
+          [
+            2
+          ],
+          [
+            3
+          ]
+        ]
+      }
+    }
+  ]
+}

@@ -30,9 +30,9 @@ def _manifest() -> ExperimentManifest:
             parameters={"pattern_mode": "cosine30"},
         ),
         solver=SolverExperimentConfig(
-            mode="hybrid_rt_po",
+            solvers=("hybrid_po",),
             fidelity="preview",
-            parameters={"max_depth": 2},
+            parameters={"rt_max_depth": 2},
         ),
         measurement=MeasurementReference(
             bundle_id="example",
@@ -69,8 +69,21 @@ def test_manifest_reader_uses_documented_default_outputs():
     )
 
 
+def test_manifest_reader_explains_version_one_solver_mode():
+    payload = _manifest().to_dict()
+    payload["schema_version"] = 1
+    payload["solver"] = {"mode": "hybrid_rt_po", "fidelity": "preview"}
+
+    with pytest.raises(ValueError, match="version 2 lists solver.solvers"):
+        ExperimentManifest.from_dict(payload)
+
+
 def test_manifest_rejects_unknown_solver_and_duplicate_frames():
-    with pytest.raises(ValueError, match="solver.mode"):
-        SolverExperimentConfig(mode="unknown")
+    with pytest.raises(ValueError, match="solver.solvers entry must be one of"):
+        SolverExperimentConfig(solvers=("unknown",))
+    with pytest.raises(ValueError, match="replaced by 'hybrid_po'"):
+        SolverExperimentConfig(solvers=("hybrid_rt_po",))
+    with pytest.raises(ValueError, match="duplicates"):
+        SolverExperimentConfig(solvers=("rt", "rt"))
     with pytest.raises(ValueError, match="duplicates"):
         MeasurementReference(bundle_id="clip", frame_indices=(0, 0))

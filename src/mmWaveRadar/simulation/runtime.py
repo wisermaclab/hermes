@@ -12,6 +12,13 @@ from typing import Any
 
 import mitsuba as mi
 
+from .compute import (
+    resolve_torch_runtime,
+    select_torch_device,
+    torch_cuda_is_available,
+    torch_mps_is_available,
+)
+
 
 def configure_mitsuba_variant(*, prefer_gpu: bool = True) -> str:
     """
@@ -42,17 +49,6 @@ def configure_mitsuba_variant(*, prefer_gpu: bool = True) -> str:
     return mi.variant()
 
 
-def _torch_cuda_is_available(torch) -> bool:
-    """Returns whether Torch reports an available CUDA backend."""
-
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore")
-        try:
-            return bool(torch.cuda.is_available())
-        except (AssertionError, RuntimeError):
-            return False
-
-
 def _torch_cuda_device_count(torch) -> int:
     """Returns the Torch CUDA device count, suppressing backend probe failures."""
 
@@ -62,41 +58,6 @@ def _torch_cuda_device_count(torch) -> int:
             return int(torch.cuda.device_count())
         except (AssertionError, RuntimeError):
             return 0
-
-
-def _torch_mps_is_available(torch) -> bool:
-    """Returns whether Torch reports an available Apple MPS backend."""
-
-    mps_backend = getattr(torch.backends, "mps", None)
-    if mps_backend is None:
-        return False
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore")
-        try:
-            return bool(mps_backend.is_available())
-        except (AssertionError, RuntimeError):
-            return False
-
-
-def select_torch_device(*, prefer_gpu: bool = True, prefer_mps: bool = True) -> str:
-    """Returns the best available Torch device for mesh/model preprocessing."""
-
-    try:
-        import torch  # pylint: disable=import-outside-toplevel
-    except ImportError:
-        return "cpu"
-    requested = os.environ.get("MMWAVE_TORCH_DEVICE")
-    if requested:
-        try:
-            torch.empty((1,), device=requested)
-            return requested
-        except (AssertionError, RuntimeError, TypeError):
-            pass
-    if prefer_gpu and _torch_cuda_is_available(torch):
-        return "cuda"
-    if prefer_mps and _torch_mps_is_available(torch):
-        return "mps"
-    return "cpu"
 
 
 def torch_runtime_summary() -> dict[str, Any]:
@@ -110,7 +71,7 @@ def torch_runtime_summary() -> dict[str, Any]:
             "torch_device": "cpu",
         }
 
-    cuda_available = _torch_cuda_is_available(torch)
+    cuda_available = torch_cuda_is_available(torch)
     cuda_device_count = _torch_cuda_device_count(torch)
     summary: dict[str, Any] = {
         "torch_available": True,
@@ -118,8 +79,14 @@ def torch_runtime_summary() -> dict[str, Any]:
         "torch_device": select_torch_device(),
         "torch_cuda_available": cuda_available,
         "torch_cuda_device_count": cuda_device_count,
-        "torch_mps_available": _torch_mps_is_available(torch),
+        "torch_mps_available": torch_mps_is_available(torch),
     }
+    for precision in ("float32", "float64"):
+        runtime = resolve_torch_runtime("auto", precision)
+        summary[f"compute_{precision}"] = {
+            "backend": "numpy" if runtime is None else "torch",
+            "device": "cpu" if runtime is None else str(runtime.device),
+        }
     requested_device = os.environ.get("MMWAVE_TORCH_DEVICE")
     if requested_device:
         summary["torch_device_requested"] = requested_device

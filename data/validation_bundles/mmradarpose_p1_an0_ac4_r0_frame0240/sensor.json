@@ -25,7 +25,6 @@
     "num_chirps_per_frame": 128,
     "frame_period_s": 0.06666666666666667,
     "num_tx": 3,
-    "tdm_enabled": true,
     "physical_num_tx": 3,
     "num_rx": 4,
     "exported_virtual_channels": 12,
@@ -33,7 +32,17 @@
     "unambiguous_range_m": 9.49,
     "doppler_resolution_mps": 0.078,
     "unambiguous_doppler_velocity_mps": 5.02,
-    "source": "Table 3 of the mmRadarPose paper; chirp repetition time is 32 ms / (128 loops * 3 transmitters)."
+    "source": "Table 3 of the mmRadarPose paper; chirp repetition time is 32 ms / (128 loops * 3 transmitters).",
+    "tx_schedule": "tdm",
+    "carrier_frequency_status": "nominal_first_sample_assumption; source ADC start delay unavailable",
+    "carrier_reference": "first_adc_sample",
+    "tdm_tx_order": [
+      0,
+      1,
+      2
+    ],
+    "adc_mode": "complex1x",
+    "if_bandwidth_hz": null
   },
   "virtual_channel_order": "tx_major",
   "metadata": {
@@ -365,5 +374,68 @@
         "environment": "environment.json"
       }
     }
-  }
+  },
+  "name": "mmradarpose_p1_an0_ac4_r0_radar",
+  "position": [
+    0.0,
+    0.0,
+    0.0
+  ],
+  "orientation": [
+    1.5707963267948966,
+    0.0,
+    0.0
+  ],
+  "cosine_3db_beamwidth_deg": 60.0,
+  "adc_units": "counts",
+  "channel_map": [
+    [
+      0,
+      0
+    ],
+    [
+      0,
+      1
+    ],
+    [
+      0,
+      2
+    ],
+    [
+      0,
+      3
+    ],
+    [
+      1,
+      0
+    ],
+    [
+      1,
+      1
+    ],
+    [
+      1,
+      2
+    ],
+    [
+      1,
+      3
+    ],
+    [
+      2,
+      0
+    ],
+    [
+      2,
+      1
+    ],
+    [
+      2,
+      2
+    ],
+    [
+      2,
+      3
+    ]
+  ]
 }
