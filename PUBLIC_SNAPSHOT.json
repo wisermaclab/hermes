@@ -44,7 +44,7 @@
     {
       "mode": "100644",
       "path": "README.md",
-      "sha256": "c571c43a6e5010eb3abc95c4b9ace4791744d00c488d28b6f0a0e3096dbee559"
+      "sha256": "a5a439709eaddad81186533e44f6074852a5118b04c1c8aa95a5315bb4e66bec"
     },
     {
       "mode": "100644",
@@ -304,7 +304,12 @@
     {
       "mode": "100644",
       "path": "docs/tutorial/index.html",
-      "sha256": "afc6ffdf669d1fa3f4176c7f09d66339ec6f43d1bdff6a7a810a2e0529f95ffb"
+      "sha256": "a9f212b697e5cad649e5443f0eebb76f14f6d2b7f54f1826103ad91debc87f1f"
+    },
+    {
+      "mode": "100644",
+      "path": "docs/user_guide.md",
+      "sha256": "74ce264f7959e07bdd524df354ec02ef4eac1788970d58e893370600de1020ca"
     },
     {
       "mode": "100644",
@@ -1113,6 +1118,11 @@
     },
     {
       "mode": "100644",
+      "path": "tools/build_docs_site.py",
+      "sha256": "198d34da8b5a8c14462e87449498061374c307b8da5e85bef5a0d0e9a8cb2cad"
+    },
+    {
+      "mode": "100644",
       "path": "tools/bundle_prepare/ADAPTER_GUIDE.md",
       "sha256": "74d95c39e0a318cf8f34ab3cfb79aeb815a41179d45b4c067934ef8843ea82cd"
     },
@@ -1422,8 +1432,8 @@
       "sha256": "40dbdb5131c93f6f68303474fdb4a5cbb438ae9b3e554d987cabfc75ae966f28"
     }
   ],
-  "policy_sha256": "7b75f45763b3eea1262e2a60fa65dcc35c277720041a46671cf202dca9ef18d3",
+  "policy_sha256": "2566472853f2130c2a1f93e5c619adcc7e115c1b79e5c0793362f8b168a87b8f",
   "schema_version": 1,
-  "source_commit": "02161c0216fbf0d11f9f95cb8e9ac5d1f0a49544",
-  "tree_sha256": "d7b0f6342427f5795dc0bf84bbd2cd8ff09c5a255bbe27e184650545392dde2d"
+  "source_commit": "6c41c8505f49c90394a688f6295061c95c65b970",
+  "tree_sha256": "49dce04d8e625d3b1bba4416ff4142ec40eb6b05280708b83ab6525a223ecf28"
 }
