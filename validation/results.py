@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import json
+from mmWaveRadar.dsp.profiles import mean_range_profile
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -40,11 +41,7 @@ def save_maps_npz(path: str | Path, **arrays) -> None:
 
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    payload = {
-        key: value
-        for key, value in arrays.items()
-        if value is not None
-    }
+    payload = {key: value for key, value in arrays.items() if value is not None}
     np.savez_compressed(path, **payload)
 
 
@@ -58,8 +55,9 @@ def plot_range_time(path: str | Path, power: np.ndarray, ranges_m: np.ndarray) -
     fig, ax = plt.subplots(figsize=(7, 4))
     image = _relative_db(power).T
     extent = [0, power.shape[0] - 1, ranges_m[0], ranges_m[-1]]
-    im = ax.imshow(image, aspect="auto", origin="lower", extent=extent,
-                   cmap="viridis", vmin=-60.0, vmax=0.0)
+    im = ax.imshow(
+        image, aspect="auto", origin="lower", extent=extent, cmap="viridis", vmin=-60.0, vmax=0.0
+    )
     ax.set_xlabel("Slow-time index")
     ax.set_ylabel("Range [m]")
     ax.set_title("Range-time power")
@@ -101,15 +99,22 @@ def plot_range_time_comparison(
         panels.append(np.asarray(power, dtype=float))
         titles.append(f"{label} range-time")
     extent = [0, real.shape[0] - 1, ranges_m[0], ranges_m[-1]]
-    fig, axes = plt.subplots(1, len(panels), figsize=(6 * len(panels), 4),
-                             sharey=True,
-                             constrained_layout=True)
+    fig, axes = plt.subplots(
+        1, len(panels), figsize=(6 * len(panels), 4), sharey=True, constrained_layout=True
+    )
     axes = np.atleast_1d(axes)
     im = None
     for ax, panel, title in zip(axes, panels, titles):
         image = _relative_db(panel).T
-        im = ax.imshow(image, aspect="auto", origin="lower", extent=extent,
-                       cmap="viridis", vmin=-60.0, vmax=0.0)
+        im = ax.imshow(
+            image,
+            aspect="auto",
+            origin="lower",
+            extent=extent,
+            cmap="viridis",
+            vmin=-60.0,
+            vmax=0.0,
+        )
         ax.set_xlabel("Slow-time index")
         ax.set_title(title)
     axes[0].set_ylabel("Range [m]")
@@ -179,8 +184,9 @@ def plot_range_doppler(
         velocities_mps,
     )
     extent = [ranges_m[0], ranges_m[-1], plot_velocities[0], plot_velocities[-1]]
-    im = ax.imshow(image, aspect="auto", origin="lower", extent=extent,
-                   cmap="magma", vmin=-60.0, vmax=0.0)
+    im = ax.imshow(
+        image, aspect="auto", origin="lower", extent=extent, cmap="magma", vmin=-60.0, vmax=0.0
+    )
     ax.set_xlabel("Range [m]")
     ax.set_ylabel("Velocity [m/s, +away]")
     ax.set_title("Range-Doppler power")
@@ -223,15 +229,16 @@ def plot_range_doppler_comparison(
         titles.append(f"{label} range-Doppler")
     plot_velocities = _increasing_velocity_axis(velocities_mps)
     extent = [ranges_m[0], ranges_m[-1], plot_velocities[0], plot_velocities[-1]]
-    fig, axes = plt.subplots(1, len(panels), figsize=(6 * len(panels), 4),
-                             sharey=True,
-                             constrained_layout=True)
+    fig, axes = plt.subplots(
+        1, len(panels), figsize=(6 * len(panels), 4), sharey=True, constrained_layout=True
+    )
     axes = np.atleast_1d(axes)
     im = None
     for ax, panel, title in zip(axes, panels, titles):
         image, _ = _image_with_increasing_velocity(_relative_db(panel), velocities_mps)
-        im = ax.imshow(image, aspect="auto", origin="lower", extent=extent,
-                       cmap="magma", vmin=-60.0, vmax=0.0)
+        im = ax.imshow(
+            image, aspect="auto", origin="lower", extent=extent, cmap="magma", vmin=-60.0, vmax=0.0
+        )
         ax.set_xlabel("Range [m]")
         ax.set_title(title)
     axes[0].set_ylabel("Velocity [m/s, +away]")
@@ -340,8 +347,4 @@ def _select_frame(power: np.ndarray, frame_index: int) -> np.ndarray:
     return value[int(frame_index)]
 
 
-def _mean_range_profile(power: np.ndarray) -> np.ndarray:
-    value = np.asarray(power, dtype=float)
-    if value.ndim == 1:
-        return value
-    return np.mean(value, axis=tuple(range(value.ndim - 1)))
+_mean_range_profile = mean_range_profile

@@ -89,9 +89,7 @@ MATERIAL_PROFILES = {
 def parse_float_list(text: str, expected: int, name: str) -> tuple[float, ...]:
     values = tuple(float(part.strip()) for part in text.split(",") if part.strip())
     if len(values) != expected:
-        raise argparse.ArgumentTypeError(
-            f"{name} must contain {expected} comma-separated values"
-        )
+        raise argparse.ArgumentTypeError(f"{name} must contain {expected} comma-separated values")
     return values
 
 
@@ -206,7 +204,9 @@ def valid_wall_candidate(candidate: AxisPlane, *, min_height: float, min_span: f
     return z_span >= min_height and lateral_span >= min_span
 
 
-def choose_walls(points: np.ndarray, args) -> tuple[Optional[AxisPlane], Optional[AxisPlane], Optional[AxisPlane]]:
+def choose_walls(
+    points: np.ndarray, args
+) -> tuple[Optional[AxisPlane], Optional[AxisPlane], Optional[AxisPlane]]:
     x_candidates = axis_plane_candidates(
         points,
         0,
@@ -219,7 +219,9 @@ def choose_walls(points: np.ndarray, args) -> tuple[Optional[AxisPlane], Optiona
         candidate
         for candidate in x_candidates
         if candidate.value >= np.percentile(points[:, 0], 45)
-        and valid_wall_candidate(candidate, min_height=args.min_wall_height, min_span=args.min_wall_span)
+        and valid_wall_candidate(
+            candidate, min_height=args.min_wall_height, min_span=args.min_wall_span
+        )
     ]
     back_wall = x_candidates[0] if x_candidates else None
 
@@ -234,7 +236,9 @@ def choose_walls(points: np.ndarray, args) -> tuple[Optional[AxisPlane], Optiona
     y_candidates = [
         candidate
         for candidate in y_candidates
-        if valid_wall_candidate(candidate, min_height=args.min_wall_height, min_span=args.min_wall_span)
+        if valid_wall_candidate(
+            candidate, min_height=args.min_wall_height, min_span=args.min_wall_span
+        )
     ]
     if not y_candidates:
         return back_wall, None, None
@@ -565,7 +569,11 @@ def connected_components_grid(
                         visited.add(neighbor)
                         queue.append(neighbor)
         indices = np.array(
-            [index for component_cell in component_cells for index in cell_to_indices[component_cell]],
+            [
+                index
+                for component_cell in component_cells
+                for index in cell_to_indices[component_cell]
+            ],
             dtype=np.int64,
         )
         if len(indices) >= min_points:
@@ -584,9 +592,8 @@ def furniture_surfaces(
     args,
 ) -> list[BoxSurface]:
     z_floor = floor.value
-    candidate = (
-        (points[:, 2] > z_floor + args.furniture_min_above_floor)
-        & (points[:, 2] < z_floor + args.furniture_max_above_floor)
+    candidate = (points[:, 2] > z_floor + args.furniture_min_above_floor) & (
+        points[:, 2] < z_floor + args.furniture_max_above_floor
     )
     candidate &= np.abs(points[:, 2] - z_floor) > args.plane_threshold
     if back_wall is not None:
@@ -629,7 +636,14 @@ def furniture_surfaces(
                 f"furniture_{cluster_number:02d}",
                 semantic,
                 "furniture",
-                (float(low[0]), float(high[0]), float(low[1]), float(high[1]), float(low[2]), float(high[2])),
+                (
+                    float(low[0]),
+                    float(high[0]),
+                    float(low[1]),
+                    float(high[1]),
+                    float(low[2]),
+                    float(high[2]),
+                ),
                 source_points=len(indices),
                 confidence=min(1.0, len(indices) / max(1, args.min_furniture_points * 4)),
             )
@@ -919,7 +933,9 @@ def main(argv: list[str] | None = None) -> int:
     back_wall, left_wall, right_wall = choose_walls(points, args)
     surfaces = room_surfaces(points, floor, back_wall, left_wall, right_wall, args)
     if not args.no_furniture:
-        surfaces.extend(furniture_surfaces(points, surfaces, floor, back_wall, left_wall, right_wall, args))
+        surfaces.extend(
+            furniture_surfaces(points, surfaces, floor, back_wall, left_wall, right_wall, args)
+        )
 
     vertices, faces = build_mesh(surfaces)
 

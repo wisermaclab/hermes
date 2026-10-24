@@ -1,7 +1,12 @@
 # SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
 # Copyright (c) 2026 Wireless System Research Group, McMaster University
 
-"""Lightweight periodic RT retracing profiler."""
+"""Lightweight profiler for choosing the RT retrace cadence.
+
+Candidate cadences are ``rt_refresh_frames`` values, as in every entry point:
+``0`` retraces every chirp and ``N`` retraces at the start of every N radar
+frames. Transitions between profiled pilot traces are measured in chirps.
+"""
 
 from __future__ import annotations
 
@@ -11,6 +16,9 @@ from typing import Mapping, Sequence
 
 import numpy as np
 
+from .path_products import coherent_channel
+from ..naming import validate_frames
+from .cadence import refresh_period_chirps
 from .rt_coherence import (
     CoherentRTPathBank,
     match_coherent_rt_path_banks,
@@ -52,7 +60,10 @@ class RTTransitionMetrics:
 
 @dataclass(frozen=True)
 class RTScheduleCostPoint:
-    """One profiled point on the periodic retracing cost-performance curve."""
+    """One profiled point on the RT retrace cost-performance curve.
+
+    ``parameter_value`` is the profiled ``rt_refresh_frames``.
+    """
 
     policy: str
     parameter_name: str
@@ -70,7 +81,7 @@ class RTScheduleCostPoint:
 
 @dataclass(frozen=True)
 class RTFixedScheduleCurveProfile:
-    """Cost-performance curve for periodic retracing intervals."""
+    """Cost-performance curve over ``rt_refresh_frames`` cadences."""
 
     periodic_curve: tuple[RTScheduleCostPoint, ...]
 
@@ -93,8 +104,8 @@ def rt_profile_trace_budget(
 def select_budgeted_pilot_indices(
     vertices_by_chirp: Sequence[np.ndarray],
     *,
-    candidate_periods_chirps: Sequence[int] = (1, 2, 4, 8, 16, 32, 64),
-    num_chirps_per_frame: int | None = None,
+    num_chirps_per_frame: int,
+    rt_refresh_frames: Sequence[int] = (0, 1, 2, 4, 8),
     max_profile_fraction: float = 0.05,
     max_trace_count: int | None = None,
     pairs_per_interval: int = 2,
@@ -108,7 +119,8 @@ def select_budgeted_pilot_indices(
     total_chirps = int(vertices.shape[0])
     budget = (
         rt_profile_trace_budget(total_chirps, max_fraction=max_profile_fraction)
-        if max_trace_count is None else int(max_trace_count)
+        if max_trace_count is None
+        else int(max_trace_count)
     )
     budget = max(min(budget, total_chirps), 0)
     if budget < 2 or total_chirps < 2:
@@ -119,8 +131,17 @@ def select_budgeted_pilot_indices(
             profile_trace_fraction=0.0,
         )
 
-    sampled_vertices = vertices[:, ::max(int(vertex_stride), 1), :]
-    periods = _sanitize_periods(candidate_periods_chirps, total_chirps, num_chirps_per_frame)
+    sampled_vertices = vertices[:, :: max(int(vertex_stride), 1), :]
+    periods = tuple(
+        sorted(
+            {
+                period
+                for _, period in _refresh_periods(
+                    rt_refresh_frames, total_chirps, num_chirps_per_frame
+                )
+            }
+        )
+    )
     pair_candidates_by_interval: dict[int, list[tuple[float, int, int]]] = {}
     for interval in periods:
         displacement = np.linalg.norm(
@@ -180,8 +201,7 @@ def select_budgeted_pilot_indices(
         pairs=tuple(selected_pairs),
         budget_trace_count=budget,
         profile_trace_fraction=(
-            float(selected_indices.size) / float(total_chirps)
-            if total_chirps else 0.0
+            float(selected_indices.size) / float(total_chirps) if total_chirps else 0.0
         ),
     )
 
@@ -280,17 +300,18 @@ def profile_transition_metrics(
     return tuple(metrics)
 
 
-def periodic_retrace_schedule_indices(
+def rt_retrace_schedule_indices(
     total_chirps: int,
     *,
-    period_chirps: int,
+    num_chirps_per_frame: int,
+    rt_refresh_frames: int,
 ) -> np.ndarray:
-    """Returns causal periodic retrace indices starting at chirp 0."""
+    """Returns the chirps an RT run retraces at, starting at chirp 0."""
 
     total_chirps = int(total_chirps)
     if total_chirps <= 0:
         return np.empty(0, dtype=np.int64)
-    interval = max(int(period_chirps), 1)
+    interval = _refresh_period_chirps(rt_refresh_frames, num_chirps_per_frame)
     return np.arange(0, total_chirps, interval, dtype=np.int64)
 
 
@@ -315,10 +336,10 @@ def profile_fixed_retrace_scheme_curves(
     metrics: Sequence[RTTransitionMetrics],
     *,
     vertices_by_chirp: Sequence[np.ndarray],
-    periodic_periods_chirps: Sequence[int] = (1, 2, 4, 8, 16, 32, 64),
-    num_chirps_per_frame: int | None = None,
+    num_chirps_per_frame: int,
+    rt_refresh_frames: Sequence[int] = (0, 1, 2, 4, 8),
 ) -> RTFixedScheduleCurveProfile:
-    """Profiles periodic retracing periods K as a cost-performance curve."""
+    """Profiles ``rt_refresh_frames`` cadences as a cost-performance curve."""
 
     vertices = np.asarray(vertices_by_chirp)
     if vertices.ndim != 3 or vertices.shape[-1] != 3:
@@ -334,10 +355,11 @@ def profile_fixed_retrace_scheme_curves(
         _periodic_cost_point(
             metrics,
             total_chirps=total_chirps,
+            rt_refresh_frames=frames,
             period_chirps=period,
         )
-        for period in _sanitize_periods(
-            periodic_periods_chirps,
+        for frames, period in _refresh_periods(
+            rt_refresh_frames,
             total_chirps,
             num_chirps_per_frame,
         )
@@ -345,28 +367,31 @@ def profile_fixed_retrace_scheme_curves(
     return RTFixedScheduleCurveProfile(periodic_curve=periodic_curve)
 
 
-def recommend_periodic_retrace_period(
+def recommend_rt_refresh_frames(
     profile: RTFixedScheduleCurveProfile,
     *,
     max_mean_channel_error: float | None = None,
     max_retrace_fraction: float | None = None,
 ) -> RTScheduleCostPoint | None:
-    """Chooses the periodic K to pass as ``periodic_retrace_period_chirps``.
+    """Chooses an ``rt_refresh_frames`` cadence from a profiled curve.
 
-    With an error target, this returns the cheapest profiled K satisfying
-    the target. With only a cost target, it returns the lowest-error period
-    within the cost budget. If both targets are provided, both must be met.
+    The returned point's ``parameter_value`` is the cadence. With an error
+    target, this returns the cheapest profiled cadence satisfying the target.
+    With only a cost target, it returns the lowest-error cadence within the
+    cost budget. If both targets are provided, both must be met.
     """
 
     candidates = list(profile.periodic_curve)
     if max_mean_channel_error is not None:
         candidates = [
-            point for point in candidates
+            point
+            for point in candidates
             if point.mean_channel_error <= float(max_mean_channel_error)
         ]
     if max_retrace_fraction is not None:
         candidates = [
-            point for point in candidates
+            point
+            for point in candidates
             if point.estimated_retrace_fraction <= float(max_retrace_fraction)
         ]
     if not candidates:
@@ -392,17 +417,18 @@ def _periodic_cost_point(
     metrics: Sequence[RTTransitionMetrics],
     *,
     total_chirps: int,
+    rt_refresh_frames: int,
     period_chirps: int,
 ) -> RTScheduleCostPoint:
-    """Builds a cost point for a fixed periodic retrace period."""
+    """Builds a cost point for one retrace cadence."""
 
     period = max(int(period_chirps), 1)
-    schedule = periodic_retrace_schedule_indices(total_chirps, period_chirps=period)
+    schedule = np.arange(0, int(total_chirps), period, dtype=np.int64)
     profiled = () if period == 1 else _metrics_for_periodic_period(metrics, period)
     return _cost_point_from_metrics(
         policy="periodic",
-        parameter_name="period_chirps",
-        parameter_value=float(period),
+        parameter_name="rt_refresh_frames",
+        parameter_value=float(rt_refresh_frames),
         schedule_indices=schedule,
         total_chirps=total_chirps,
         metrics=profiled,
@@ -452,7 +478,9 @@ def _metrics_for_periodic_period(
     within = tuple(metric for metric in metrics if 0 < int(metric.interval_chirps) < period)
     if within:
         return within
-    closest = min(metrics, key=lambda metric: abs(int(metric.interval_chirps) - max(period - 1, 1)))
+    closest = min(
+        metrics, key=lambda metric: abs(int(metric.interval_chirps) - max(period - 1, 1))
+    )
     return (closest,)
 
 
@@ -489,37 +517,44 @@ def _best_common_anchor(sampled_vertices: np.ndarray, intervals: Sequence[int]) 
     scores = np.zeros(limit, dtype=np.float64)
     for interval in intervals:
         displacement = np.linalg.norm(
-            sampled_vertices[:limit] - sampled_vertices[interval:interval + limit],
+            sampled_vertices[:limit] - sampled_vertices[interval : interval + limit],
             axis=2,
         )
         scores = np.maximum(scores, np.max(displacement, axis=1))
     return int(np.argmax(scores))
 
 
-def _sanitize_periods(
-    candidate_periods_chirps: Sequence[int],
+def _refresh_period_chirps(rt_refresh_frames, num_chirps_per_frame) -> int:
+    """Converts an ``rt_refresh_frames`` cadence to a retrace interval in chirps."""
+
+    frames = validate_frames(rt_refresh_frames, name="rt_refresh_frames")
+    chirps = int(num_chirps_per_frame)
+    if chirps <= 0:
+        raise ValueError("num_chirps_per_frame must be positive")
+    return refresh_period_chirps(frames, chirps)
+
+
+def _refresh_periods(
+    rt_refresh_frames: Sequence[int],
     total_chirps: int,
-    num_chirps_per_frame: int | None = None,
-) -> tuple[int, ...]:
-    """Filters candidate periods to valid positive chirp intervals."""
+    num_chirps_per_frame: int,
+) -> tuple[tuple[int, int], ...]:
+    """Returns (cadence, interval in chirps) pairs that fit the profiled run."""
 
     total_chirps = int(total_chirps)
-    frame_chirps = None
-    if num_chirps_per_frame is not None:
-        frame_chirps = int(num_chirps_per_frame)
-        if frame_chirps <= 0:
-            raise ValueError("num_chirps_per_frame must be positive")
-    periods = sorted({
-        int(period)
-        for period in candidate_periods_chirps
-        if (
-            0 < int(period) <= total_chirps
-            and (frame_chirps is None or frame_chirps % int(period) == 0)
-        )
-    })
+    periods = {}
+    for frames in rt_refresh_frames:
+        period = _refresh_period_chirps(frames, num_chirps_per_frame)
+        if period <= total_chirps:
+            periods.setdefault(period, int(frames))
     if not periods and total_chirps > 0:
-        periods = [1]
-    return tuple(periods)
+        periods[1] = 0
+    return tuple(
+        sorted(
+            ((frames, period) for period, frames in periods.items()),
+            key=lambda item: item[1],
+        )
+    )
 
 
 def _even_anchor_indices(count: int, keep: int) -> list[int]:
@@ -530,18 +565,7 @@ def _even_anchor_indices(count: int, keep: int) -> list[int]:
     return [int(round(v)) for v in np.linspace(0, count - 1, keep)]
 
 
-def _coherent_sum(coefficients: np.ndarray, valid: np.ndarray) -> np.ndarray:
-    """Sums valid path coefficients coherently per virtual channel."""
-
-    coefficients = np.asarray(coefficients, dtype=np.complex128)
-    valid = np.asarray(valid, dtype=bool)
-    if coefficients.ndim != 2:
-        raise ValueError("coefficients must have shape [channel, path]")
-    if valid.shape != (coefficients.shape[1],):
-        raise ValueError("valid must have shape [path]")
-    if not np.any(valid):
-        return np.zeros(coefficients.shape[0], dtype=np.complex128)
-    return np.sum(coefficients[:, valid], axis=1)
+_coherent_sum = coherent_channel
 
 
 def _coefficient_power(coefficients: np.ndarray, indices: np.ndarray) -> float:

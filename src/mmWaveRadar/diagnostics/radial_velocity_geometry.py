@@ -19,6 +19,13 @@ from typing import Any, Mapping, Sequence
 
 import numpy as np
 
+from mmWaveRadar.tutorial_support import (
+    radar_pose_in_front_of_chest as radar_pose_in_front_of_chest,
+)
+from mmWaveRadar.tutorial_support import orientation_toward as _orientation_toward
+from mmWaveRadar.tutorial_support import smpl_chest_front as _smpl_chest_front
+from mmWaveRadar.tutorial_support import amass_marker_dict as _amass_marker_dict
+from mmWaveRadar.tutorial_support import mean_marker as _mean_marker
 from ..radar import FMCWConfig, RadarHardware, RadarSensor
 from ..simulation.motion_diagnostics import (
     RadialVelocitySamples,
@@ -26,7 +33,6 @@ from ..simulation.motion_diagnostics import (
     radial_velocity_summary,
 )
 from ..targets import MeshSequence, amass_to_mesh_sequence, load_amass_npz
-
 
 _LIGHT_SPEED_MPS = 299792458.0
 _DEFAULT_PERCENTILES = (50.0, 90.0, 95.0, 99.0, 99.9, 100.0)
@@ -137,14 +143,8 @@ def format_radial_velocity_report(result: RadialVelocityDiagnosticResult) -> str
             f"time={result.mesh_time_span_s[0]:.3f}.."
             f"{result.mesh_time_span_s[1]:.3f} s"
         ),
-        (
-            "  radar position: "
-            f"{np.array2string(result.radar_position, precision=4)}"
-        ),
-        (
-            "  radar orientation: "
-            f"{np.array2string(result.radar_orientation, precision=4)}"
-        ),
+        ("  radar position: " f"{np.array2string(result.radar_position, precision=4)}"),
+        ("  radar orientation: " f"{np.array2string(result.radar_orientation, precision=4)}"),
         (
             "  channels: "
             f"tx={result.tx_positions.shape[0]}, "
@@ -156,42 +156,43 @@ def format_radial_velocity_report(result: RadialVelocityDiagnosticResult) -> str
     for point_kind, summary in result.summaries.items():
         abs_pct = summary["abs_percentiles_mps"]
         signed_pct = summary["signed_percentiles_mps"]
-        lines.extend([
-            "",
-            point_kind,
-            (
-                f"  samples={summary['sample_count']} "
-                f"time={summary['time_start_s']:.3f}.."
-                f"{summary['time_stop_s']:.3f} s"
-            ),
-            (
-                "  signed min/mean/max [m/s]: "
-                f"{summary['signed_min_mps']:.3f}, "
-                f"{summary['signed_mean_mps']:.3f}, "
-                f"{summary['signed_max_mps']:.3f}"
-            ),
-            f"  |v| mean [m/s]: {summary['abs_mean_mps']:.3f}",
-            (
-                "  |v| percentiles [m/s]: "
-                + ", ".join(
-                    f"p{_format_percentile_key(p)}={value:.3f}"
-                    for p, value in abs_pct.items()
-                )
-            ),
-            (
-                "  signed percentiles [m/s]: "
-                + ", ".join(
-                    f"p{_format_percentile_key(p)}={value:.3f}"
-                    for p, value in signed_pct.items()
-                )
-            ),
-            (
-                "  fraction |v| >= 5/10/20 m/s: "
-                f"{summary['fraction_abs_ge_5_mps']:.3e}, "
-                f"{summary['fraction_abs_ge_10_mps']:.3e}, "
-                f"{summary['fraction_abs_ge_20_mps']:.3e}"
-            ),
-        ])
+        lines.extend(
+            [
+                "",
+                point_kind,
+                (
+                    f"  samples={summary['sample_count']} "
+                    f"time={summary['time_start_s']:.3f}.."
+                    f"{summary['time_stop_s']:.3f} s"
+                ),
+                (
+                    "  signed min/mean/max [m/s]: "
+                    f"{summary['signed_min_mps']:.3f}, "
+                    f"{summary['signed_mean_mps']:.3f}, "
+                    f"{summary['signed_max_mps']:.3f}"
+                ),
+                f"  |v| mean [m/s]: {summary['abs_mean_mps']:.3f}",
+                (
+                    "  |v| percentiles [m/s]: "
+                    + ", ".join(
+                        f"p{_format_percentile_key(p)}={value:.3f}" for p, value in abs_pct.items()
+                    )
+                ),
+                (
+                    "  signed percentiles [m/s]: "
+                    + ", ".join(
+                        f"p{_format_percentile_key(p)}={value:.3f}"
+                        for p, value in signed_pct.items()
+                    )
+                ),
+                (
+                    "  fraction |v| >= 5/10/20 m/s: "
+                    f"{summary['fraction_abs_ge_5_mps']:.3e}, "
+                    f"{summary['fraction_abs_ge_10_mps']:.3e}, "
+                    f"{summary['fraction_abs_ge_20_mps']:.3e}"
+                ),
+            ]
+        )
     return "\n".join(lines)
 
 
@@ -309,9 +310,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             smpl_model_dir = Path(env_dir).expanduser()
 
     config = RadialVelocityDiagnosticConfig(
-        mesh_sequence_npz=Path(args.mesh_sequence_npz).expanduser()
-        if args.mesh_sequence_npz
-        else None,
+        mesh_sequence_npz=(
+            Path(args.mesh_sequence_npz).expanduser() if args.mesh_sequence_npz else None
+        ),
         amass_npz=Path(args.amass_npz).expanduser() if args.amass_npz else None,
         smpl_model_dir=smpl_model_dir,
         model_type=args.model_type,
@@ -359,10 +360,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     source.add_argument("--amass-npz", help="AMASS/SMPL motion NPZ.")
     parser.add_argument(
         "--smpl-model-dir",
-        help=(
-            "SMPL model directory for --amass-npz. Defaults to "
-            "MMWAVE_SMPL_MODEL_DIR when set."
-        ),
+        help=("SMPL model directory for --amass-npz. Defaults to MMWAVE_SMPL_MODEL_DIR when set."),
     )
     parser.add_argument(
         "--model-type",
@@ -557,31 +555,6 @@ def _resolve_radar_pose(
     )
 
 
-def radar_pose_in_front_of_chest(
-    mesh_sequence: MeshSequence,
-    *,
-    clearance_m: float = 0.50,
-    amass_data: Mapping[str, Any] | None = None,
-) -> tuple[np.ndarray, tuple[float, float, float], np.ndarray, np.ndarray]:
-    """Estimates a first-frame chest-facing radar pose."""
-
-    vertices = mesh_sequence.vertices_at(float(mesh_sequence.times[0]))
-    chest = _smpl_chest_front(vertices, amass_data)
-    if chest is None:
-        mins = vertices.min(axis=0)
-        maxs = vertices.max(axis=0)
-        chest_front_point = np.array(
-            [mins[0], 0.5 * (mins[1] + maxs[1]), 0.65 * maxs[2]],
-            dtype=float,
-        )
-        front_dir = np.array([-1.0, 0.0, 0.0], dtype=float)
-    else:
-        chest_front_point, front_dir = chest
-    radar_position = chest_front_point + float(clearance_m) * front_dir
-    radar_orientation = _orientation_toward(chest_front_point, radar_position)
-    return radar_position, radar_orientation, chest_front_point, front_dir
-
-
 def _make_radar_sensor(
     config: RadialVelocityDiagnosticConfig,
     radar_position: tuple[float, float, float],
@@ -670,93 +643,6 @@ def _normalize_point_kinds(point_kinds: Sequence[str]) -> tuple[str, ...]:
         if point_kind not in normalized:
             normalized.append(point_kind)
     return tuple(normalized)
-
-
-def _orientation_toward(
-    target_point: Sequence[float],
-    radar_position: Sequence[float],
-) -> tuple[float, float, float]:
-    """Returns Euler angles that point the radar boresight at ``target_point``."""
-
-    direction = np.asarray(target_point, dtype=float) - np.asarray(
-        radar_position,
-        dtype=float,
-    )
-    norm = np.linalg.norm(direction)
-    if norm <= 0.0:
-        raise ValueError("target point must differ from radar position")
-    direction /= norm
-    theta = np.arccos(np.clip(direction[2], -1.0, 1.0))
-    phi = np.arctan2(direction[1], direction[0])
-    return (float(phi), float(theta - 0.5 * np.pi), 0.0)
-
-
-def _smpl_chest_front(
-    vertices: np.ndarray,
-    amass_data: Mapping[str, Any] | None,
-) -> tuple[np.ndarray, np.ndarray] | None:
-    """Estimates a chest-front point and horizontal front direction from markers."""
-
-    markers = _amass_marker_dict(amass_data)
-    if not markers:
-        return None
-    sternum = _mean_marker(markers, ("STRN", "CLAV"))
-    front_ref = _mean_marker(markers, ("STRN", "LFSH", "RFSH"))
-    back_ref = _mean_marker(markers, ("TOPBACK", "MIDBACK", "LBSH", "RBSH"))
-    if sternum is None or front_ref is None or back_ref is None:
-        return None
-    front_xy = front_ref[:2] - back_ref[:2]
-    front_norm = np.linalg.norm(front_xy)
-    if front_norm < 1e-6:
-        return None
-    front_dir_xy = front_xy / front_norm
-    lateral_dir_xy = np.array([-front_dir_xy[1], front_dir_xy[0]])
-    z_span = max(float(vertices[:, 2].max() - vertices[:, 2].min()), 1e-6)
-    lateral = vertices[:, :2] @ lateral_dir_xy
-    lateral_center = float(sternum[:2] @ lateral_dir_xy)
-    torso = (
-        (np.abs(vertices[:, 2] - sternum[2]) <= max(0.12, 0.12 * z_span))
-        & (np.abs(lateral - lateral_center) <= 0.30)
-    )
-    if np.count_nonzero(torso) < 16:
-        torso = np.ones(vertices.shape[0], dtype=bool)
-    proj = vertices[:, :2] @ front_dir_xy
-    front_surface_proj = float(np.max(proj[torso]))
-    sternum_proj = float(sternum[:2] @ front_dir_xy)
-    chest_front_xy = sternum[:2] + (front_surface_proj - sternum_proj) * front_dir_xy
-    chest_front_point = np.array(
-        [chest_front_xy[0], chest_front_xy[1], sternum[2]],
-        dtype=float,
-    )
-    front_dir = np.array([front_dir_xy[0], front_dir_xy[1], 0.0], dtype=float)
-    return chest_front_point, front_dir
-
-
-def _amass_marker_dict(amass_data: Mapping[str, Any] | None) -> dict[str, np.ndarray]:
-    """Returns first-frame AMASS marker positions keyed by marker label."""
-
-    if amass_data is None:
-        return {}
-    if "marker_data" not in amass_data or "marker_labels" not in amass_data:
-        return {}
-    labels = [
-        label.decode("utf-8") if isinstance(label, bytes) else str(label)
-        for label in amass_data["marker_labels"]
-    ]
-    points = np.asarray(amass_data["marker_data"], dtype=float)[0]
-    return dict(zip(labels, points))
-
-
-def _mean_marker(
-    markers: Mapping[str, np.ndarray],
-    names: Sequence[str],
-) -> np.ndarray | None:
-    """Averages available markers from ``names`` or returns ``None``."""
-
-    points = [markers[name] for name in names if name in markers]
-    if not points:
-        return None
-    return np.mean(np.asarray(points, dtype=float), axis=0)
 
 
 def _flattened_values_and_weights(samples: RadialVelocitySamples) -> tuple[np.ndarray, np.ndarray]:

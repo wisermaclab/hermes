@@ -14,7 +14,6 @@ import numpy as np
 
 from mmWaveRadar.radar import FMCWConfig, RadarHardware
 
-
 REPO_ROOT = Path(__file__).resolve().parents[2]
 AMASS_DATA_ROOT = REPO_ROOT / "data" / "AMASS"
 VALIDATION_DATA_ROOT = REPO_ROOT / "data" / "validation_bundles"
@@ -72,9 +71,7 @@ VALIDATION_TEXT_FILES = {
 PROJECT_CODE_ROOTS = ("src", "validation", "tools", "benchmarks", "tests")
 PROJECT_CODE_SPDX = "SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0"
 MIXED_TI_SOURCE = Path("tools/bundle_prepare/rtpose/rtpose_adc.py")
-MIXED_TI_SPDX = (
-    "SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0 AND BSD-3-Clause"
-)
+MIXED_TI_SPDX = "SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0 AND BSD-3-Clause"
 
 
 class _SourceLinkParser(HTMLParser):
@@ -91,20 +88,14 @@ class _SourceLinkParser(HTMLParser):
 
 def test_project_license_files_metadata_and_source_headers_are_consistent():
     code_license = (REPO_ROOT / "LICENSE").read_text(encoding="utf-8")
-    docs_data_license = (REPO_ROOT / "LICENSE-DOCS-DATA").read_text(
-        encoding="utf-8"
-    )
+    docs_data_license = (REPO_ROOT / "LICENSE-DOCS-DATA").read_text(encoding="utf-8")
     notice = (REPO_ROOT / "NOTICE").read_text(encoding="utf-8")
-    commercial = (REPO_ROOT / "COMMERCIAL-LICENSING.md").read_text(
-        encoding="utf-8"
-    )
+    commercial = (REPO_ROOT / "COMMERCIAL-LICENSING.md").read_text(encoding="utf-8")
     package_metadata = (REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8")
 
     assert code_license.startswith("# PolyForm Noncommercial License 1.0.0\n")
     assert "polyformproject.org/licenses/noncommercial/1.0.0" in code_license
-    assert docs_data_license.startswith(
-        "Attribution-NonCommercial 4.0 International\n"
-    )
+    assert docs_data_license.startswith("Attribution-NonCommercial 4.0 International\n")
     assert 'license = "PolyForm-Noncommercial-1.0.0"' in package_metadata
     assert "LICENSE-DOCS-DATA" in package_metadata
     assert notice.startswith("Required Notice: Copyright (c) 2026 ")
@@ -113,9 +104,7 @@ def test_project_license_files_metadata_and_source_headers_are_consistent():
     assert "rzheng@mcmaster.ca" in commercial
 
     source_files = sorted(
-        path
-        for root in PROJECT_CODE_ROOTS
-        for path in (REPO_ROOT / root).rglob("*.py")
+        path for root in PROJECT_CODE_ROOTS for path in (REPO_ROOT / root).rglob("*.py")
     )
     assert source_files
     for path in source_files:
@@ -127,9 +116,7 @@ def test_project_license_files_metadata_and_source_headers_are_consistent():
 
 
 def test_third_party_fixtures_are_explicitly_excluded_from_project_licenses():
-    third_party_notice = (REPO_ROOT / "THIRD_PARTY_NOTICES.md").read_text(
-        encoding="utf-8"
-    )
+    third_party_notice = (REPO_ROOT / "THIRD_PARTY_NOTICES.md").read_text(encoding="utf-8")
     excluded_paths = (
         "data/AMASS/walking_poses_cmu_105_02.npz",
         "data/validation_bundles/rtpose_seq10_frame0020/",
@@ -155,19 +142,15 @@ def test_api_documentation_source_links_resolve():
 
 
 def test_demo_readme_lists_every_notebook():
-    notebook_names = {
-        path.name for path in (REPO_ROOT / "demo").glob("*.ipynb")
-    }
-    demo_readme = (REPO_ROOT / "demo" / "README.md").read_text(
-        encoding="utf-8"
-    )
+    notebook_names = {path.name for path in (REPO_ROOT / "demo").glob("*.ipynb")}
+    demo_readme = (REPO_ROOT / "demo" / "README.md").read_text(encoding="utf-8")
 
     missing = sorted(name for name in notebook_names if name not in demo_readme)
     assert not missing, f"Notebooks missing from demo/README.md: {missing}"
 
 
-def test_human_only_po_notebook_binds_fmcw_to_its_hardware():
-    notebook_path = REPO_ROOT / "demo" / "Human-Only-PO.ipynb"
+def test_po_notebook_binds_fmcw_to_its_hardware():
+    notebook_path = REPO_ROOT / "demo" / "PO.ipynb"
     notebook = json.loads(notebook_path.read_text(encoding="utf-8"))
     source = next(
         "".join(cell.get("source", []))
@@ -187,17 +170,15 @@ def test_human_only_po_notebook_binds_fmcw_to_its_hardware():
     assert fmcw.num_tx == hardware.num_tx == 1
 
 
-def test_human_only_po_notebook_is_a_focused_api_tutorial():
-    notebook_path = REPO_ROOT / "demo" / "Human-Only-PO.ipynb"
+def test_po_notebook_is_a_focused_api_tutorial():
+    notebook_path = REPO_ROOT / "demo" / "PO.ipynb"
     notebook = json.loads(notebook_path.read_text(encoding="utf-8"))
-    source = "\n".join(
-        "".join(cell.get("source", [])) for cell in notebook["cells"]
-    )
+    source = "\n".join("".join(cell.get("source", [])) for cell in notebook["cells"])
 
-    assert 'mobility_mode="human_only_po"' in source
+    assert 'solver="po"' in source
     assert '"face_centroid"' in source
     assert '"parent_face_far_field_analytic"' in source
-    assert "incremental_update=incremental" in source
+    assert "po_refresh_frames=1 if incremental else 0" in source
     assert "mesh_preview_times_s = np.linspace" in source
     assert "plot_mesh_projection" in source
     assert "plot_bedroom_scene_projection" in source
@@ -227,15 +208,11 @@ def test_public_demo_inventory_contains_only_focused_tutorials():
     expected = {
         "README.md",
         "Point-Targets.ipynb",
-        "Human-Only-PO.ipynb",
-        "Full-RT.ipynb",
+        "PO.ipynb",
+        "RT.ipynb",
         "Hybrid-PO.ipynb",
     }
-    actual = {
-        path.name
-        for path in (REPO_ROOT / "demo").iterdir()
-        if path.is_file()
-    }
+    actual = {path.name for path in (REPO_ROOT / "demo").iterdir() if path.is_file()}
 
     assert actual == expected
 
@@ -252,20 +229,18 @@ def test_public_demo_notebooks_are_output_free():
             if cell["cell_type"] == "code"
             and (cell.get("outputs") or cell.get("execution_count") is not None)
         ]
-        assert not saved_cells, (
-            f"{notebook_path.name} contains saved output in cells {saved_cells}"
-        )
+        assert (
+            not saved_cells
+        ), f"{notebook_path.name} contains saved output in cells {saved_cells}"
 
 
 def test_hybrid_po_notebook_is_a_focused_api_tutorial():
     notebook_path = REPO_ROOT / "demo" / "Hybrid-PO.ipynb"
     notebook = json.loads(notebook_path.read_text(encoding="utf-8"))
-    source = "\n".join(
-        "".join(cell.get("source", [])) for cell in notebook["cells"]
-    )
+    source = "\n".join("".join(cell.get("source", [])) for cell in notebook["cells"])
 
     assert "run_calibrated_hybrid_po" in source
-    assert 'coupling_enabled = True' in source
+    assert "hybrid_coupling = True" in source
     assert '"human_po"' in source
     assert '"static_environment_blocked"' in source
     assert '"human_env"' in source
@@ -274,7 +249,8 @@ def test_hybrid_po_notebook_is_a_focused_api_tutorial():
     assert "plot_mesh_projection" in source
     assert "plot_bedroom_scene_projection" in source
     assert "BEDROOM_SCENE_XML" in source
-    assert "BEDROOM_SCENE_BOXES" in source
+    assert "derived from that shared XML automatically" in source
+    assert "BEDROOM_SCENE_BOXES" not in source
     assert "range_profile_from_cube" in source
     assert "range_doppler_map" in source
     assert "db_relative" in source
@@ -301,21 +277,20 @@ def test_hybrid_po_notebook_is_a_focused_api_tutorial():
     assert not [name for name in research_diagnostics if name in source]
 
 
-def test_full_rt_notebook_is_a_focused_api_tutorial():
-    notebook_path = REPO_ROOT / "demo" / "Full-RT.ipynb"
+def test_rt_notebook_is_a_focused_api_tutorial():
+    notebook_path = REPO_ROOT / "demo" / "RT.ipynb"
     notebook = json.loads(notebook_path.read_text(encoding="utf-8"))
-    source = "\n".join(
-        "".join(cell.get("source", [])) for cell in notebook["cells"]
-    )
+    source = "\n".join("".join(cell.get("source", [])) for cell in notebook["cells"])
 
-    assert '"mobility_mode": "rt_retrace"' in source
-    assert '"mobility_mode": "rt_coherent_bank"' in source
+    assert 'solver="rt"' in source
+    assert '"rt_refresh_frames": 0' in source
+    assert '"rt_refresh_frames": 1' in source
     assert "coherent_depths = (1, 2, 4)" in source
-    assert '"retrace_period_chirps": 1' in source
     assert "plot_mesh_projection" in source
     assert "plot_bedroom_scene_projection" in source
     assert "BEDROOM_SCENE_XML" in source
-    assert "BEDROOM_SCENE_BOXES" in source
+    assert "derived from it automatically" in source
+    assert "BEDROOM_SCENE_BOXES" not in source
     assert "range_profile_from_cube" in source
     assert "range_doppler_map" in source
     assert "db_relative" in source
@@ -369,19 +344,14 @@ def test_cmu_walking_fixture_is_pickle_free_and_self_identifying():
         )
         assert archive["conversion_tool"].item() == "SparseSMPLFit"
         assert archive["conversion_tool_version"].item() == "0.1.0"
-        assert archive["source_shape_method"].item() == (
-            "asf_lengths+c3d_surface_markers"
-        )
+        assert archive["source_shape_method"].item() == ("asf_lengths+c3d_surface_markers")
         assert archive["source_skeleton"].item() == "105.asf"
         assert archive["source_motion"].item() == "105_02.amc.txt"
         assert archive["source_sync_metadata"].item() == "105_02.c3d"
         assert json.loads(archive["retarget_metrics"].item())["frames"] == 1748.0
         assert archive["source_retarget_frame_count"].item() == 1748
         assert archive["output_frame_count"].item() == 1748
-        assert (
-            json.loads(archive["source_retarget_metrics"].item())["frames"]
-            == 1748.0
-        )
+        assert json.loads(archive["source_retarget_metrics"].item())["frames"] == 1748.0
         assert (
             archive["source_asf_sha256"].item()
             == "de06a1ee5d917e4bd23461e22e49b43591ed8d9bd84a92d6b6927f423a972b30"
@@ -503,8 +473,9 @@ def test_public_validation_metadata_is_portable_and_discloses_neutralization():
         assert metadata["mesh_sequence_included"] is False
 
     rt_metadata = json.loads(
-        (VALIDATION_DATA_ROOT / "rtpose_seq10_frame0020/benchmark_metadata.json")
-        .read_text(encoding="utf-8")
+        (VALIDATION_DATA_ROOT / "rtpose_seq10_frame0020/benchmark_metadata.json").read_text(
+            encoding="utf-8"
+        )
     )
     privacy = rt_metadata["camera_privacy"]
     assert privacy["method"] == "opaque solid face mask"
@@ -513,20 +484,31 @@ def test_public_validation_metadata_is_portable_and_discloses_neutralization():
     assert privacy["image_size_px"] == [1440, 1080]
 
     rt_sensor = json.loads(
-        (VALIDATION_DATA_ROOT / "rtpose_seq10_frame0020/sensor.json").read_text(
-            encoding="utf-8"
-        )
+        (VALIDATION_DATA_ROOT / "rtpose_seq10_frame0020/sensor.json").read_text(encoding="utf-8")
     )
     rt_channel_metadata = rt_sensor["metadata"]
     assert rt_channel_metadata["source_rx_order"] == [
-        13, 14, 15, 16, 1, 2, 3, 4, 9, 10, 11, 12, 5, 6, 7, 8
+        13,
+        14,
+        15,
+        16,
+        1,
+        2,
+        3,
+        4,
+        9,
+        10,
+        11,
+        12,
+        5,
+        6,
+        7,
+        8,
     ]
     assert rt_channel_metadata["exported_rx_order"] == list(range(1, 17))
     assert rt_channel_metadata["rx_order"] == list(range(1, 17))
     assert rt_channel_metadata["velocity_resolution_mps"] > 0.0
-    assert rt_channel_metadata["scene_path"] == (
-        "environment_geometry/environment_scene.xml"
-    )
+    assert rt_channel_metadata["scene_path"] == ("environment_geometry/environment_scene.xml")
 
 
 def test_public_rtpose_images_are_face_occluded_pngs_at_source_resolution():

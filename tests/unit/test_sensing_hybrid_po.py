@@ -9,6 +9,7 @@ from types import SimpleNamespace
 
 from sensing_test_helpers import *  # noqa: F401,F403
 import mmWaveRadar.simulation.hybrid_pipeline as hybrid_pipeline
+import mmWaveRadar.simulation.hybrid_passes as hybrid_passes
 from mmWaveRadar.simulation.hybrid_pipeline import (
     CalibratedHybridPOResult,
     HybridCouplingRecomputeResult,
@@ -18,7 +19,7 @@ from mmWaveRadar.simulation.hybrid_pipeline import (
 )
 
 
-def test_full_rt_baseline_propagates_explicit_virtual_channel_mapping():
+def test_rt_baseline_propagates_explicit_virtual_channel_mapping():
     captured = {}
 
     class TestSimulator(MmWaveRadarSimulator):
@@ -78,13 +79,13 @@ def test_full_rt_baseline_propagates_explicit_virtual_channel_mapping():
         material=human_skin_material("permuted-mapping-human"),
     )
     simulator = TestSimulator(
-        mobility_mode="rt_retrace",
-        periodic_retrace=False,
+        solver="rt",
+        rt_refresh_frames=0,
         compute_backend="numpy",
         compute_precision="float64",
     )
 
-    result = hybrid_pipeline.run_full_rt_mobility_baseline(
+    result = hybrid_pipeline.run_rt_baseline(
         scene=load_scene(),
         radar=radar,
         targets=[target],
@@ -119,10 +120,16 @@ def test_hybrid_static_env_po_blocks_static_component_and_preserves_sum():
             del scene
             return FakeStaticPaths()
 
-    fmcw = FMCWConfig(carrier_frequency=60e9, slope=1e12,
-                      chirp_duration=1e-3, chirp_repetition_time=0.5,
-                      sampling_frequency=2e3, num_adc_samples=4,
-                      num_chirps_per_frame=2, frame_period=1.0)
+    fmcw = FMCWConfig(
+        carrier_frequency=60e9,
+        slope=1e12,
+        chirp_duration=1e-3,
+        chirp_repetition_time=0.5,
+        sampling_frequency=2e3,
+        num_adc_samples=4,
+        num_chirps_per_frame=2,
+        frame_period=1.0,
+    )
     radar = RadarSensor(
         name="radar",
         position=(0.0, 0.0, 0.0),
@@ -136,38 +143,36 @@ def test_hybrid_static_env_po_blocks_static_component_and_preserves_sum():
     target = MeshTarget(
         "human",
         MeshSequence(
-            vertices=np.stack([
-                _triangle_from_yz(0.0, (-0.5, -0.5), (0.5, -0.5), (0.0, 0.5)),
-                _triangle_from_yz(0.0, (-0.5, -0.5), (0.5, -0.5), (0.0, 0.5)),
-            ]),
+            vertices=np.stack(
+                [
+                    _triangle_from_yz(0.0, (-0.5, -0.5), (0.5, -0.5), (0.0, 0.5)),
+                    _triangle_from_yz(0.0, (-0.5, -0.5), (0.5, -0.5), (0.0, 0.5)),
+                ]
+            ),
             faces=np.array([[0, 1, 2]], dtype=np.uint32),
             times=np.array([0.0, 1.0]),
         ),
         material=human_skin_material("hybrid-human"),
     )
-    base_human_po_config = HumanPOMobilityConfig(
-        visibility_samples_per_face=2,
-        visibility_fade_chirps=7,
+    base_po_config = POConfig(
+        po_visibility_samples_per_face=2,
+        po_visibility_fade_frames=7,
     )
     sim = TestSimulator(
-        mobility_mode="hybrid_static_env_po",
+        solver="hybrid_po",
         compute_backend="numpy",
         compute_precision="float64",
-        human_po_config=base_human_po_config,
-        hybrid_static_env_po_config=HybridStaticEnvPOConfig(
-            blocking_enabled=True,
-            blocking_fade_chirps=1,
-            human_po_config=HumanPOMobilityConfig(
-                visibility_samples_per_face=1,
-                visibility_fade_chirps=1,
-            ),
+        po_config=base_po_config,
+        hybrid_config=HybridPOConfig(
+            hybrid_calibration="none",
+            po_config=POConfig(po_visibility_samples_per_face=1),
         ),
     )
 
     cube = sim.run(load_scene(), radar, [target], num_frames=1)
 
-    assert sim.human_po_config == base_human_po_config
-    assert cube.metadata.mode == "hybrid_static_env_po"
+    assert sim.po_config == base_po_config
+    assert cube.metadata.solver == "hybrid_po"
     assert cube.adc.shape == (1, 2, 4, 1)
     assert np.all(np.isfinite(cube.adc))
     assert cube.components is not None
@@ -195,30 +200,8 @@ def test_hybrid_static_env_po_blocks_static_component_and_preserves_sum():
         assert key in cube.metadata.runtime_profile_s
         assert key in cube.metadata.runtime_profile_counts
 
-    no_block = TestSimulator(
-        mobility_mode="hybrid_static_env_po",
-        compute_backend="numpy",
-        compute_precision="float64",
-        hybrid_static_env_po_config=HybridStaticEnvPOConfig(
-            blocking_enabled=False,
-            human_po_config=HumanPOMobilityConfig(
-                visibility_samples_per_face=1,
-                visibility_fade_chirps=1,
-            ),
-        ),
-    ).run(load_scene(), radar, [target], num_frames=1)
-
-    assert np.allclose(
-        no_block.components["static_environment_blocked"],
-        no_block.components["static_environment_unblocked"],
-    )
-    assert np.allclose(
-        no_block.adc,
-        no_block.components["human_po"]
-        + no_block.components["static_environment_unblocked"]
-        + no_block.components["human_env"]
-        + no_block.components["env_human"],
-    )
+    with pytest.raises(TypeError, match="blocking_enabled"):
+        HybridPOConfig(blocking_enabled=False)
 
 
 def test_hybrid_rt_path_coupling_is_quiet_and_does_not_propagate_rt_baseline(
@@ -242,7 +225,7 @@ def test_hybrid_rt_path_coupling_is_quiet_and_does_not_propagate_rt_baseline(
             path_counts=np.zeros((1, 1), dtype=np.int64),
             max_displacements=np.zeros((1, 1), dtype=float),
             virtual_channel_order=radar.hardware.virtual_channel_order,
-            mode="hybrid_static_env_po",
+            solver="hybrid_po",
             runtime_profile_s={},
             runtime_profile_counts={},
         ),
@@ -259,12 +242,12 @@ def test_hybrid_rt_path_coupling_is_quiet_and_does_not_propagate_rt_baseline(
         },
     )
     sim = MmWaveRadarSimulator(
-        mobility_mode="hybrid_static_env_po",
+        solver="hybrid_po",
         compute_backend="numpy",
         compute_precision="float64",
-        hybrid_static_env_po_config=HybridStaticEnvPOConfig(
-            coupling_enabled=False,
-            human_po_config=HumanPOMobilityConfig(),
+        hybrid_config=HybridPOConfig(
+            hybrid_coupling=False,
+            po_config=POConfig(),
         ),
     )
 
@@ -305,7 +288,7 @@ def test_cached_hybrid_pipeline_preserves_multi_tx_motion_phase_timing(
         num_chirps_per_frame=4,
         frame_period=0.1,
         num_tx=2,
-        tdm_enabled=True,
+        tx_schedule="tdm",
     )
     radar = RadarSensor(
         name="cached-tdm",
@@ -318,10 +301,7 @@ def test_cached_hybrid_pipeline_preserves_multi_tx_motion_phase_timing(
     adc = np.empty((1, 4, 4, 2), dtype=np.complex128)
     for chirp in range(4):
         for channel, tx_index in enumerate(hardware.virtual_tx_indices()):
-            phase = np.exp(
-                2j * np.pi * doppler_hz
-                * fmcw.tx_chirp_time(0, chirp, int(tx_index))
-            )
+            phase = np.exp(2j * np.pi * doppler_hz * fmcw.tx_chirp_time(0, chirp, int(tx_index)))
             adc[0, chirp, :, channel] = phase
     zeros = np.zeros_like(adc)
     packed_times = np.asarray([[0.25, 0.50, 0.90, 1.40]])
@@ -333,7 +313,7 @@ def test_cached_hybrid_pipeline_preserves_multi_tx_motion_phase_timing(
             path_counts=np.ones((1, 4), dtype=np.int64),
             max_displacements=np.zeros((1, 4), dtype=float),
             virtual_channel_order=hardware.virtual_channel_order,
-            mode="hybrid_static_env_po",
+            solver="hybrid_po",
             runtime_profile_s={},
             runtime_profile_counts={},
         ),
@@ -382,6 +362,10 @@ def test_cached_hybrid_pipeline_preserves_multi_tx_motion_phase_timing(
             env_human_coefficients=coefficients,
             env_human_delays_s=delays,
             env_human_valid=valid,
+            human_env_delay_response=None,
+            env_human_delay_response=None,
+            human_env_active_sets=(),
+            env_human_active_sets=(),
             runtime_profile_s={},
             runtime_profile_counts={},
         )
@@ -392,34 +376,29 @@ def test_cached_hybrid_pipeline_preserves_multi_tx_motion_phase_timing(
         lambda self, scene: (None, None),
     )
     monkeypatch.setattr(
-        hybrid_pipeline,
-        "extract_static_path_bank",
-        lambda *args, **kwargs: object(),
-    )
-    monkeypatch.setattr(
-        hybrid_pipeline,
-        "extract_rt_reflector_bank",
+        hybrid_passes,
+        "select_image_source_reflectors",
         lambda *args, **kwargs: SimpleNamespace(
             vertices=np.zeros((1, 3, 3)),
         ),
     )
     monkeypatch.setattr(
-        hybrid_pipeline,
+        hybrid_passes,
         "HumanVisibilityScene",
         TestVisibilityScene,
     )
     monkeypatch.setattr(
-        hybrid_pipeline,
+        hybrid_passes,
         "compute_env_human_coupling_channels",
         fake_coupling,
     )
 
     simulator = TestSimulator(
-        mobility_mode="hybrid_static_env_po",
+        solver="hybrid_po",
         compute_backend="numpy",
         compute_precision="float64",
-        hybrid_static_env_po_config=HybridStaticEnvPOConfig(
-            coupling_enabled=True,
+        hybrid_config=HybridPOConfig(
+            hybrid_coupling=True,
         ),
     )
     target = MeshTarget(
@@ -447,19 +426,13 @@ def test_cached_hybrid_pipeline_preserves_multi_tx_motion_phase_timing(
     )
     expected_phase_offset = -2.0 * np.pi * doppler_hz * fmcw.chirp_repetition_time
     np.testing.assert_allclose(
-        np.angle(
-            result.cube.adc[0, :, 0, 0]
-            * result.cube.adc[0, :, 0, 1].conj()
-        ),
+        np.angle(result.cube.adc[0, :, 0, 0] * result.cube.adc[0, :, 0, 1].conj()),
         expected_phase_offset,
     )
     physical_times = (
-        packed_times[:, :, None]
-        + np.arange(2) * fmcw.chirp_repetition_time
+        packed_times[:, :, None] + np.arange(2) * fmcw.chirp_repetition_time
     ).reshape(-1)
-    observed_x = np.asarray(
-        [np.mean(vertices[:, 0]) for vertices in observed_vertices]
-    )
+    observed_x = np.asarray([np.mean(vertices[:, 0]) for vertices in observed_vertices])
     np.testing.assert_allclose(observed_x, 1.0 + 0.05 * physical_times)
     assert observed_x[1] - observed_x[0] == pytest.approx(
         0.05 * fmcw.chirp_repetition_time,
@@ -469,7 +442,7 @@ def test_cached_hybrid_pipeline_preserves_multi_tx_motion_phase_timing(
 
 def test_run_calibrated_hybrid_po_wraps_base_and_coupling(monkeypatch, capsys):
     class TestSimulator(MmWaveRadarSimulator):
-        def _run_human_only_po(
+        def _run_po(
             self,
             radar,
             targets,
@@ -477,10 +450,10 @@ def test_run_calibrated_hybrid_po_wraps_base_and_coupling(monkeypatch, capsys):
             num_frames,
             static_visibility_scene=None,
             rt_reference_scene=None,
-            human_po_config=None,
+            po_config=None,
         ):
             del targets, static_visibility_scene, rt_reference_scene
-            del human_po_config
+            del po_config
             shape = (
                 int(num_frames),
                 radar.fmcw.num_chirps_per_frame,
@@ -500,19 +473,29 @@ def test_run_calibrated_hybrid_po_wraps_base_and_coupling(monkeypatch, capsys):
                     path_counts=np.ones(shape[:2], dtype=np.int64),
                     max_displacements=np.zeros(shape[:2], dtype=float),
                     virtual_channel_order=radar.hardware.virtual_channel_order,
-                    mode="human_only_po",
+                    solver="po",
                     total_path_power=np.full(shape[:2], 4.0, dtype=np.float64),
                 ),
             )
 
     calibration_calls = []
 
-    def fake_full_rt_baseline(*, scene, radar, targets, simulator, num_frames):
+    def fake_rt_baseline(
+        *,
+        scene,
+        radar,
+        targets,
+        simulator,
+        num_frames,
+        calibration_reference_component,
+    ):
         del scene, simulator
-        calibration_calls.append({
-            "num_frames": int(num_frames),
-            "start_time_s": float(targets[0].mesh_sequence.start_time_s),
-        })
+        calibration_calls.append(
+            {
+                "num_frames": int(num_frames),
+                "start_time_s": float(targets[0].mesh_sequence.start_time_s),
+            }
+        )
         shape = (
             int(num_frames),
             radar.fmcw.num_chirps_per_frame,
@@ -525,19 +508,21 @@ def test_run_calibrated_hybrid_po_wraps_base_and_coupling(monkeypatch, capsys):
             for chirp in range(shape[1]):
                 times[frame, chirp] = radar.fmcw.chirp_time(frame, chirp)
         metadata = SensingMetadata(
-            events=[{
-                "frame": 0,
-                "chirp": 0,
-                "time": 0.0,
-                "coherent_path_update": True,
-            }],
+            events=[
+                {
+                    "frame": 0,
+                    "chirp": 0,
+                    "time": 0.0,
+                    "coherent_path_update": True,
+                }
+            ],
             path_counts=np.ones(shape[:2], dtype=np.int64),
             max_displacements=np.zeros(shape[:2], dtype=float),
             virtual_channel_order=radar.hardware.virtual_channel_order,
-            mode="rt_baseline",
+            solver="rt",
         )
         power = np.full(shape[:2], 4.0, dtype=np.float64)
-        return hybrid_pipeline.FullRTMobilityBaselineResult(
+        return hybrid_pipeline.RTBaselineResult(
             cube=RadarCube(adc=adc, times=times, metadata=metadata),
             human_reference_adc=adc[0],
             human_reference_path_counts=np.ones(shape[1], dtype=np.int64),
@@ -554,12 +539,18 @@ def test_run_calibrated_hybrid_po_wraps_base_and_coupling(monkeypatch, capsys):
             human_env_coupled_path_power=np.zeros(shape[:2], dtype=np.float64),
             human_multi_touch_path_power=np.zeros(shape[:2], dtype=np.float64),
             retrace_count=int(num_frames),
+            reference_adc_power={
+                calibration_reference_component: np.mean(np.abs(adc) ** 2, axis=2),
+            },
         )
 
-    def fake_static_pass(*, scene, radar, target, times, simulator, config):
-        del scene, radar, target, simulator, config
+    static_scene_objects = []
+
+    def fake_static_pass(*, scene, radar, target, times, simulator, config, reflector_bank=None):
+        static_scene_objects.append(set(scene.objects))
+        del radar, target, simulator, config
         adc_shape = times.shape + (4, 1)
-        return hybrid_pipeline._StaticEnvironmentPass(
+        return hybrid_passes._StaticEnvironmentPass(
             static_unblocked_adc=5.0 * np.ones(adc_shape, dtype=np.complex128),
             static_blocked_adc=3.0 * np.ones(adc_shape, dtype=np.complex128),
             visibility_weights=np.ones(times.shape + (1,), dtype=float),
@@ -579,7 +570,7 @@ def test_run_calibrated_hybrid_po_wraps_base_and_coupling(monkeypatch, capsys):
     def fake_coupling_pass(**kwargs):
         times = kwargs["times"]
         adc_shape = times.shape + (4, 1)
-        return hybrid_pipeline._CouplingPass(
+        return hybrid_passes._CouplingPass(
             human_env_adc=7.0 * np.ones(adc_shape, dtype=np.complex128),
             env_human_adc=11.0 * np.ones(adc_shape, dtype=np.complex128),
             human_env_counts=np.ones(times.shape, dtype=np.int64),
@@ -598,8 +589,8 @@ def test_run_calibrated_hybrid_po_wraps_base_and_coupling(monkeypatch, capsys):
     monkeypatch.setattr(hybrid_pipeline, "MmWaveRadarSimulator", TestSimulator)
     monkeypatch.setattr(
         hybrid_pipeline,
-        "run_full_rt_mobility_baseline",
-        fake_full_rt_baseline,
+        "run_rt_baseline",
+        fake_rt_baseline,
     )
     monkeypatch.setattr(
         hybrid_pipeline,
@@ -615,28 +606,41 @@ def test_run_calibrated_hybrid_po_wraps_base_and_coupling(monkeypatch, capsys):
         material=human_skin_material("hybrid-flow-human"),
     )
 
+    rt_sequence = POCalibrationConfig(
+        mode="rt_sequence",
+        gain_type="amplitude",
+        sample_mode="all_chirps",
+        reference_component="single_human_only",
+        alignment="same_index",
+        keep_rt_baseline=False,
+        rt_refresh_frames=1,
+    )
     result = run_calibrated_hybrid_po(
         scene=load_scene(),
         coupling_scene=load_scene(),
         radar=radar,
         target=target,
         num_frames=2,
-        coupling_enabled=False,
-        rt_samples_per_src=1,
-        rt_max_num_paths_per_src=1,
+        hybrid_coupling=False,
+        rt_samples_per_source=1,
+        rt_max_paths_per_source=1,
         compute_backend="numpy",
         compute_precision="float64",
         progress=True,
         print_reflector_summary=False,
+        hybrid_calibration=rt_sequence,
     )
 
     assert isinstance(result, CalibratedHybridPOResult)
-    assert result.base_config.coupling_enabled is False
-    assert result.hybrid_config.coupling_enabled is False
-    assert result.calibration_config.mode == "rt_sequence"
+    assert result.base_config.hybrid_coupling is False
+    assert result.hybrid_config.hybrid_coupling is False
+    assert result.hybrid_calibration.mode == "rt_sequence"
+    assert result.hybrid_calibration.reference_component == "single_human_only"
     assert calibration_calls == [{"num_frames": 1, "start_time_s": 0.0}]
     assert result.num_chirps == int(np.prod(result.cube.adc.shape[:2]))
-    assert np.allclose(result.cube.adc, 23.0)
+    assert result.calibration["reference_power_kind"] == "adc_rms_power"
+    assert result.calibration["human_po_amplitude_gain"] == pytest.approx(0.5)
+    assert np.allclose(result.cube.adc, 22.0)
     assert np.allclose(
         result.cube.adc,
         result.cube.components["human_po"]
@@ -663,19 +667,47 @@ def test_run_calibrated_hybrid_po_wraps_base_and_coupling(monkeypatch, capsys):
         target=target,
         num_frames=2,
         calibration_frame_range=(1, 2),
-        coupling_enabled=False,
-        rt_samples_per_src=1,
-        rt_max_num_paths_per_src=1,
+        hybrid_coupling=False,
+        rt_samples_per_source=1,
+        rt_max_paths_per_source=1,
         compute_backend="numpy",
         compute_precision="float64",
         progress=False,
         print_reflector_summary=False,
+        hybrid_calibration=rt_sequence,
     )
     assert calibration_calls[0]["num_frames"] == 1
-    assert calibration_calls[0]["start_time_s"] == pytest.approx(
-        radar.fmcw.chirp_time(1, 0)
-    )
+    assert calibration_calls[0]["start_time_s"] == pytest.approx(radar.fmcw.chirp_time(1, 0))
     assert shifted.calibration["calibration_frame_range"] == (1, 2)
+
+    # Without calibration the absolute PO is used unchanged and no RT
+    # reference runs.
+    # A mesh left behind by an earlier RT run must not reach the static pass.
+    calibration_calls.clear()
+    static_scene_objects.clear()
+    environment = load_scene()
+    target.add_to_scene(environment)
+    uncalibrated = run_calibrated_hybrid_po(
+        scene=load_scene(),
+        coupling_scene=environment,
+        radar=radar,
+        target=target,
+        num_frames=2,
+        hybrid_coupling=False,
+        rt_samples_per_source=1,
+        rt_max_paths_per_source=1,
+        compute_backend="numpy",
+        compute_precision="float64",
+        progress=False,
+        print_reflector_summary=False,
+        hybrid_calibration="none",
+    )
+    assert uncalibrated.hybrid_calibration.mode == "none"
+    assert calibration_calls == []
+    assert uncalibrated.calibration["human_po_amplitude_gain"] == 1.0
+    assert np.allclose(uncalibrated.cube.adc, 23.0)
+    assert static_scene_objects == [set()]
+    assert target.name in environment.objects
 
 
 def test_run_calibrated_hybrid_po_rejects_invalid_calibration_frame_range():

@@ -5,12 +5,20 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from typing import TYPE_CHECKING
 
 import numpy as np
 
+from .ti_cli import parse_ti_cli_config
+
+from ..geometry import rotation_matrix
+
 from .fmcw import FMCWConfig
 from .hardware import RadarHardware
+
+if TYPE_CHECKING:
+    from sionna.rt import Transmitter, Receiver
 
 
 def _finite_pose_vector(name: str, value) -> tuple[float, float, float]:
@@ -31,25 +39,10 @@ def _positions_to_point3f(positions: np.ndarray, wavelength: float):
     import mitsuba as mi  # pylint: disable=import-outside-toplevel
 
     pos = np.asarray(positions, dtype=float)
-    return mi.Point3f(pos[:, 0] / wavelength,
-                      pos[:, 1] / wavelength,
-                      pos[:, 2] / wavelength)
+    return mi.Point3f(pos[:, 0] / wavelength, pos[:, 1] / wavelength, pos[:, 2] / wavelength)
 
 
-def _rotation_matrix_numpy(orientation: tuple[float, float, float]) -> np.ndarray:
-    """Returns the world rotation matrix for a radar pose."""
-
-    a, b, c = (float(v) for v in orientation)
-    sin_a, cos_a = np.sin(a), np.cos(a)
-    sin_b, cos_b = np.sin(b), np.cos(b)
-    sin_c, cos_c = np.sin(c), np.cos(c)
-    return np.array([
-        [cos_a * cos_b, cos_a * sin_b * sin_c - sin_a * cos_c,
-         cos_a * sin_b * cos_c + sin_a * sin_c],
-        [sin_a * cos_b, sin_a * sin_b * sin_c + cos_a * cos_c,
-         sin_a * sin_b * cos_c - cos_a * sin_c],
-        [-sin_b, cos_b * sin_c, cos_b * cos_c],
-    ], dtype=float)
+_rotation_matrix_numpy = rotation_matrix  # Compatibility alias.
 
 
 @dataclass(frozen=True)
@@ -84,24 +77,36 @@ class RadarSensor:
             raise ValueError("tx_power_dbm must be a finite scalar") from exc
         if not np.isfinite(tx_power_dbm):
             raise ValueError("tx_power_dbm must be a finite scalar")
-        if self.fmcw.num_tx != self.hardware.num_tx:
+        # A TDM cycle may contain slots whose TX channels were not retained.
+        # Its slot count sets Doppler timing independently of stored hardware.
+        if self.fmcw.tx_schedule != "tdm" and self.fmcw.num_tx != self.hardware.num_tx:
             raise ValueError(
                 f"fmcw.num_tx ({self.fmcw.num_tx}) must match the hardware "
                 f"transmitter count ({self.hardware.num_tx})"
             )
 
+        # Include the board's analog IF limit in receiver filtering.
+        board_if = (self.hardware.board_metadata or {}).get("adc", {}).get("if_bandwidth_hz")
+        if board_if is not None:
+            limit = min(float(board_if), self.fmcw.if_bandwidth_hz or float(board_if))
+            object.__setattr__(self, "fmcw", replace(self.fmcw, if_bandwidth_hz=limit))
         object.__setattr__(self, "position", position)
         object.__setattr__(self, "orientation", orientation)
         object.__setattr__(self, "tx_power_dbm", tx_power_dbm)
 
     @classmethod
-    def from_ti_board(cls, model: str, *, fmcw: FMCWConfig,
-                      name: str = "radar",
-                      position=(0.0, 0.0, 0.0),
-                      orientation=(0.0, 0.0, 0.0),
-                      pattern_mode: str = "cosine30",
-                      cosine_half_power_angle_deg: float = 30.0,
-                      tx_power_dbm: float | None = None) -> "RadarSensor":
+    def from_ti_board(
+        cls,
+        model: str,
+        *,
+        fmcw: FMCWConfig,
+        name: str = "radar",
+        position=(0.0, 0.0, 0.0),
+        orientation=(0.0, 0.0, 0.0),
+        pattern_mode: str = "cosine30",
+        cosine_half_power_angle_deg: float = 30.0,
+        tx_power_dbm: float | None = None,
+    ) -> "RadarSensor":
         """Builds a radar sensor from a supported TI board catalog entry."""
 
         from .ti import get_ti_board_spec  # pylint: disable=import-outside-toplevel
@@ -112,41 +117,35 @@ class RadarSensor:
             pattern_mode=pattern_mode,
             cosine_half_power_angle_deg=cosine_half_power_angle_deg,
         )
-        fmcw = FMCWConfig(
-            carrier_frequency=fmcw.carrier_frequency,
-            slope=fmcw.slope,
-            chirp_duration=fmcw.chirp_duration,
-            chirp_repetition_time=fmcw.chirp_repetition_time,
-            sampling_frequency=fmcw.sampling_frequency,
-            num_adc_samples=fmcw.num_adc_samples,
-            num_chirps_per_frame=fmcw.num_chirps_per_frame,
-            frame_period=fmcw.frame_period,
-            num_tx=hardware.num_tx,
-            tdm_enabled=fmcw.tdm_enabled,
-        )
+        fmcw = replace(fmcw, num_tx=hardware.num_tx)
         power = spec.tx_power_dbm if tx_power_dbm is None else float(tx_power_dbm)
-        return cls(name=name,
-                   position=tuple(position),
-                   orientation=tuple(orientation),
-                   hardware=hardware,
-                   fmcw=fmcw,
-                   tx_power_dbm=power)
+        return cls(
+            name=name,
+            position=tuple(position),
+            orientation=tuple(orientation),
+            hardware=hardware,
+            fmcw=fmcw,
+            tx_power_dbm=power,
+        )
 
     @classmethod
-    def from_virtual_ura(cls, *, rows: int,
-                         cols: int | None = None,
-                         fmcw: FMCWConfig,
-                         name: str = "radar",
-                         position=(0.0, 0.0, 0.0),
-                         orientation=(0.0, 0.0, 0.0),
-                         spacing_lambda: float = 0.5,
-                         spacing_y_lambda: float | None = None,
-                         spacing_z_lambda: float | None = None,
-                         centered: bool = True,
-                         tx_power_dbm: float = 12.0,
-                         scalar_antenna_gain_dbi: float | None = 0.0,
-                         antenna_pattern: object | None = None
-                         ) -> "RadarSensor":
+    def from_virtual_ura(
+        cls,
+        *,
+        rows: int,
+        cols: int | None = None,
+        fmcw: FMCWConfig,
+        name: str = "radar",
+        position=(0.0, 0.0, 0.0),
+        orientation=(0.0, 0.0, 0.0),
+        spacing_lambda: float = 0.5,
+        spacing_y_lambda: float | None = None,
+        spacing_z_lambda: float | None = None,
+        centered: bool = True,
+        tx_power_dbm: float = 12.0,
+        scalar_antenna_gain_dbi: float | None = 0.0,
+        antenna_pattern: object | None = None,
+    ) -> "RadarSensor":
         """
         Builds a radar sensor from a synthetic virtual URA.
 
@@ -166,37 +165,31 @@ class RadarSensor:
             scalar_antenna_gain_dbi=scalar_antenna_gain_dbi,
             antenna_pattern=antenna_pattern,
         )
-        fmcw = FMCWConfig(
-            carrier_frequency=fmcw.carrier_frequency,
-            slope=fmcw.slope,
-            chirp_duration=fmcw.chirp_duration,
-            chirp_repetition_time=fmcw.chirp_repetition_time,
-            sampling_frequency=fmcw.sampling_frequency,
-            num_adc_samples=fmcw.num_adc_samples,
-            num_chirps_per_frame=fmcw.num_chirps_per_frame,
-            frame_period=fmcw.frame_period,
-            num_tx=1,
-            tdm_enabled=False,
+        fmcw = replace(fmcw, num_tx=1, tx_schedule="simultaneous")
+        return cls(
+            name=name,
+            position=tuple(position),
+            orientation=tuple(orientation),
+            hardware=hardware,
+            fmcw=fmcw,
+            tx_power_dbm=float(tx_power_dbm),
         )
-        return cls(name=name,
-                   position=tuple(position),
-                   orientation=tuple(orientation),
-                   hardware=hardware,
-                   fmcw=fmcw,
-                   tx_power_dbm=float(tx_power_dbm))
 
     @classmethod
-    def from_ti_cli_config(cls, filename: str, *,
-                           name: str = "radar",
-                           position=(0.0, 0.0, 0.0),
-                           orientation=(0.0, 0.0, 0.0),
-                           hardware_model: str = "IWR6843AOP",
-                           default_carrier_frequency: float = 77e9,
-                           pattern_mode: str = "cosine30",
-                           tx_power_dbm: float = 12.0) -> "RadarSensor":
+    def from_ti_cli_config(
+        cls,
+        filename: str,
+        *,
+        name: str = "radar",
+        position=(0.0, 0.0, 0.0),
+        orientation=(0.0, 0.0, 0.0),
+        hardware_model: str = "IWR6843AOP",
+        default_carrier_frequency: float = 77e9,
+        pattern_mode: str = "cosine30",
+        tx_power_dbm: float = 12.0,
+    ) -> "RadarSensor":
         """Builds a radar sensor from a TI mmWave CLI config file."""
-        fmcw, enabled_tx_indices = _parse_ti_cli_config(
-            filename, default_carrier_frequency)
+        fmcw, enabled_tx_indices = parse_ti_cli_config(filename, default_carrier_frequency)
         from .ti import is_ti_board_model  # pylint: disable=import-outside-toplevel
 
         if is_ti_board_model(hardware_model):
@@ -208,65 +201,65 @@ class RadarSensor:
             hardware = RadarHardware.from_xwr68xx(hardware_model)
         if enabled_tx_indices is not None:
             hardware = hardware.subset_tx(enabled_tx_indices)
-        fmcw = FMCWConfig(
-            carrier_frequency=fmcw.carrier_frequency,
-            slope=fmcw.slope,
-            chirp_duration=fmcw.chirp_duration,
-            chirp_repetition_time=fmcw.chirp_repetition_time,
-            sampling_frequency=fmcw.sampling_frequency,
-            num_adc_samples=fmcw.num_adc_samples,
-            num_chirps_per_frame=fmcw.num_chirps_per_frame,
-            frame_period=fmcw.frame_period,
-            num_tx=hardware.num_tx,
-            tdm_enabled=fmcw.tdm_enabled)
-        return cls(name=name,
-                   position=tuple(position),
-                   orientation=tuple(orientation),
-                   hardware=hardware,
-                   fmcw=fmcw,
-                   tx_power_dbm=tx_power_dbm)
+        fmcw = replace(fmcw, num_tx=hardware.num_tx)
+        return cls(
+            name=name,
+            position=tuple(position),
+            orientation=tuple(orientation),
+            hardware=hardware,
+            fmcw=fmcw,
+            tx_power_dbm=tx_power_dbm,
+        )
 
     def configure_scene(self, scene) -> tuple[Transmitter, Receiver]:
         """
         Adds radar Tx/Rx devices to ``scene`` and configures their arrays.
 
-        Existing scene Tx/Rx arrays are replaced because Sionna scenes use one
-        shared Tx array and one shared Rx array.
+        The Tx device sits at the Tx-array centre and the Rx device at the
+        Rx-array centre, with element positions relative to them. Sionna
+        traces synthetic arrays from the device positions, so these centres
+        are RT's phase centres, matching PO and the RT path bank. Existing
+        scene Tx/Rx arrays are replaced because Sionna scenes use one shared
+        Tx array and one shared Rx array.
         """
         from sionna.rt import AntennaArray, Receiver, Transmitter
         from sionna.rt.antenna_pattern import antenna_pattern_registry
 
         wavelength = self.fmcw.wavelength
         pattern = antenna_pattern_registry.get("iso")(polarization="V")
+        tx_local = np.asarray(self.hardware.tx_positions, dtype=float)
+        rx_local = np.asarray(self.hardware.rx_positions, dtype=float)
         scene.tx_array = AntennaArray(
-            pattern,
-            _positions_to_point3f(self.hardware.tx_positions, wavelength))
+            pattern, _positions_to_point3f(tx_local - tx_local.mean(axis=0), wavelength)
+        )
         scene.rx_array = AntennaArray(
-            pattern,
-            _positions_to_point3f(self.hardware.rx_positions, wavelength))
+            pattern, _positions_to_point3f(rx_local - rx_local.mean(axis=0), wavelength)
+        )
         scene.frequency = self.fmcw.carrier_frequency
+        tx_position = tuple(float(v) for v in self.world_tx_positions().mean(axis=0))
+        rx_position = tuple(float(v) for v in self.world_rx_positions().mean(axis=0))
 
         tx_name = f"{self.name}-tx"
         rx_name = f"{self.name}-rx"
         tx = scene.get(tx_name)
         rx = scene.get(rx_name)
         if tx is None:
-            tx = Transmitter(name=tx_name,
-                             position=self.position,
-                             orientation=self.orientation,
-                             power_dbm=self.tx_power_dbm)
+            tx = Transmitter(
+                name=tx_name,
+                position=tx_position,
+                orientation=self.orientation,
+                power_dbm=self.tx_power_dbm,
+            )
             scene.add(tx)
         else:
-            tx.position = self.position
+            tx.position = tx_position
             tx.orientation = self.orientation
             tx.power_dbm = self.tx_power_dbm
         if rx is None:
-            rx = Receiver(name=rx_name,
-                          position=self.position,
-                          orientation=self.orientation)
+            rx = Receiver(name=rx_name, position=rx_position, orientation=self.orientation)
             scene.add(rx)
         else:
-            rx.position = self.position
+            rx.position = rx_position
             rx.orientation = self.orientation
         return tx, rx
 
@@ -285,12 +278,11 @@ class RadarSensor:
 
         pts = np.asarray(points, dtype=float)
         flat = pts.reshape((-1, 3))
-        rot = _rotation_matrix_numpy(self.orientation)
+        rot = rotation_matrix(self.orientation)
         local = (rot.T @ (flat - np.asarray(self.position, dtype=float)).T).T
         return local.reshape(pts.shape)
 
-    def local_azimuth_elevation(self, points: np.ndarray
-                                ) -> tuple[np.ndarray, np.ndarray]:
+    def local_azimuth_elevation(self, points: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         """
         Returns local azimuth/elevation angles for world points in degrees.
 
@@ -300,205 +292,16 @@ class RadarSensor:
 
         local = self.world_to_local_points(points).reshape((-1, 3))
         azimuth = np.degrees(np.arctan2(local[:, 1], local[:, 0]))
-        elevation = np.degrees(
-            np.arctan2(local[:, 2], np.hypot(local[:, 0], local[:, 1]))
-        )
+        elevation = np.degrees(np.arctan2(local[:, 2], np.hypot(local[:, 0], local[:, 1])))
         return azimuth, elevation
 
     def _world_positions(self, local_positions: np.ndarray) -> np.ndarray:
         """Transforms local element positions to world coordinates in meters."""
 
-        rot = _rotation_matrix_numpy(self.orientation)
+        rot = rotation_matrix(self.orientation)
         pos = np.asarray(local_positions, dtype=float)
         world = (rot @ pos.T).T
         return world + np.asarray(self.position, dtype=float)[None, :]
 
 
-def _parse_ti_cli_config(filename: str,
-                         default_carrier_frequency: float
-                         ) -> tuple[FMCWConfig, tuple[int, ...] | None]:
-    """Parses TI ``profileCfg``, ``chirpCfg``, and ``frameCfg`` commands."""
-
-    profiles: dict[int, dict[str, float | int]] = {}
-    chirp_configs: list[dict[str, object]] = []
-    frame_config: tuple[int, int, int, float] | None = None
-
-    with open(filename, "r", encoding="utf-8") as f:
-        for raw in f:
-            line = raw.strip()
-            if not line or line.startswith("%") or line.startswith("#"):
-                continue
-            toks = line.split()
-            if toks[0] == "profileCfg":
-                try:
-                    profile_id = int(float(toks[1]))
-                    profiles[profile_id] = {
-                        "start_freq_ghz": float(toks[2]),
-                        "idle_us": float(toks[3]),
-                        "ramp_us": float(toks[5]),
-                        "slope_mhz_per_us": float(toks[8]),
-                        "num_adc": int(float(toks[10])),
-                        "fs_ksps": float(toks[11]),
-                    }
-                except (IndexError, ValueError) as exc:
-                    raise ValueError(f"Could not parse profileCfg: {line}") \
-                        from exc
-            elif toks[0] == "chirpCfg":
-                try:
-                    chirp_configs.append({
-                        "start": int(float(toks[1])),
-                        "end": int(float(toks[2])),
-                        "profile_id": int(float(toks[3])),
-                        "variations": tuple(float(toks[index])
-                                            for index in range(4, 8)),
-                        "tx_mask": int(float(toks[8])),
-                    })
-                except (IndexError, ValueError) as exc:
-                    raise ValueError(f"Could not parse chirpCfg: {line}") \
-                        from exc
-            elif toks[0] == "frameCfg":
-                try:
-                    frame_config = (
-                        int(float(toks[1])),
-                        int(float(toks[2])),
-                        int(float(toks[3])),
-                        float(toks[5]),
-                    )
-                except (IndexError, ValueError) as exc:
-                    raise ValueError(f"Could not parse frameCfg: {line}") \
-                        from exc
-
-    if not profiles or frame_config is None:
-        raise ValueError("TI config must contain profileCfg and frameCfg")
-
-    chirp_start, chirp_end, num_loops, frame_period_ms = frame_config
-    if chirp_start < 0 or chirp_end < chirp_start:
-        raise ValueError("frameCfg chirp range must be nonnegative and ordered")
-    if num_loops <= 0:
-        raise ValueError("frameCfg numLoops must be positive")
-
-    num_chirps_per_loop = chirp_end - chirp_start + 1
-    schedule: list[dict[str, object]] = []
-    if chirp_configs:
-        for chirp_index in range(chirp_start, chirp_end + 1):
-            matches = [
-                config for config in chirp_configs
-                if int(config["start"]) <= chirp_index <= int(config["end"])
-            ]
-            if not matches:
-                raise ValueError(
-                    f"No chirpCfg covers in-frame chirp index {chirp_index}"
-                )
-            if len(matches) > 1:
-                raise ValueError(
-                    f"Multiple chirpCfg entries cover in-frame chirp index"
-                    f" {chirp_index}"
-                )
-            schedule.append(matches[0])
-    elif len(profiles) != 1:
-        raise ValueError(
-            "Multiple profileCfg entries require an in-frame chirpCfg mapping"
-        )
-
-    if schedule:
-        for config in schedule:
-            profile_id = int(config["profile_id"])
-            if profile_id not in profiles:
-                raise ValueError(
-                    f"In-frame chirpCfg references missing profile {profile_id}"
-                )
-            if any(value != 0.0 for value in config["variations"]):
-                raise ValueError(
-                    "In-frame chirpCfg parameter variations are not supported"
-                )
-        profile_ids = tuple(dict.fromkeys(
-            int(config["profile_id"]) for config in schedule
-        ))
-    else:
-        profile_ids = (next(iter(profiles)),)
-
-    profile = profiles[profile_ids[0]]
-    waveform_fields = (
-        "start_freq_ghz",
-        "idle_us",
-        "ramp_us",
-        "slope_mhz_per_us",
-        "num_adc",
-        "fs_ksps",
-    )
-    for profile_id in profile_ids[1:]:
-        candidate = profiles[profile_id]
-        if any(candidate[field] != profile[field]
-               for field in waveform_fields):
-            raise ValueError(
-                "In-frame chirpCfg entries reference incompatible profiles"
-            )
-
-    start_freq_ghz = float(profile["start_freq_ghz"])
-    carrier_frequency = (default_carrier_frequency
-                         if not np.isfinite(start_freq_ghz)
-                         else start_freq_ghz * 1e9)
-    enabled_tx_indices = None
-    tdm_enabled = False
-    if schedule:
-        tx_masks = tuple(int(config["tx_mask"]) for config in schedule)
-        mask = 0
-        for tx_mask in tx_masks:
-            mask |= tx_mask
-        if mask <= 0:
-            raise ValueError("In-frame chirpCfg entries must enable a transmitter")
-        enabled_tx_indices = tuple(
-            index for index in range(mask.bit_length())
-            if mask & (1 << index)
-        )
-        single_tx_slots = all(
-            tx_mask > 0 and not tx_mask & (tx_mask - 1)
-            for tx_mask in tx_masks
-        )
-        constant_mask = len(set(tx_masks)) == 1
-        complete_cycle = False
-        if len(enabled_tx_indices) > 1 and single_tx_slots:
-            scheduled_tx_indices = tuple(
-                tx_mask.bit_length() - 1 for tx_mask in tx_masks
-            )
-            cycle_length = len(enabled_tx_indices)
-            first_cycle = scheduled_tx_indices[:cycle_length]
-            complete_cycle = (
-                len(set(first_cycle)) == cycle_length
-                and len(scheduled_tx_indices) % cycle_length == 0
-                and all(
-                    scheduled_tx_indices[start:start + cycle_length]
-                    == first_cycle
-                    for start in range(0, len(scheduled_tx_indices), cycle_length)
-                )
-            )
-            if complete_cycle:
-                enabled_tx_indices = first_cycle
-                tdm_enabled = True
-        if not constant_mask and not complete_cycle:
-            raise ValueError(
-                "Changing in-frame Tx masks are unsupported; use one constant "
-                "simultaneous mask or a complete repeated single-Tx TDM cycle"
-            )
-
-    num_slow_time_samples = (
-        num_loops * (num_chirps_per_loop // len(enabled_tx_indices))
-        if tdm_enabled
-        else num_loops * num_chirps_per_loop
-    )
-
-    fmcw = FMCWConfig(
-        carrier_frequency=carrier_frequency,
-        slope=float(profile["slope_mhz_per_us"]) * 1e12,
-        chirp_duration=float(profile["ramp_us"]) * 1e-6,
-        chirp_repetition_time=(float(profile["idle_us"])
-                               + float(profile["ramp_us"])) * 1e-6,
-        sampling_frequency=float(profile["fs_ksps"]) * 1e3,
-        num_adc_samples=int(profile["num_adc"]),
-        num_chirps_per_frame=num_slow_time_samples,
-        frame_period=frame_period_ms * 1e-3,
-        num_tx=(len(enabled_tx_indices)
-                if enabled_tx_indices is not None else num_chirps_per_loop),
-        tdm_enabled=tdm_enabled,
-    )
-    return fmcw, enabled_tx_indices
+_parse_ti_cli_config = parse_ti_cli_config  # Compatibility alias.

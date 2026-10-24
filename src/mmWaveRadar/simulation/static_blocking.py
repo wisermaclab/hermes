@@ -11,6 +11,8 @@ from typing import Callable
 import mitsuba as mi
 import numpy as np
 
+from ..arrays import as_numpy
+
 from sionna.rt.constants import InteractionType, INVALID_PRIMITIVE, INVALID_SHAPE
 
 from ..radar.hardware import resolve_virtual_channel_pairs
@@ -32,6 +34,8 @@ class StaticPathBank:
     path_interactions: np.ndarray | None = None
     path_objects: np.ndarray | None = None
     path_primitives: np.ndarray | None = None
+    # CIR coefficients before hardware pattern, scalar gain, and phase signs.
+    propagation_coefficients: np.ndarray | None = None
 
 
 @dataclass(frozen=True)
@@ -68,11 +72,13 @@ def extract_static_path_bank(
         virtual_channel_tx_indices=radar.hardware.virtual_tx_indices(),
         virtual_channel_rx_indices=radar.hardware.virtual_rx_indices(),
     )
+    propagation_coefficients = coefficients
     coefficients = apply_path_hardware_gain(
         radar.hardware,
         coefficients,
         paths=paths,
         frequency_hz=radar.fmcw.carrier_frequency,
+        radar_orientation=radar.orientation,
     )
     num_paths = int(delays_s.size)
     tx_center = np.mean(radar.world_tx_positions(), axis=0)
@@ -115,6 +121,7 @@ def extract_static_path_bank(
         path_interactions=interactions,
         path_objects=objects,
         path_primitives=primitives,
+        propagation_coefficients=propagation_coefficients,
     )
 
 
@@ -126,33 +133,47 @@ def blocked_path_visibility(
     aabb_culling: bool = True,
     aabb_margin_m: float = 0.02,
     state: PathVisibilityState | None = None,
-    fade_chirps: int = 8,
+    fade_steps: int = 1,
+    fade_advance: bool = True,
+    refresh: bool = True,
+    previous_raw_visibility: np.ndarray | None = None,
     ray_epsilon_m: float = 1e-5,
     ray_chunk_size: int = 65536,
 ) -> PathVisibilityResult:
-    """Computes per-path human blocking with temporal fading."""
+    """Computes per-path human blocking with temporal fading.
 
-    raw_visibility = np.ones(bank.delays_s.shape, dtype=np.float64)
-    raw_visibility[~bank.valid] = 0.0
-    candidate_segment_indices = None
-    if aabb_culling and blocker_vertices is not None:
-        candidate_segment_indices = segment_indices_intersecting_aabb(
+    With ``refresh`` false the rays are not cast again and
+    ``previous_raw_visibility`` is reused. Each call with ``fade_advance``
+    moves fading paths one step of ``1/fade_steps``; otherwise the previous
+    weights are held.
+    """
+
+    if refresh or previous_raw_visibility is None:
+        raw_visibility = np.ones(bank.delays_s.shape, dtype=np.float64)
+        raw_visibility[~bank.valid] = 0.0
+        candidate_segment_indices = None
+        if aabb_culling and blocker_vertices is not None:
+            candidate_segment_indices = segment_indices_intersecting_aabb(
+                bank,
+                blocker_vertices,
+                margin_m=aabb_margin_m,
+            )
+        blocked_paths = segment_blocked_paths(
             bank,
-            blocker_vertices,
-            margin_m=aabb_margin_m,
+            visibility_scene,
+            candidate_segment_indices=candidate_segment_indices,
+            ray_epsilon_m=ray_epsilon_m,
+            ray_chunk_size=ray_chunk_size,
         )
-    blocked_paths = segment_blocked_paths(
-        bank,
-        visibility_scene,
-        candidate_segment_indices=candidate_segment_indices,
-        ray_epsilon_m=ray_epsilon_m,
-        ray_chunk_size=ray_chunk_size,
-    )
-    raw_visibility[blocked_paths] = 0.0
+        raw_visibility[blocked_paths] = 0.0
+    else:
+        raw_visibility = np.asarray(previous_raw_visibility, dtype=np.float64)
+        blocked_paths = bank.valid & ~(raw_visibility > 0.0)
     fade_weights, latched_visibility = update_path_visibility_state(
         raw_visibility,
         state=state,
-        fade_chirps=fade_chirps,
+        fade_steps=fade_steps,
+        advance=fade_advance,
     )
     weights = latched_visibility * fade_weights
     return PathVisibilityResult(
@@ -204,7 +225,7 @@ def segment_blocked_paths(
             return blocked
     chunk_size = max(int(ray_chunk_size), 1)
     for chunk_start in range(0, candidate_indices.size, chunk_size):
-        chunk_indices = candidate_indices[chunk_start:chunk_start + chunk_size]
+        chunk_indices = candidate_indices[chunk_start : chunk_start + chunk_size]
         chunk_directions = directions[chunk_indices]
         chunk_distances = distances[chunk_indices]
         unit_directions = chunk_directions / chunk_distances[:, None]
@@ -225,6 +246,54 @@ def segment_blocked_paths(
         hit = np.asarray(pi_hit.is_valid(), dtype=bool)
         if np.any(hit):
             blocked[bank.segment_path_indices[chunk_indices[hit]]] = True
+    return blocked
+
+
+def blocked_segments(
+    starts: np.ndarray,
+    ends: np.ndarray,
+    visibility_scene: HumanVisibilityScene,
+    *,
+    start_margins_m: np.ndarray,
+    end_margins_m: np.ndarray,
+    ray_chunk_size: int = 65536,
+) -> np.ndarray:
+    """Returns which segments the human mesh intersects.
+
+    Each ray starts ``start_margins_m`` after its start and stops
+    ``end_margins_m`` before its end, so a segment that begins or ends on the
+    body is not blocked by the surface it touches.
+    """
+
+    starts = np.asarray(starts, dtype=np.float64).reshape(-1, 3)
+    ends = np.asarray(ends, dtype=np.float64).reshape(-1, 3)
+    blocked = np.zeros(starts.shape[0], dtype=bool)
+    if starts.size == 0:
+        return blocked
+    directions = ends - starts
+    distances = np.linalg.norm(directions, axis=1)
+    start_margins = np.asarray(start_margins_m, dtype=np.float64).reshape(-1)
+    end_margins = np.asarray(end_margins_m, dtype=np.float64).reshape(-1)
+    castable = distances > start_margins + end_margins
+    candidate_indices = np.flatnonzero(castable)
+    chunk_size = max(int(ray_chunk_size), 1)
+    for chunk_start in range(0, candidate_indices.size, chunk_size):
+        indices = candidate_indices[chunk_start : chunk_start + chunk_size]
+        unit = directions[indices] / distances[indices, None]
+        origins = starts[indices] + start_margins[indices, None] * unit
+        maxt = distances[indices] - start_margins[indices] - end_margins[indices]
+        ray = mi.Ray3f(
+            o=mi.Point3f(origins[:, 0], origins[:, 1], origins[:, 2]),
+            d=mi.Vector3f(unit[:, 0], unit[:, 1], unit[:, 2]),
+            maxt=mi.Float(maxt),
+            time=0.0,
+            wavelengths=mi.Color0f(),
+        )
+        hit = np.asarray(
+            visibility_scene.scene.ray_intersect_preliminary(ray).is_valid(),
+            dtype=bool,
+        )
+        blocked[indices[hit]] = True
     return blocked
 
 
@@ -254,8 +323,7 @@ def segment_indices_intersecting_aabb(
     segment_min = np.minimum(starts, ends)
     segment_max = np.maximum(starts, ends)
     overlaps = np.all(
-        (segment_max >= aabb_min[None, :])
-        & (segment_min <= aabb_max[None, :]),
+        (segment_max >= aabb_min[None, :]) & (segment_min <= aabb_max[None, :]),
         axis=1,
     )
     return np.flatnonzero(overlaps)
@@ -265,14 +333,15 @@ def update_path_visibility_state(
     raw_visibility: np.ndarray,
     *,
     state: PathVisibilityState | None,
-    fade_chirps: int,
+    fade_steps: int,
+    advance: bool = True,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Updates per-path fade weights using the PO visibility fade semantics."""
 
     raw_visibility = np.asarray(raw_visibility, dtype=np.float64).reshape(-1)
     raw_visible = raw_visibility > 0.0
-    if fade_chirps <= 0:
-        raise ValueError("fade_chirps must be positive")
+    if fade_steps <= 0:
+        raise ValueError("fade_steps must be positive")
     if state is None:
         fade_weights = raw_visible.astype(np.float64)
         return fade_weights, raw_visibility.copy()
@@ -290,7 +359,10 @@ def update_path_visibility_state(
     ):
         raise ValueError("visibility state shape mismatch")
 
-    step = 1.0 / float(fade_chirps)
+    if not advance:
+        return prev_fade.copy(), prev_latched.copy()
+
+    step = 1.0 / float(fade_steps)
     fade_weights = prev_fade.copy()
     latched = prev_latched.copy()
 
@@ -322,9 +394,7 @@ def synthesize_blocked_static_cube(
     times = np.asarray(times)
     weights = np.asarray(visibility_weights, dtype=np.float64)
     if weights.shape != times.shape + bank.delays_s.shape:
-        raise ValueError(
-            "visibility_weights must have shape times.shape + [num_paths]"
-        )
+        raise ValueError("visibility_weights must have shape times.shape + [num_paths]")
     num_vc = bank.coefficients.shape[0]
     out = np.zeros(
         times.shape + (int(fmcw.num_adc_samples), num_vc),
@@ -358,8 +428,7 @@ def _path_arrays(
     tau = np.asarray(tau)
     if a.ndim != 6:
         raise RuntimeError(
-            "Expected CIR coefficients with shape "
-            "[rx, rx_ant, tx, tx_ant, paths, time]"
+            "Expected CIR coefficients with shape [rx, rx_ant, tx, tx_ant, paths, time]"
         )
     a = a[0, :, 0, :, :, 0]
     tau = tau[0, 0, :] if tau.ndim == 3 else tau.reshape(-1)
@@ -386,7 +455,7 @@ def _path_arrays(
 def _path_vertices(paths) -> np.ndarray:
     """Normalizes Sionna path-vertex tensors to ``[depth, paths, 3]``."""
 
-    vertices = _to_numpy(paths.vertices)
+    vertices = as_numpy(paths.vertices)
     if vertices.ndim == 7:
         return np.asarray(vertices[:, 0, 0, 0, 0, :, :], dtype=np.float64)
     if vertices.ndim == 5:
@@ -431,7 +500,7 @@ def _path_component_array(
 ) -> np.ndarray:
     """Normalizes Sionna path metadata arrays to ``[depth, paths]``."""
 
-    array = _to_numpy(value)
+    array = as_numpy(value)
     if array.ndim == 6:
         return np.asarray(array[:, 0, 0, 0, 0, :], dtype=np.uint32)
     if array.ndim == 4:
@@ -446,7 +515,7 @@ def _path_component_array(
 def _path_interactions(paths, num_paths: int) -> np.ndarray:
     """Normalizes Sionna interaction-type tensors to ``[depth, paths]``."""
 
-    interactions = _to_numpy(paths.interactions)
+    interactions = as_numpy(paths.interactions)
     if interactions.ndim == 6:
         return np.asarray(interactions[:, 0, 0, 0, 0, :], dtype=np.uint32)
     if interactions.ndim == 4:
@@ -456,11 +525,3 @@ def _path_interactions(paths, num_paths: int) -> np.ndarray:
     if interactions.size == 0:
         return np.zeros((0, num_paths), dtype=np.uint32)
     raise RuntimeError(f"Unsupported path interactions shape: {interactions.shape}")
-
-
-def _to_numpy(value) -> np.ndarray:
-    """Converts tensor-like objects to NumPy arrays."""
-
-    if hasattr(value, "numpy"):
-        return value.numpy()
-    return np.asarray(value)

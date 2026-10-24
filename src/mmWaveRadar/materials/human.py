@@ -16,13 +16,15 @@ def human_skin_material(name: str):
     """
     from sionna.rt import RadioMaterial  # pylint: disable=import-outside-toplevel
 
-    return RadioMaterial(name=name,
-                         relative_permittivity=38.0,
-                         conductivity=1.5,
-                         thickness=0.01,
-                         scattering_coefficient=0.35,
-                         scattering_pattern="backscattering",
-                         alpha_r=8,
-                         alpha_i=20,
-                         lambda_=0.35,
-                         color=(0.85, 0.55, 0.45))
+    return RadioMaterial(
+        name=name,
+        relative_permittivity=38.0,
+        conductivity=1.5,
+        thickness=0.01,
+        scattering_coefficient=0.35,
+        scattering_pattern="backscattering",
+        alpha_r=8,
+        alpha_i=20,
+        lambda_=0.35,
+        color=(0.85, 0.55, 0.45),
+    )

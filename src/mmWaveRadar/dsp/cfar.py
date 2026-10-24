@@ -48,8 +48,7 @@ def ca_cfar_1d(
         ("min_sep", min_sep, 1),
     )
     for name, value, minimum in integer_parameters:
-        if isinstance(value, (bool, np.bool_)) or not isinstance(
-                value, (int, np.integer)):
+        if isinstance(value, (bool, np.bool_)) or not isinstance(value, (int, np.integer)):
             raise ValueError(f"{name} must be an integer >= {minimum}")
         if int(value) < minimum:
             raise ValueError(f"{name} must be >= {minimum}")
@@ -80,8 +79,7 @@ def ca_cfar_1d(
         cfar_input = x
 
     num_cells = 2 * num_train
-    alpha = (num_cells * (pfa ** (-1.0 / num_cells) - 1.0)
-             if scale is None else scale)
+    alpha = num_cells * (pfa ** (-1.0 / num_cells) - 1.0) if scale is None else scale
     pad = num_guard + num_train
 
     det = np.zeros(r, dtype=bool)
@@ -89,8 +87,8 @@ def ca_cfar_1d(
     noise = np.full(r, np.nan, dtype=float)
 
     for i in range(pad, r - pad):
-        left = cfar_input[i - pad: i - num_guard]
-        right = cfar_input[i + num_guard + 1: i + pad + 1]
+        left = cfar_input[i - pad : i - num_guard]
+        right = cfar_input[i + num_guard + 1 : i + pad + 1]
         z = np.mean(np.concatenate([left, right]))
         noise[i] = z
         thr[i] = alpha * z
@@ -102,8 +100,7 @@ def ca_cfar_1d(
 
     idx = np.where(det)[0]
     if not peak_only:
-        return {"det_mask": det, "threshold": thr, "noise_est": noise,
-                "peaks": idx}
+        return {"det_mask": det, "threshold": thr, "noise_est": noise, "peaks": idx}
 
     peaks = []
     for i in idx:
@@ -127,5 +124,4 @@ def ca_cfar_1d(
             taken[lo:hi] = True
         peaks = np.asarray(sorted(chosen), dtype=int)
 
-    return {"det_mask": det, "threshold": thr, "noise_est": noise,
-            "peaks": peaks}
+    return {"det_mask": det, "threshold": thr, "noise_est": noise, "peaks": peaks}

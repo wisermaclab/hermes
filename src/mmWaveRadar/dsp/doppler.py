@@ -5,10 +5,12 @@
 
 from __future__ import annotations
 
-import operator
 from typing import Literal, Optional
 
 import numpy as np
+
+from ..values import positive_integer, positive_float
+from ..naming import validate_tx_schedule
 
 from .constants import SPEED_OF_LIGHT
 from .clutter import remove_slow_time_mean
@@ -27,38 +29,10 @@ def _attr(obj, *names):
     return None
 
 
-def _positive_float(name: str, value: object) -> float:
-    """Returns a finite positive scalar with a user-facing error."""
-
-    try:
-        scalar = float(value)
-    except (TypeError, ValueError, OverflowError) as exc:
-        raise ValueError(f"{name} must be a finite positive scalar") from exc
-    if not np.isfinite(scalar) or scalar <= 0.0:
-        raise ValueError(f"{name} must be a finite positive scalar")
-    return scalar
+_positive_float = positive_float
 
 
-def _positive_integer(name: str, value: object) -> int:
-    """Returns a positive integer without truncating floats or booleans."""
-
-    if isinstance(value, (bool, np.bool_)):
-        raise ValueError(f"{name} must be a positive integer")
-    try:
-        integer = operator.index(value)
-    except TypeError as exc:
-        raise ValueError(f"{name} must be a positive integer") from exc
-    if integer <= 0:
-        raise ValueError(f"{name} must be a positive integer")
-    return int(integer)
-
-
-def _boolean(name: str, value: object) -> bool:
-    """Returns a strict boolean with a user-facing error."""
-
-    if not isinstance(value, (bool, np.bool_)):
-        raise ValueError(f"{name} must be a boolean")
-    return bool(value)
+_positive_integer = positive_integer
 
 
 def _resolve_doppler_parameters(
@@ -69,7 +43,7 @@ def _resolve_doppler_parameters(
     pri,
     fmcw,
     num_tx,
-    tdm_enabled,
+    tx_schedule,
 ) -> tuple[object, object, float, float]:
     """Resolves shared waveform parameters for Doppler helpers."""
 
@@ -81,30 +55,23 @@ def _resolve_doppler_parameters(
         carrier_frequency = _attr(fmcw, "carrier_frequency")
     if pri is None:
         chirp_repetition_time = _attr(fmcw, "chirp_repetition_time")
-        if tdm_enabled is None:
-            tdm_enabled = _attr(fmcw, "tdm_enabled")
-        if tdm_enabled is None:
-            tdm_enabled = False
-        tdm_enabled = _boolean("tdm_enabled", tdm_enabled)
+        if tx_schedule is None:
+            tx_schedule = _attr(fmcw, "tx_schedule")
+        if tx_schedule is None:
+            tx_schedule = "simultaneous"
+        tx_schedule = validate_tx_schedule(tx_schedule)
         if num_tx is None:
             num_tx = _attr(fmcw, "num_tx")
         if num_tx is None:
             num_tx = 1
         num_tx = _positive_integer("num_tx", num_tx)
         if chirp_repetition_time is not None:
-            pri = (num_tx if tdm_enabled else 1) * _positive_float(
+            pri = (num_tx if tx_schedule == "tdm" else 1) * _positive_float(
                 "chirp_repetition_time",
                 chirp_repetition_time,
             )
-    if (
-        sampling_frequency is None
-        or slope is None
-        or carrier_frequency is None
-        or pri is None
-    ):
-        raise ValueError(
-            "sampling_frequency, slope, carrier_frequency, and pri are required"
-        )
+    if sampling_frequency is None or slope is None or carrier_frequency is None or pri is None:
+        raise ValueError("sampling_frequency, slope, carrier_frequency, and pri are required")
     return (
         sampling_frequency,
         slope,
@@ -122,7 +89,7 @@ def range_doppler_map(
     *,
     fmcw=None,
     num_tx: int | None = None,
-    tdm_enabled: bool | None = None,
+    tx_schedule: str | None = None,
     win_range: Optional[str] = "hann",
     win_doppler: Optional[str] = "hann",
     remove_mean_clutter: bool = False,
@@ -142,24 +109,22 @@ def range_doppler_map(
     :param fmcw: Optional object with FMCW attributes.
     :param num_tx: Number of TDM transmitters. When omitted, use
         ``fmcw.num_tx`` if available, otherwise one.
-    :param tdm_enabled: Whether the slow-time samples use a TDM schedule. When
-        omitted, use ``fmcw.tdm_enabled`` if available, otherwise false.
+    :param tx_schedule: ``tdm`` or ``simultaneous`` slow-time sampling. When
+        omitted, use ``fmcw.tx_schedule`` if available, otherwise simultaneous.
     :param remove_mean_clutter: If true, subtract the per-range-bin,
         per-channel slow-time mean from the range-time cube before Doppler
         windowing and FFT.
     :returns: Tuple ``(rd_cube, ranges_m, velocities_mps)`` where ``rd_cube``
         has shape ``[num_doppler_bins, num_range_bins, num_channels]``.
     """
-    sampling_frequency, slope, carrier_frequency, pri = (
-        _resolve_doppler_parameters(
-            sampling_frequency=sampling_frequency,
-            slope=slope,
-            carrier_frequency=carrier_frequency,
-            pri=pri,
-            fmcw=fmcw,
-            num_tx=num_tx,
-            tdm_enabled=tdm_enabled,
-        )
+    sampling_frequency, slope, carrier_frequency, pri = _resolve_doppler_parameters(
+        sampling_frequency=sampling_frequency,
+        slope=slope,
+        carrier_frequency=carrier_frequency,
+        pri=pri,
+        fmcw=fmcw,
+        num_tx=num_tx,
+        tx_schedule=tx_schedule,
     )
 
     x = np.asarray(adc)
@@ -168,7 +133,7 @@ def range_doppler_map(
     if any(size == 0 for size in x.shape):
         raise ValueError("adc dimensions must be non-empty")
 
-    rt, ranges_m = range_fft(x, sampling_frequency, slope, window=win_range)
+    rt, ranges_m = range_fft(x, sampling_frequency, slope, fmcw=fmcw, window=win_range)
     if remove_mean_clutter:
         rt = remove_slow_time_mean(rt)
     wd = window_1d(rt.shape[0], win_doppler)[:, None, None]
@@ -192,7 +157,7 @@ def framewise_range_doppler_map(
     *,
     fmcw=None,
     num_tx: int | None = None,
-    tdm_enabled: bool | None = None,
+    tx_schedule: str | None = None,
     win_range: Optional[str] = "hann",
     win_doppler: Optional[str] = "hann",
     remove_mean_clutter: bool = False,
@@ -219,16 +184,14 @@ def framewise_range_doppler_map(
             pri=pri,
             fmcw=fmcw,
             num_tx=num_tx,
-            tdm_enabled=tdm_enabled,
+            tx_schedule=tx_schedule,
             win_range=win_range,
             win_doppler=win_doppler,
             remove_mean_clutter=remove_mean_clutter,
         )
         return rd[None, ...], ranges_m, velocities_mps
     if x.ndim != 4:
-        raise ValueError(
-            "adc must have shape [F, M, N, P] or [M, N, P]"
-        )
+        raise ValueError("adc must have shape [F, M, N, P] or [M, N, P]")
     if x.shape[0] == 0:
         raise ValueError("adc must contain at least one frame")
     rd_frames = []
@@ -243,7 +206,7 @@ def framewise_range_doppler_map(
             pri=pri,
             fmcw=fmcw,
             num_tx=num_tx,
-            tdm_enabled=tdm_enabled,
+            tx_schedule=tx_schedule,
             win_range=win_range,
             win_doppler=win_doppler,
             remove_mean_clutter=remove_mean_clutter,
@@ -264,7 +227,7 @@ def doppler_time_spectrum(
     *,
     fmcw=None,
     num_tx: int | None = None,
-    tdm_enabled: bool | None = None,
+    tx_schedule: str | None = None,
     win_range: Optional[str] = "hann",
     win_doppler: Optional[str] = "hann",
     nfft_mult: int = 1,
@@ -294,8 +257,8 @@ def doppler_time_spectrum(
     :param fmcw: Optional object with FMCW attributes.
     :param num_tx: Number of TDM transmitters. When omitted, use
         ``fmcw.num_tx`` if available, otherwise one.
-    :param tdm_enabled: Whether the slow-time samples use a TDM schedule. When
-        omitted, use ``fmcw.tdm_enabled`` if available, otherwise false.
+    :param tx_schedule: ``tdm`` or ``simultaneous`` slow-time sampling. When
+        omitted, use ``fmcw.tx_schedule`` if available, otherwise simultaneous.
     :param win_range: Fast-time window kind.
     :param win_doppler: Slow-time Doppler window kind.
     :param nfft_mult: Range FFT zero-padding multiplier.
@@ -314,16 +277,14 @@ def doppler_time_spectrum(
     :returns: Tuple ``(spectrum, times_s, velocities_mps, selected_ranges_m)``
         where ``spectrum`` has shape ``[num_time_bins, num_doppler_bins]``.
     """
-    sampling_frequency, slope, carrier_frequency, pri = (
-        _resolve_doppler_parameters(
-            sampling_frequency=sampling_frequency,
-            slope=slope,
-            carrier_frequency=carrier_frequency,
-            pri=pri,
-            fmcw=fmcw,
-            num_tx=num_tx,
-            tdm_enabled=tdm_enabled,
-        )
+    sampling_frequency, slope, carrier_frequency, pri = _resolve_doppler_parameters(
+        sampling_frequency=sampling_frequency,
+        slope=slope,
+        carrier_frequency=carrier_frequency,
+        pri=pri,
+        fmcw=fmcw,
+        num_tx=num_tx,
+        tx_schedule=tx_schedule,
     )
 
     x = np.asarray(adc)
@@ -332,13 +293,13 @@ def doppler_time_spectrum(
     if x.ndim == 2:
         x = x[:, :, None]
     if x.ndim != 3:
-        raise ValueError("adc must have shape [M, N], [M, N, P], or"
-                         " [F, M, N, P]")
+        raise ValueError("adc must have shape [M, N], [M, N, P], or [F, M, N, P]")
 
     rt, ranges_m = range_fft(
         x,
         sampling_frequency,
         slope,
+        fmcw=fmcw,
         window=win_range,
         nfft_mult=nfft_mult,
     )
@@ -352,8 +313,7 @@ def doppler_time_spectrum(
 
     num_slow = rt.shape[0]
     if window_chirps is None:
-        window_chirps = min(num_slow, int(_attr(fmcw, "num_chirps_per_frame")
-                                          or 64))
+        window_chirps = min(num_slow, int(_attr(fmcw, "num_chirps_per_frame") or 64))
     window_chirps = _positive_integer("window_chirps", window_chirps)
     if window_chirps > num_slow:
         raise ValueError("window_chirps must be in [1, num_chirps]")

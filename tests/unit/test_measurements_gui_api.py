@@ -21,15 +21,10 @@ from mmWaveRadar.measurements import (
     load_bundle,
 )
 import mmWaveRadar.measurements as measurements_module
-
+from mmWaveRadar.radar import FMCWConfig
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-SMALL_BUNDLE = (
-    REPO_ROOT
-    / "data"
-    / "validation_bundles"
-    / "mmradarpose_p1_an0_ac4_r0_frame0240"
-)
+SMALL_BUNDLE = REPO_ROOT / "data" / "validation_bundles" / "mmradarpose_p1_an0_ac4_r0_frame0240"
 
 
 def test_measurement_bundle_loads_products_and_self_comparison():
@@ -38,7 +33,7 @@ def test_measurement_bundle_loads_products_and_self_comparison():
     products = measurement.primary_products()
     comparison = measurement.compare_adc(measurement.primary_adc)
 
-    assert measurement.schema_version == 1
+    assert measurement.schema_version == 2
     assert measurement.profile == "hermes"
     assert measurement.data_origin == "measurement"
     assert measurement.can_resimulate is True
@@ -47,11 +42,61 @@ def test_measurement_bundle_loads_products_and_self_comparison():
     assert products.adc.shape == measurement.primary_adc.shape
     assert products.range_time_power.ndim == 2
     assert products.range_doppler_power.ndim == 3
+    assert products.channel_range_profile_power.shape == (
+        products.adc.shape[0],
+        len(products.range_time_ranges_m),
+        products.adc.shape[-1],
+    )
+    np.testing.assert_allclose(
+        products.channel_range_profile_power.mean(axis=0).sum(axis=-1),
+        products.range_profile_power,
+    )
+    assert "TX" in products.channel_labels[0]
     assert np.isclose(comparison.metrics.range_time_correlation, 1.0)
     assert np.isclose(comparison.metrics.range_doppler_correlation, 1.0)
     assert np.isclose(comparison.metrics.complex_correlation, 1.0)
     assert np.isclose(comparison.metrics.scale_adjusted_complex_nmse, 0.0)
     assert np.isclose(comparison.metrics.peak_range_error_m, 0.0)
+
+
+def test_channel_profiles_keep_distinct_ranges_and_use_the_selected_clutter_filter():
+    samples = np.arange(64)
+    chirp_phase = np.asarray([1, -1, 1, -1])
+    tones = np.stack(
+        [
+            np.exp(2j * np.pi * 5 * samples / 64),
+            0.1 * np.exp(2j * np.pi * 12 * samples / 64),
+        ],
+        axis=-1,
+    )
+    adc = (chirp_phase[None, :, None, None] * tones[None, None, :, :]).astype(np.complex64)
+    second = np.stack(
+        [
+            0.5 * np.exp(2j * np.pi * 7 * samples / 64),
+            0.2 * np.exp(2j * np.pi * 15 * samples / 64),
+        ],
+        axis=-1,
+    )
+    adc = np.concatenate([adc, chirp_phase[None, :, None, None] * second[None, None]], axis=0)
+    fmcw = FMCWConfig(
+        carrier_frequency=60e9,
+        slope=68e12,
+        chirp_duration=58e-6,
+        chirp_repetition_time=65e-6,
+        sampling_frequency=4.5e6,
+        num_adc_samples=64,
+        num_chirps_per_frame=4,
+        num_tx=1,
+        frame_period=0.05,
+    )
+    products = compute_radar_products(adc, fmcw, clutter_removal="mean")
+    profiles = products.channel_range_profile_power
+    np.testing.assert_array_equal(np.argmax(profiles, axis=1), [[5, 12], [7, 15]])
+    assert profiles[0, 12, 1] / profiles[0, 5, 0] == pytest.approx(0.01, rel=1e-4)
+    np.testing.assert_allclose(profiles.mean(axis=0).sum(axis=-1), products.range_profile_power)
+    stationary = np.repeat(adc[:1, :1], 4, axis=1)
+    filtered = compute_radar_products(stationary, fmcw, clutter_removal="mean")
+    np.testing.assert_allclose(filtered.channel_range_profile_power, 0.0, atol=1e-25)
 
 
 def test_measurement_comparison_can_select_channel_zero():
@@ -117,9 +162,7 @@ def test_committed_validation_bundles_conform_to_normative_schemas():
         for document, schema in mappings.items()
     }
     bundle_roots = sorted(
-        path
-        for path in (REPO_ROOT / "data" / "validation_bundles").glob("*")
-        if path.is_dir()
+        path for path in (REPO_ROOT / "data" / "validation_bundles").glob("*") if path.is_dir()
     )
 
     assert bundle_roots
@@ -131,8 +174,7 @@ def test_committed_validation_bundles_conform_to_normative_schemas():
             document = json.loads(document_path.read_text(encoding="utf-8"))
             errors = list(validator.iter_errors(document))
             assert not errors, (
-                f"{document_path} violates its normative schema: "
-                f"{errors[0].message}"
+                f"{document_path} violates its normative schema: " f"{errors[0].message}"
             )
 
 
@@ -206,7 +248,7 @@ def test_gui_bundle_preflight_rejects_declared_npz_bomb_before_integrity(
         archive.writestr("adc.npy", member.getvalue())
     monkeypatch.setattr(
         measurements_module,
-        "check_bundle_integrity",
+        "check_and_load_bundle",
         lambda _root: pytest.fail("integrity must not run before NPZ preflight"),
     )
 
@@ -247,7 +289,7 @@ def test_gui_bundle_preflight_caps_json_before_parsing(tmp_path, monkeypatch):
     (tmp_path / "bundle.json").write_text("{}", encoding="utf-8")
     monkeypatch.setattr(
         measurements_module,
-        "check_bundle_integrity",
+        "check_and_load_bundle",
         lambda _root: pytest.fail("JSON must be bounded before parsing"),
     )
     limits = replace(
@@ -306,7 +348,7 @@ def test_gui_bundle_rejects_adc_path_alias_before_integrity(
     )
     monkeypatch.setattr(
         measurements_module,
-        "check_bundle_integrity",
+        "check_and_load_bundle",
         lambda _root: pytest.fail("integrity must not run for aliased ADCs"),
     )
 

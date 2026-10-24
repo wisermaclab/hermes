@@ -6,24 +6,32 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Callable, Literal
+from typing import Callable
 
 import numpy as np
 
+from ..values import boolean
+from ..naming import (
+    HumanBounces,
+    SOLVERS,
+    Solver,
+    validate_frames,
+    validate_hybrid_calibration,
+)
 from .calibration import POCalibrationConfig
-from .physical_optics import ComputeBackend, ComputePrecision, POIntegrationMode
+from .compute import (
+    ComputeBackend,
+    ComputePrecision,
+    numpy_dtypes_for_precision,
+    validate_compute_backend,
+)
+from .physical_optics import (
+    POIntegrationMode,
+    default_phase_span_scale_rad,
+)
 
-
-CouplingMode = Literal["one_target_bounce", "one_human_bounce", "unrestricted"]
-
-MobilityMode = Literal[
-    "rt_retrace",
-    "rt_coherent_bank",
-    "human_only_po",
-    "hybrid_static_env_po",
-]
-
-SENSING_METADATA_SCHEMA_VERSION = 1
+SENSING_METADATA_SCHEMA_VERSION = 2
+DEFAULT_PO_REFRESH_ON_PHASE_ERROR_RAD = 0.1
 
 
 def _validate_integer(name: str, value, *, minimum: int) -> int:
@@ -54,20 +62,7 @@ def _validate_finite(name: str, value, *, minimum: float, inclusive: bool) -> fl
     return scalar
 
 
-def _validate_boolean(
-    name: str,
-    value,
-    *,
-    optional: bool = False,
-) -> bool | None:
-    """Validates a boolean option without applying truth-value coercion."""
-
-    if value is None and optional:
-        return None
-    if not isinstance(value, (bool, np.bool_)):
-        suffix = " or None" if optional else ""
-        raise ValueError(f"{name} must be a boolean{suffix}")
-    return bool(value)
+_validate_boolean = boolean
 
 
 @dataclass(frozen=True)
@@ -108,27 +103,60 @@ class RTCoherentTransitionConfig:
         object.__setattr__(self, "crossfade", crossfade)
 
 
-@dataclass(frozen=True)
-class HumanPOMobilityConfig:
-    """Configuration for the Phase 1 human-only PO mobility model."""
+def _calibration_config(name: str, value) -> POCalibrationConfig:
+    """Accepts a calibration name or a full calibration configuration."""
 
-    visibility_samples_per_face: int = 4
-    visibility_fade_chirps: int = 8
-    visibility_use_phase_center: bool = True
-    adaptive_visibility_sampling: bool = False
-    adaptive_visibility_edge_margin: float = 0.15
-    incremental_update: bool = False
-    incremental_visibility_refresh_chirps: int = 8
-    incremental_full_refresh_chirps: int | None = 64
-    incremental_normal_threshold_deg: float = 5.0
-    incremental_centroid_displacement_threshold_m: float | None = None
-    incremental_area_relative_threshold: float | None = None
-    compute_backend: ComputeBackend | None = None
-    compute_precision: ComputePrecision | None = None
+    if isinstance(value, POCalibrationConfig):
+        return value
+    return POCalibrationConfig(mode=validate_hybrid_calibration(value, name=name))
+
+
+@dataclass(frozen=True)
+class POConfig:
+    """Physical-optics settings for the PO solver and the Hybrid PO body.
+
+    Exact integration runs at a frame start every ``po_refresh_frames``
+    frames; 0 integrates every chirp. Between exact solves each facet keeps
+    its integrated amplitude while its per-channel phase, delay, and
+    spreading follow the motion. Facets that drift past the
+    ``po_refresh_on_phase_error_rad`` are integrated again. This bounds the
+    change since the last exact solve in vertex two-way path lengths relative
+    to the facet centre, multiplied by the wavenumber. Area changes above 30%
+    and normal changes above 20 degrees (configurable with
+    ``po_refresh_on_area_fraction`` and ``po_refresh_on_normal_deg``)
+    also force an exact solve, measured
+    from the last exact geometry, to catch amplitude and polarization drift.
+    Visibility
+    (self-shadowing) is refreshed every ``po_visibility_refresh_frames``
+    frames (0 = every chirp), and visibility changes fade over
+    ``po_visibility_fade_frames`` frames (0 = a step at the frame start).
+    Adaptive visibility sampling is enabled by default: additional face samples
+    are checked near centroid visibility boundaries and grazing incidence.
+    Disable it to check every configured sample on every face; adaptive checks
+    can miss partial occlusion within faces not flagged by those criteria.
+    """
+
+    po_refresh_frames: int = 1
+    po_visibility_refresh_frames: int = 1
+    po_visibility_fade_frames: int = 0
+    po_visibility_samples_per_face: int = 4
+    po_adaptive_visibility_sampling: bool = True
+    po_adaptive_visibility_edge_margin: float = 0.15
+    po_refresh_on_phase_error_rad: float = DEFAULT_PO_REFRESH_ON_PHASE_ERROR_RAD
+    po_refresh_on_area_fraction: float = 0.30
+    po_refresh_on_normal_deg: float = 20.0
     po_integration_mode: POIntegrationMode = "face_centroid"
-    po_quadrature_phase_span_scale_rad: float = 1.0
+    # None selects the integration mode's default; see
+    # effective_po_phase_span_scale_rad.
+    po_quadrature_phase_span_scale_rad: float | None = None
+    po_curvature_error_rad: float = 0.005
     po_quadrature_max_refinement_depth: int = 16
     po_quadrature_max_subfaces_per_parent: int = 0
+    # Optional RT-reference amplitude fit for the PO solver. Hybrid PO uses
+    # HybridPOConfig.hybrid_calibration instead.
+    po_calibration: POCalibrationConfig | str = "none"
+    compute_backend: ComputeBackend | None = None
+    compute_precision: ComputePrecision | None = None
     progress_callback: Callable[[dict], None] | None = field(
         default=None,
         repr=False,
@@ -144,92 +172,73 @@ class HumanPOMobilityConfig:
         repr=False,
         compare=False,
     )
-    calibration: POCalibrationConfig = field(default_factory=POCalibrationConfig)
 
     def __post_init__(self):
+        for name in (
+            "po_refresh_frames",
+            "po_visibility_refresh_frames",
+            "po_visibility_fade_frames",
+        ):
+            object.__setattr__(self, name, validate_frames(getattr(self, name), name=name))
+        for name in ("po_refresh_on_area_fraction", "po_refresh_on_normal_deg"):
+            value = _validate_finite(name, getattr(self, name), minimum=0.0, inclusive=True)
+            if name == "po_refresh_on_normal_deg" and value > 180.0:
+                raise ValueError("po_refresh_on_normal_deg must not exceed 180")
+            object.__setattr__(self, name, value)
         visibility_samples = _validate_integer(
-            "visibility_samples_per_face",
-            self.visibility_samples_per_face,
+            "po_visibility_samples_per_face",
+            self.po_visibility_samples_per_face,
             minimum=1,
         )
-        visibility_fade = _validate_integer(
-            "visibility_fade_chirps",
-            self.visibility_fade_chirps,
-            minimum=1,
-        )
-        visibility_refresh = _validate_integer(
-            "incremental_visibility_refresh_chirps",
-            self.incremental_visibility_refresh_chirps,
-            minimum=1,
-        )
-        full_refresh = self.incremental_full_refresh_chirps
-        if self.incremental_full_refresh_chirps is not None:
-            full_refresh = _validate_integer(
-                "incremental_full_refresh_chirps",
-                self.incremental_full_refresh_chirps,
-                minimum=0,
-            )
         edge_margin = _validate_finite(
-            "adaptive_visibility_edge_margin",
-            self.adaptive_visibility_edge_margin,
+            "po_adaptive_visibility_edge_margin",
+            self.po_adaptive_visibility_edge_margin,
             minimum=0.0,
             inclusive=True,
         )
         if edge_margin > 1.0:
-            raise ValueError("adaptive_visibility_edge_margin must not exceed 1")
-        normal_threshold = _validate_finite(
-            "incremental_normal_threshold_deg",
-            self.incremental_normal_threshold_deg,
+            raise ValueError("po_adaptive_visibility_edge_margin must not exceed 1")
+        phase_error_threshold = _validate_finite(
+            "po_refresh_on_phase_error_rad",
+            self.po_refresh_on_phase_error_rad,
             minimum=0.0,
             inclusive=True,
         )
-        optional_thresholds: dict[str, float | None] = {}
-        for name, value in (
-            (
-                "incremental_centroid_displacement_threshold_m",
-                self.incremental_centroid_displacement_threshold_m,
-            ),
-            (
-                "incremental_area_relative_threshold",
-                self.incremental_area_relative_threshold,
-            ),
-        ):
-            if value is not None:
-                value = _validate_finite(
-                    name,
-                    value,
-                    minimum=0.0,
-                    inclusive=True,
-                )
-            optional_thresholds[name] = value
-        if self.compute_backend not in (None, "auto", "numpy", "torch"):
-            raise ValueError(
-                "compute_backend must be 'auto', 'numpy', 'torch', or None"
-            )
-        if self.compute_precision not in (None, "float64", "float32"):
-            raise ValueError(
-                "compute_precision must be 'float64', 'float32', or None"
-            )
+        if self.compute_backend is not None:
+            validate_compute_backend(self.compute_backend, name="compute_backend")
+        if self.compute_precision is not None:
+            numpy_dtypes_for_precision(self.compute_precision)
         if self.po_integration_mode not in (
             "face_centroid",
             "parent_face_quadrature",
+            "parent_face_adaptive_analytic",
             "parent_face_far_field_analytic",
         ):
             raise ValueError(
                 "po_integration_mode must be 'face_centroid', "
-                "'parent_face_quadrature', or "
+                "'parent_face_quadrature', 'parent_face_adaptive_analytic', or "
                 "'parent_face_far_field_analytic'"
             )
-        quadrature_scale = _validate_finite(
-            "po_quadrature_phase_span_scale_rad",
-            self.po_quadrature_phase_span_scale_rad,
-            minimum=0.0,
-            inclusive=False,
+        quadrature_scale = (
+            None
+            if self.po_quadrature_phase_span_scale_rad is None
+            else _validate_finite(
+                "po_quadrature_phase_span_scale_rad",
+                self.po_quadrature_phase_span_scale_rad,
+                minimum=0.0,
+                inclusive=False,
+            )
         )
         refinement_depth = _validate_integer(
             "po_quadrature_max_refinement_depth",
             self.po_quadrature_max_refinement_depth,
             minimum=0,
+        )
+        curvature_error = _validate_finite(
+            "po_curvature_error_rad",
+            self.po_curvature_error_rad,
+            minimum=0.0,
+            inclusive=False,
         )
         max_subfaces = _validate_integer(
             "po_quadrature_max_subfaces_per_parent",
@@ -238,8 +247,11 @@ class HumanPOMobilityConfig:
         )
         if self.progress_callback is not None and not callable(self.progress_callback):
             raise ValueError("progress_callback must be callable or None")
-        if not isinstance(self.calibration, POCalibrationConfig):
-            raise ValueError("calibration must be a POCalibrationConfig instance")
+        object.__setattr__(
+            self,
+            "po_calibration",
+            _calibration_config("po_calibration", self.po_calibration),
+        )
 
         raw_visibility = self.precomputed_raw_fractional_visibility
         visible_counts = self.precomputed_visible_sample_counts
@@ -268,59 +280,30 @@ class HumanPOMobilityConfig:
                     counts.shape != raw.shape
                     or not np.issubdtype(counts.dtype, np.integer)
                     or np.any(counts < 0)
-                    or np.any(counts > int(self.visibility_samples_per_face))
+                    or np.any(counts > int(self.po_visibility_samples_per_face))
                 ):
                     raise ValueError(
                         "precomputed_visible_sample_counts must be integer counts "
-                        "matching visibility and visibility_samples_per_face"
+                        "matching visibility and po_visibility_samples_per_face"
                     )
 
-        object.__setattr__(self, "visibility_samples_per_face", visibility_samples)
-        object.__setattr__(self, "visibility_fade_chirps", visibility_fade)
+        object.__setattr__(self, "po_visibility_samples_per_face", visibility_samples)
         object.__setattr__(
             self,
-            "visibility_use_phase_center",
+            "po_adaptive_visibility_sampling",
             _validate_boolean(
-                "visibility_use_phase_center",
-                self.visibility_use_phase_center,
+                "po_adaptive_visibility_sampling",
+                self.po_adaptive_visibility_sampling,
             ),
         )
-        object.__setattr__(
-            self,
-            "adaptive_visibility_sampling",
-            _validate_boolean(
-                "adaptive_visibility_sampling",
-                self.adaptive_visibility_sampling,
-            ),
-        )
-        object.__setattr__(
-            self,
-            "incremental_update",
-            _validate_boolean("incremental_update", self.incremental_update),
-        )
-        object.__setattr__(self, "adaptive_visibility_edge_margin", edge_margin)
-        object.__setattr__(
-            self,
-            "incremental_visibility_refresh_chirps",
-            visibility_refresh,
-        )
-        object.__setattr__(
-            self,
-            "incremental_full_refresh_chirps",
-            full_refresh,
-        )
-        object.__setattr__(
-            self,
-            "incremental_normal_threshold_deg",
-            normal_threshold,
-        )
-        for name, value in optional_thresholds.items():
-            object.__setattr__(self, name, value)
+        object.__setattr__(self, "po_adaptive_visibility_edge_margin", edge_margin)
+        object.__setattr__(self, "po_refresh_on_phase_error_rad", phase_error_threshold)
         object.__setattr__(
             self,
             "po_quadrature_phase_span_scale_rad",
             quadrature_scale,
         )
+        object.__setattr__(self, "po_curvature_error_rad", curvature_error)
         object.__setattr__(
             self,
             "po_quadrature_max_refinement_depth",
@@ -332,31 +315,45 @@ class HumanPOMobilityConfig:
             max_subfaces,
         )
 
+    @property
+    def effective_po_phase_span_scale_rad(self) -> float:
+        """Returns the explicit phase span or the integration mode's default."""
+
+        if self.po_quadrature_phase_span_scale_rad is not None:
+            return float(self.po_quadrature_phase_span_scale_rad)
+        return default_phase_span_scale_rad(self.po_integration_mode)
+
+    @property
+    def incremental(self) -> bool:
+        """Whether facets are phase-updated between exact integrations."""
+
+        return self.po_refresh_frames > 0
+
 
 @dataclass(frozen=True)
-class HybridStaticEnvPOConfig:
-    """Configuration for static-environment RT plus dynamic human PO."""
+class HybridPOConfig:
+    """Hybrid PO settings: RT static room, PO body, blocking, and coupling.
 
-    blocking_enabled: bool = True
-    blocking_fade_chirps: int = 8
+    Blocking of room paths by the body is always on and follows the
+    simulator's ``rt_visibility_*`` cadence. The body and both coupling
+    directions use ``po_config``. Reflector selection is fixed for the run.
+    """
+
+    hybrid_coupling: bool = True
+    # Keep image powers within this level of the strongest, then take at most
+    # hybrid_max_reflectors, with a hard supported maximum of four.
+    hybrid_reflector_cutoff_db: float = -20.0
+    hybrid_max_reflectors: int = 4
+    hybrid_reflection_scale: float = 1.0
+    hybrid_min_reflector_area_m2: float = 1e-4
+    hybrid_calibration: POCalibrationConfig | str = "rt_first_pose"
     blocking_aabb_culling: bool = True
     blocking_aabb_margin_m: float = 0.02
     blocking_ray_epsilon_m: float = 1e-5
     blocking_ray_chunk_size: int = 65536
-    coupling_enabled: bool = False
-    coupling_max_reflectors: int = 16
-    coupling_min_reflector_area_m2: float = 1e-4
-    coupling_reflection_scale: float = 1.0
-    coupling_incremental_update: bool | None = None
-    coupling_visibility_refresh_chirps: int | None = None
-    human_po_config: HumanPOMobilityConfig | None = None
+    po_config: POConfig | None = None
 
     def __post_init__(self):
-        blocking_fade = _validate_integer(
-            "blocking_fade_chirps",
-            self.blocking_fade_chirps,
-            minimum=1,
-        )
         aabb_margin = _validate_finite(
             "blocking_aabb_margin_m",
             self.blocking_aabb_margin_m,
@@ -372,91 +369,58 @@ class HybridStaticEnvPOConfig:
         ray_chunk_size = _validate_integer(
             "blocking_ray_chunk_size", self.blocking_ray_chunk_size, minimum=1
         )
+        cutoff = self.hybrid_reflector_cutoff_db
+        if isinstance(cutoff, (bool, np.bool_)) or cutoff is None:
+            raise ValueError("hybrid_reflector_cutoff_db must be finite and <= 0")
+        try:
+            cutoff = float(cutoff)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("hybrid_reflector_cutoff_db must be finite and <= 0") from exc
+        if not np.isfinite(cutoff) or cutoff > 0.0:
+            raise ValueError("hybrid_reflector_cutoff_db must be finite and <= 0")
         max_reflectors = _validate_integer(
-            "coupling_max_reflectors", self.coupling_max_reflectors, minimum=0
+            "hybrid_max_reflectors", self.hybrid_max_reflectors, minimum=1
         )
+        if max_reflectors > 4:
+            raise ValueError("hybrid_max_reflectors must be between 1 and 4")
         min_reflector_area = _validate_finite(
-            "coupling_min_reflector_area_m2",
-            self.coupling_min_reflector_area_m2,
+            "hybrid_min_reflector_area_m2",
+            self.hybrid_min_reflector_area_m2,
             minimum=0.0,
             inclusive=True,
         )
         reflection_scale = _validate_finite(
-            "coupling_reflection_scale",
-            self.coupling_reflection_scale,
+            "hybrid_reflection_scale",
+            self.hybrid_reflection_scale,
             minimum=0.0,
             inclusive=True,
         )
-        if (
-            self.coupling_visibility_refresh_chirps is not None
-            and not (
-                isinstance(
-                    self.coupling_visibility_refresh_chirps,
-                    (int, np.integer),
-                )
-                and not isinstance(
-                    self.coupling_visibility_refresh_chirps,
-                    (bool, np.bool_),
-                )
-                and self.coupling_visibility_refresh_chirps > 0
-            )
-        ):
-            raise ValueError(
-                "coupling_visibility_refresh_chirps must be a positive integer"
-            )
-        if self.human_po_config is not None and not isinstance(
-            self.human_po_config,
-            HumanPOMobilityConfig,
-        ):
-            raise ValueError(
-                "human_po_config must be a HumanPOMobilityConfig or None"
-            )
+        if self.po_config is not None and not isinstance(self.po_config, POConfig):
+            raise ValueError("po_config must be a POConfig or None")
         object.__setattr__(
             self,
-            "blocking_enabled",
-            _validate_boolean("blocking_enabled", self.blocking_enabled),
+            "hybrid_coupling",
+            _validate_boolean("hybrid_coupling", self.hybrid_coupling),
         )
         object.__setattr__(
             self,
             "blocking_aabb_culling",
-            _validate_boolean(
-                "blocking_aabb_culling",
-                self.blocking_aabb_culling,
-            ),
+            _validate_boolean("blocking_aabb_culling", self.blocking_aabb_culling),
         )
         object.__setattr__(
             self,
-            "coupling_enabled",
-            _validate_boolean("coupling_enabled", self.coupling_enabled),
+            "hybrid_calibration",
+            _calibration_config("hybrid_calibration", self.hybrid_calibration),
         )
-        object.__setattr__(
-            self,
-            "coupling_incremental_update",
-            _validate_boolean(
-                "coupling_incremental_update",
-                self.coupling_incremental_update,
-                optional=True,
-            ),
-        )
-        object.__setattr__(self, "blocking_fade_chirps", blocking_fade)
         object.__setattr__(self, "blocking_aabb_margin_m", aabb_margin)
         object.__setattr__(self, "blocking_ray_epsilon_m", ray_epsilon)
         object.__setattr__(self, "blocking_ray_chunk_size", ray_chunk_size)
-        object.__setattr__(self, "coupling_max_reflectors", max_reflectors)
-        object.__setattr__(
-            self,
-            "coupling_min_reflector_area_m2",
-            min_reflector_area,
-        )
-        object.__setattr__(self, "coupling_reflection_scale", reflection_scale)
-        if self.coupling_visibility_refresh_chirps is not None:
-            object.__setattr__(
-                self,
-                "coupling_visibility_refresh_chirps",
-                int(self.coupling_visibility_refresh_chirps),
-            )
-        if self.human_po_config is None:
-            object.__setattr__(self, "human_po_config", HumanPOMobilityConfig())
+        object.__setattr__(self, "hybrid_reflector_cutoff_db", cutoff)
+        object.__setattr__(self, "hybrid_max_reflectors", max_reflectors)
+        object.__setattr__(self, "hybrid_min_reflector_area_m2", min_reflector_area)
+        object.__setattr__(self, "hybrid_reflection_scale", reflection_scale)
+        if self.po_config is None:
+            object.__setattr__(self, "po_config", POConfig())
 
 
 @dataclass(frozen=True)
@@ -468,7 +432,7 @@ class SensingMetadata:
     max_displacements: np.ndarray
     virtual_channel_order: str
     metadata_schema_version: int = SENSING_METADATA_SCHEMA_VERSION
-    mode: str = "rt_retrace"
+    solver: Solver = "rt"
     visible_face_counts: np.ndarray | None = None
     effective_visible_area_fraction: np.ndarray | None = None
     runtime_per_chirp_s: np.ndarray | None = None
@@ -502,6 +466,7 @@ class SensingMetadata:
     env_human_min_path_lengths_m: np.ndarray | None = None
     env_human_mean_path_lengths_m: np.ndarray | None = None
     env_human_max_path_lengths_m: np.ndarray | None = None
+    adc_if_filter: dict | None = None
     po_calibration: dict | None = None
     rt_transition_persistent_path_counts: np.ndarray | None = None
     rt_transition_birth_path_counts: np.ndarray | None = None
@@ -509,7 +474,10 @@ class SensingMetadata:
     rt_transition_alpha: np.ndarray | None = None
     rt_transition_old_weights: np.ndarray | None = None
     rt_transition_new_weights: np.ndarray | None = None
+    rt_visibility_refresh: np.ndarray | None = None
+    rt_blocked_path_counts: np.ndarray | None = None
     virtual_channel_times_s: np.ndarray | None = None
+    provenance: dict | None = None
 
 
 @dataclass(frozen=True)
@@ -523,13 +491,14 @@ class RadarCube:
 
 
 __all__ = [
-    "CouplingMode",
-    "HybridStaticEnvPOConfig",
-    "HumanPOMobilityConfig",
-    "MobilityMode",
+    "HumanBounces",
+    "HybridPOConfig",
+    "POConfig",
     "POIntegrationMode",
     "RTCoherentTransitionConfig",
     "RadarCube",
     "SENSING_METADATA_SCHEMA_VERSION",
+    "SOLVERS",
     "SensingMetadata",
+    "Solver",
 ]

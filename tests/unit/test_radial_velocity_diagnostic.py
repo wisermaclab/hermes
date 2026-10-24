@@ -18,10 +18,13 @@ from mmWaveRadar.diagnostics.radial_velocity_geometry import (
 
 
 def _write_test_mesh_sequence(path):
-    vertices = np.array([
-        [[1.0, 0.0, 0.0], [1.0, 1.0, 0.0], [1.0, 0.0, 1.0]],
-        [[1.1, 0.0, 0.0], [1.1, 1.0, 0.0], [1.1, 0.0, 1.0]],
-    ], dtype=np.float32)
+    vertices = np.array(
+        [
+            [[1.0, 0.0, 0.0], [1.0, 1.0, 0.0], [1.0, 0.0, 1.0]],
+            [[1.1, 0.0, 0.0], [1.1, 1.0, 0.0], [1.1, 0.0, 1.0]],
+        ],
+        dtype=np.float32,
+    )
     faces = np.array([[0, 1, 2]], dtype=np.uint32)
     times = np.array([0.0, 0.1], dtype=float)
     np.savez_compressed(path, vertices=vertices, faces=faces, times=times)
@@ -51,20 +54,25 @@ def test_radial_velocity_diagnostic_cli_writes_json(tmp_path):
     report_json = tmp_path / "report.json"
     _write_test_mesh_sequence(mesh_npz)
 
-    assert radial_velocity_main([
-        "--mesh-sequence-npz",
-        str(mesh_npz),
-        "--radar-position",
-        "0,0,0",
-        "--tx-positions",
-        "0,0,0",
-        "--rx-positions",
-        "0,0,0",
-        "--point-kind",
-        "face_centroid",
-        "--json",
-        str(report_json),
-    ]) == 0
+    assert (
+        radial_velocity_main(
+            [
+                "--mesh-sequence-npz",
+                str(mesh_npz),
+                "--radar-position",
+                "0,0,0",
+                "--tx-positions",
+                "0,0,0",
+                "--rx-positions",
+                "0,0,0",
+                "--point-kind",
+                "face_centroid",
+                "--json",
+                str(report_json),
+            ]
+        )
+        == 0
+    )
 
     report = json.loads(report_json.read_text())
     assert report["source_path"] == str(mesh_npz)
@@ -95,12 +103,14 @@ def test_radial_velocity_cli_reports_malformed_vectors_as_usage_errors(
     capsys,
 ):
     with pytest.raises(SystemExit) as exc:
-        radial_velocity_main([
-            "--mesh-sequence-npz",
-            "missing.npz",
-            option,
-            value,
-        ])
+        radial_velocity_main(
+            [
+                "--mesh-sequence-npz",
+                "missing.npz",
+                option,
+                value,
+            ]
+        )
 
     error = capsys.readouterr().err
     assert exc.value.code == 2

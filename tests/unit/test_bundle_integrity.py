@@ -41,6 +41,7 @@ def _write_bundle(root: Path) -> np.ndarray:
                 },
                 "fmcw": {
                     "carrier_frequency_hz": 60.0e9,
+                    "carrier_reference": "first_adc_sample",
                     "slope_hz_per_s": 20.0e12,
                     "chirp_duration_s": 60.0e-6,
                     "chirp_repetition_time_s": 80.0e-6,
@@ -61,7 +62,7 @@ def _write_bundle(root: Path) -> np.ndarray:
         trans=np.zeros((2, 3), dtype=np.float32),
         betas=np.zeros(10, dtype=np.float32),
         faces=faces,
-        times=np.asarray([0.0, 0.1]),
+        times=np.asarray([0.0, 0.101]),
     )
     adc = np.zeros((2, 4, 8, 12), dtype=np.complex64)
     np.savez(root / "radar_adc.npz", adc=adc)
@@ -102,11 +103,14 @@ def test_safe_bundle_file_returns_canonical_contained_file(tmp_path):
     artifact = nested / "artifact.npz"
     artifact.write_bytes(b"contained")
 
-    assert _safe_bundle_file(
-        bundle_root,
-        "nested/artifact.npz",
-        label="artifact",
-    ) == artifact.resolve()
+    assert (
+        _safe_bundle_file(
+            bundle_root,
+            "nested/artifact.npz",
+            label="artifact",
+        )
+        == artifact.resolve()
+    )
 
 
 def _replace_amass_arrays(root: Path, **replacements: np.ndarray) -> None:
@@ -155,7 +159,7 @@ def test_integrity_rejects_nonfinite_adc(tmp_path):
         check_bundle_integrity(tmp_path)
 
 
-def test_integrity_rejects_frame_time_outside_motion_timeline(tmp_path):
+def test_integrity_keeps_playback_when_motion_timeline_is_short(tmp_path):
     _write_bundle(tmp_path)
     (tmp_path / "frames.json").write_text(
         json.dumps(
@@ -169,8 +173,10 @@ def test_integrity_rejects_frame_time_outside_motion_timeline(tmp_path):
         encoding="utf-8",
     )
 
-    with pytest.raises(ValueError, match="within the amass_sequence.npz timeline"):
-        check_bundle_integrity(tmp_path)
+    report = check_bundle_integrity(tmp_path)
+    assert report["valid"]
+    assert report["resimulation"]["available"] is False
+    assert "full radar acquisition" in report["resimulation"]["issues"][0]
 
 
 def test_integrity_requires_explicit_motion_time(tmp_path):
@@ -180,7 +186,7 @@ def test_integrity_requires_explicit_motion_time(tmp_path):
         encoding="utf-8",
     )
 
-    with pytest.raises(ValueError, match="must include motion_time_s"):
+    with pytest.raises(ValueError, match="frames.schema.json"):
         check_bundle_integrity(tmp_path)
 
 
@@ -203,7 +209,7 @@ def test_integrity_rejects_invalid_amass_timing_and_faces(tmp_path):
         poses=np.zeros((2, 72), dtype=np.float32),
         trans=np.zeros((2, 3), dtype=np.float32),
         betas=np.zeros(10, dtype=np.float32),
-        times=np.asarray([0.0, 0.1]),
+        times=np.asarray([0.0, 0.101]),
         faces=np.asarray([[0, 1, 6890]], dtype=np.uint32),
     )
     with pytest.raises(ValueError, match="outside base-SMPL topology"):
@@ -229,7 +235,7 @@ def test_integrity_and_bundle_prefer_canonical_amass_sequence(tmp_path):
         trans=np.zeros((2, 3), dtype=np.float32),
         betas=np.zeros(10, dtype=np.float32),
         times=np.asarray([7.2, 7.3]),
-        bundle_times=np.asarray([-0.1, 0.0]),
+        bundle_times=np.asarray([-0.1, 0.001]),
         faces=np.asarray([[0, 1, 2]], dtype=np.uint32),
     )
 
@@ -248,7 +254,7 @@ def test_integrity_validates_source_times_even_when_bundle_times_are_present(
     _replace_amass_arrays(
         tmp_path,
         times=np.asarray([7.2, 7.2]),
-        bundle_times=np.asarray([0.0, 0.1]),
+        bundle_times=np.asarray([0.0, 0.101]),
     )
 
     with pytest.raises(
@@ -295,7 +301,7 @@ def test_integrity_reports_each_validated_motion_timeline(tmp_path):
     _write_bundle(tmp_path)
     _replace_amass_arrays(
         tmp_path,
-        bundle_times=np.asarray([0.0, 0.1]),
+        bundle_times=np.asarray([0.0, 0.101]),
         source_capture_times=np.asarray([7.2, 7.3]),
         radar_capture_times=np.asarray([2.0, 2.1]),
     )
@@ -318,14 +324,14 @@ def test_bundle_rejects_undeclared_body_motion_filenames(tmp_path):
         poses=np.zeros((2, 72), dtype=np.float32),
         trans=np.zeros((2, 3), dtype=np.float32),
         betas=np.zeros(10, dtype=np.float32),
-        times=np.asarray([0.0, 0.1]),
+        times=np.asarray([0.0, 0.101]),
         faces=np.asarray([[0, 1, 2]], dtype=np.uint32),
     )
     np.savez(
         tmp_path / "mesh_sequence.npz",
         vertices=np.zeros((2, 3, 3), dtype=np.float32),
         faces=np.asarray([[0, 1, 2]], dtype=np.uint32),
-        times=np.asarray([0.0, 0.1]),
+        times=np.asarray([0.0, 0.101]),
     )
 
     with pytest.raises(FileNotFoundError, match="amass_sequence.npz"):
@@ -341,7 +347,7 @@ def test_integrity_checks_environment_references(tmp_path):
         encoding="utf-8",
     )
 
-    with pytest.raises(FileNotFoundError, match="environment asset"):
+    with pytest.raises(FileNotFoundError, match="Referenced bundle file"):
         check_bundle_integrity(tmp_path)
 
     scene = tmp_path / "environment_geometry" / "scene.xml"
@@ -368,11 +374,7 @@ def test_integrity_validates_optional_environment_mesh_sequence(tmp_path):
     )
     (tmp_path / "environment.json").write_text(
         json.dumps(
-            {
-                "environment_mesh_sequence": (
-                    "environment_geometry/environment_mesh_sequence.npz"
-                )
-            }
+            {"environment_mesh_sequence": ("environment_geometry/environment_mesh_sequence.npz")}
         ),
         encoding="utf-8",
     )
@@ -380,9 +382,7 @@ def test_integrity_validates_optional_environment_mesh_sequence(tmp_path):
     report = check_bundle_integrity(tmp_path)
 
     assert report["environment"]["referenced_assets"] == {
-        "environment_mesh_sequence": (
-            "environment_geometry/environment_mesh_sequence.npz"
-        )
+        "environment_mesh_sequence": ("environment_geometry/environment_mesh_sequence.npz")
     }
 
 
@@ -393,7 +393,7 @@ def test_integrity_rejects_absolute_environment_reference(tmp_path):
         encoding="utf-8",
     )
 
-    with pytest.raises(ValueError, match="bundle-relative"):
+    with pytest.raises(ValueError, match="environment.schema.json"):
         check_bundle_integrity(tmp_path)
 
 

@@ -17,7 +17,12 @@ from sionna.rt.constants import InteractionType, INVALID_PRIMITIVE, INVALID_SHAP
 
 from ..radar.hardware import resolve_virtual_channel_pairs
 from .channel_gain import apply_path_hardware_gain
-from .runtime import _torch_cuda_is_available
+from .compute import (
+    ComputePrecision,
+    TorchRuntime,
+    numpy_dtypes_for_precision,
+    resolve_torch_runtime,
+)
 from .static_blocking import (
     _path_arrays,
     _path_interactions,
@@ -27,9 +32,8 @@ from .static_blocking import (
 )
 from ..targets import MeshTarget
 
-
 _TORCH_COHERENT_BANK_CACHE: dict[
-    tuple[int, str],
+    tuple[int, str, str],
     tuple[weakref.ReferenceType, dict],
 ] = {}
 
@@ -128,6 +132,7 @@ def extract_coherent_rt_path_bank(
         coefficients,
         paths=paths,
         frequency_hz=radar.fmcw.carrier_frequency,
+        radar_orientation=radar.orientation,
     )
     num_paths = int(delays_s.size)
     path_vertices = _path_vertices(paths)
@@ -136,18 +141,15 @@ def extract_coherent_rt_path_bank(
     primitives = _path_primitives(paths, interactions.shape, num_paths)
     target_ids = _target_object_ids(targets)
     target_faces = tuple(
-        np.asarray(target.mesh_sequence.faces, dtype=np.int64)
-        for target in targets
+        np.asarray(target.mesh_sequence.faces, dtype=np.int64) for target in targets
     )
     if anchor_target_vertices is None:
         target_anchor_vertices = tuple(
-            np.asarray(target.mesh_sequence.vertices[0], dtype=np.float64)
-            for target in targets
+            np.asarray(target.mesh_sequence.vertices[0], dtype=np.float64) for target in targets
         )
     else:
         target_anchor_vertices = tuple(
-            np.asarray(vertices, dtype=np.float64)
-            for vertices in anchor_target_vertices
+            np.asarray(vertices, dtype=np.float64) for vertices in anchor_target_vertices
         )
         if len(target_anchor_vertices) != len(targets):
             raise ValueError("anchor_target_vertices must match targets")
@@ -227,32 +229,35 @@ def update_coherent_rt_path_bank(
     *,
     frequency_hz: float | None = None,
     backend: str = "numpy",
+    precision: ComputePrecision = "float64",
 ) -> CoherentRTPathUpdate:
-    """Updates path geometry, using CUDA when requested and available."""
+    """Update path geometry and carrier phase at the requested precision.
 
-    current_vertices = _coerce_target_vertices(target_vertices)
-    if _use_cuda_coherent_update(backend):
-        import torch  # pylint: disable=import-outside-toplevel
+    Float32 permits supported MPS execution. Float64 remains available for
+    large-coordinate scenes or particularly sensitive coherent comparisons.
+    """
 
+    float_dtype, complex_dtype = numpy_dtypes_for_precision(precision)
+    current_vertices = _coerce_target_vertices(target_vertices, dtype=float_dtype)
+    runtime = resolve_torch_runtime(backend, precision)
+    if runtime is not None:
         return _update_coherent_rt_path_bank_torch(
             bank,
             current_vertices,
             frequency_hz=frequency_hz,
-            device=torch.device("cuda"),
+            runtime=runtime,
         )
-    if backend not in ("auto", "numpy", "torch"):
-        raise ValueError("backend must be 'auto', 'numpy', or 'torch'")
     path_lengths = np.asarray(
         bank.anchor_path_lengths_m,
-        dtype=np.float64,
+        dtype=float_dtype,
     ).copy()
     delay_lengths = np.asarray(
         bank.anchor_delay_lengths_m,
-        dtype=np.float64,
+        dtype=float_dtype,
     ).copy()
     spreads = np.asarray(
         bank.anchor_spread_products_m,
-        dtype=np.float64,
+        dtype=float_dtype,
     ).copy()
 
     dynamic_paths = np.any(
@@ -265,6 +270,7 @@ def update_coherent_rt_path_bank(
             bank,
             current_vertices,
             path_indices,
+            dtype=float_dtype,
         )
         (
             first_points,
@@ -273,8 +279,8 @@ def update_coherent_rt_path_bank(
             internal_spreads,
         ) = _shared_dynamic_path_geometry(points, active)
 
-        tx_positions = np.asarray(bank.tx_positions, dtype=np.float64)
-        rx_positions = np.asarray(bank.rx_positions, dtype=np.float64)
+        tx_positions = np.asarray(bank.tx_positions, dtype=float_dtype)
+        rx_positions = np.asarray(bank.rx_positions, dtype=float_dtype)
         vc_tx, vc_rx = resolve_virtual_channel_pairs(
             int(tx_positions.shape[0]),
             int(rx_positions.shape[0]),
@@ -298,16 +304,18 @@ def update_coherent_rt_path_bank(
             last_points=last_points,
             internal_lengths=internal_lengths,
             internal_spreads=internal_spreads,
-            tx_positions=np.asarray(bank.tx_center, dtype=np.float64).reshape(1, 3),
-            rx_positions=np.asarray(bank.rx_center, dtype=np.float64).reshape(1, 3),
+            tx_positions=np.asarray(bank.tx_center, dtype=float_dtype).reshape(1, 3),
+            rx_positions=np.asarray(bank.rx_center, dtype=float_dtype).reshape(1, 3),
         )
         delay_lengths[path_indices] = center_lengths[0]
     freq = bank.frequency_hz if frequency_hz is None else float(frequency_hz)
     k0 = 2.0 * pi * freq / c
-    length_delta = path_lengths - bank.anchor_path_lengths_m
-    phase = np.exp(1j * k0 * length_delta)
-    spread_ratio = bank.anchor_spread_products_m / np.maximum(spreads, 1e-18)
-    coefficients = bank.coefficients * phase * spread_ratio
+    length_delta = path_lengths - np.asarray(bank.anchor_path_lengths_m, dtype=float_dtype)
+    phase = np.exp(-1j * k0 * length_delta)
+    spread_ratio = np.asarray(bank.anchor_spread_products_m, dtype=float_dtype) / np.maximum(
+        spreads, 1e-18
+    )
+    coefficients = np.asarray(bank.coefficients, dtype=complex_dtype) * phase * spread_ratio
     return CoherentRTPathUpdate(
         coefficients=coefficients.astype(bank.coefficients.dtype, copy=False),
         delays_s=(delay_lengths / c).astype(bank.delays_s.dtype, copy=False),
@@ -315,6 +323,56 @@ def update_coherent_rt_path_bank(
         path_lengths_m=path_lengths,
         delay_lengths_m=delay_lengths,
         spread_products_m=spreads,
+    )
+
+
+def coherent_path_segments(
+    bank: CoherentRTPathBank,
+    target_vertices: Sequence[np.ndarray] | Mapping[int, np.ndarray],
+    *,
+    body_margin_m: float = 2e-3,
+    endpoint_margin_m: float = 1e-5,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Returns the current segments of every valid path for a visibility test.
+
+    Points on a moving target follow their triangle, so a path is tested
+    where it is now rather than where it was traced. Segments that start or
+    end on the body keep ``body_margin_m`` clear of it so the touched surface
+    does not count as a blocker. Returns ``starts, ends, path_indices,
+    start_margins_m, end_margins_m``.
+    """
+
+    path_indices = np.flatnonzero(np.asarray(bank.valid, dtype=bool))
+    empty = np.zeros((0, 3), dtype=np.float64)
+    if path_indices.size == 0:
+        return empty, empty, np.zeros(0, dtype=np.int64), np.zeros(0), np.zeros(0)
+    points, active = _current_dynamic_path_points(
+        bank,
+        _coerce_target_vertices(target_vertices),
+        path_indices,
+    )
+    on_body = np.asarray(bank.dynamic_target_indices[:, path_indices]) >= 0
+    tx_center = np.asarray(bank.tx_center, dtype=np.float64).reshape(3)
+    rx_center = np.asarray(bank.rx_center, dtype=np.float64).reshape(3)
+    starts, ends, owners, start_margins, end_margins = [], [], [], [], []
+    for local, path in enumerate(path_indices):
+        depths = np.flatnonzero(active[:, local])
+        chain = [tx_center, *points[depths, local]]
+        body = [False, *on_body[depths, local]]
+        chain.append(rx_center)
+        body.append(False)
+        for index in range(len(chain) - 1):
+            starts.append(chain[index])
+            ends.append(chain[index + 1])
+            owners.append(path)
+            start_margins.append(body_margin_m if body[index] else endpoint_margin_m)
+            end_margins.append(body_margin_m if body[index + 1] else endpoint_margin_m)
+    return (
+        np.asarray(starts, dtype=np.float64).reshape(-1, 3),
+        np.asarray(ends, dtype=np.float64).reshape(-1, 3),
+        np.asarray(owners, dtype=np.int64),
+        np.asarray(start_margins, dtype=np.float64),
+        np.asarray(end_margins, dtype=np.float64),
     )
 
 
@@ -327,6 +385,7 @@ def match_coherent_rt_path_banks(
     match_delay_tolerance_fraction: float = 0.5,
     match_separation_fraction: float = 0.25,
     backend: str = "numpy",
+    precision: ComputePrecision = "float64",
 ) -> CoherentRTPathTransition:
     """Matches conservative path identities across consecutive retraces.
 
@@ -349,11 +408,13 @@ def match_coherent_rt_path_banks(
         old_bank,
         boundary_target_vertices,
         backend=backend,
+        precision=precision,
     )
     new_update = update_coherent_rt_path_bank(
         new_bank,
         boundary_target_vertices,
         backend=backend,
+        precision=precision,
     )
     old_valid = np.asarray(old_update.valid, dtype=bool)
     new_valid = np.asarray(new_update.valid, dtype=bool)
@@ -512,8 +573,7 @@ def synthesize_coherent_rt_transition(
     source_indices = np.concatenate(source_index_parts).astype(np.int64, copy=False)
     return CoherentRTTransitionSynthesis(
         coefficients=np.concatenate(coeff_parts, axis=1),
-        delays_s=np.concatenate(delay_parts).astype(current_update.delays_s.dtype,
-                                                    copy=False),
+        delays_s=np.concatenate(delay_parts).astype(current_update.delays_s.dtype, copy=False),
         valid=np.ones(source_indices.shape, dtype=bool),
         roles=np.concatenate(role_parts),
         source_is_new=np.concatenate(source_is_new_parts),
@@ -606,9 +666,7 @@ def _target_object_ids(targets: Sequence[MeshTarget]) -> dict[int, int]:
 
     target_ids = {}
     for target_index, target in enumerate(targets):
-        object_id = int(
-            np.asarray(target.ensure_scene_object().object_id).reshape(-1)[0]
-        )
+        object_id = int(np.asarray(target.ensure_scene_object().object_id).reshape(-1)[0])
         target_ids[object_id] = target_index
     return target_ids
 
@@ -652,6 +710,8 @@ def _dynamic_hit_coordinates(
 
 def _coerce_target_vertices(
     target_vertices: Sequence[np.ndarray] | Mapping[int, np.ndarray],
+    *,
+    dtype=np.float64,
 ) -> tuple[np.ndarray, ...]:
     """Normalizes target vertices to a tuple indexed by target id."""
 
@@ -660,26 +720,9 @@ def _coerce_target_vertices(
             return ()
         max_index = max(int(k) for k in target_vertices)
         return tuple(
-            np.asarray(target_vertices[index], dtype=np.float64)
-            for index in range(max_index + 1)
+            np.asarray(target_vertices[index], dtype=dtype) for index in range(max_index + 1)
         )
-    return tuple(np.asarray(vertices, dtype=np.float64) for vertices in target_vertices)
-
-
-def _use_cuda_coherent_update(backend: str) -> bool:
-    """Returns whether coherent-bank geometry should use Torch CUDA."""
-
-    if backend == "numpy":
-        return False
-    if backend not in ("auto", "torch"):
-        raise ValueError("backend must be 'auto', 'numpy', or 'torch'")
-    try:
-        import torch  # pylint: disable=import-outside-toplevel
-    except ImportError:
-        if backend == "torch":
-            raise
-        return False
-    return _torch_cuda_is_available(torch)
+    return tuple(np.asarray(vertices, dtype=dtype) for vertices in target_vertices)
 
 
 def _update_coherent_rt_path_bank_torch(
@@ -687,14 +730,14 @@ def _update_coherent_rt_path_bank_torch(
     target_vertices: tuple[np.ndarray, ...],
     *,
     frequency_hz: float | None,
-    device,
+    runtime: TorchRuntime,
 ) -> CoherentRTPathUpdate:
     """Torch implementation of the vectorized coherent-bank update."""
 
     import torch  # pylint: disable=import-outside-toplevel
 
-    dtype = torch.float64
-    bank_data = _torch_coherent_bank_data(bank, device=device)
+    device, dtype = runtime.device, runtime.float_dtype
+    bank_data = _torch_coherent_bank_data(bank, runtime=runtime)
     path_lengths = bank_data["anchor_path_lengths"].clone()
     delay_lengths = bank_data["anchor_delay_lengths"].clone()
     spreads = bank_data["anchor_spreads"].clone()
@@ -712,11 +755,13 @@ def _update_coherent_rt_path_bank_torch(
                 depth_indices,
                 local_path_indices,
                 triangle_vertex_indices,
-            ) = bank_data["target_hits"][target_index]
+            ) = bank_data[
+                "target_hits"
+            ][target_index]
             if depth_indices.numel() == 0:
                 continue
             vertices_t = torch.as_tensor(
-                np.asarray(vertices, dtype=np.float64),
+                np.asarray(vertices, dtype=runtime.numpy_float_dtype),
                 dtype=dtype,
                 device=device,
             )
@@ -748,8 +793,7 @@ def _update_coherent_rt_path_bank_torch(
             continuing = depth_active & seen
             first_points[first] = points[depth_index, first]
             segment_lengths = torch.linalg.vector_norm(
-                points[depth_index, continuing]
-                - previous_points[continuing],
+                points[depth_index, continuing] - previous_points[continuing],
                 dim=1,
             )
             internal_lengths[continuing] += segment_lengths
@@ -785,14 +829,16 @@ def _update_coherent_rt_path_bank_torch(
     anchor_lengths = bank_data["anchor_path_lengths"]
     anchor_spreads = bank_data["anchor_spreads"]
     coefficients = bank_data["coefficients"]
-    phase = torch.exp(1j * wave_number * (path_lengths - anchor_lengths))
+    phase = torch.exp(-1j * wave_number * (path_lengths - anchor_lengths))
     spread_ratio = anchor_spreads / torch.clamp(spreads, min=1e-18)
     coefficients = coefficients * phase * spread_ratio
     path_lengths_np = path_lengths.cpu().numpy()
     delay_lengths_np = delay_lengths.cpu().numpy()
     spreads_np = spreads.cpu().numpy()
     return CoherentRTPathUpdate(
-        coefficients=coefficients.cpu().numpy().astype(
+        coefficients=coefficients.cpu()
+        .numpy()
+        .astype(
             bank.coefficients.dtype,
             copy=False,
         ),
@@ -804,17 +850,17 @@ def _update_coherent_rt_path_bank_torch(
     )
 
 
-def _torch_coherent_bank_data(bank: CoherentRTPathBank, *, device) -> dict:
-    """Returns invariant coherent-bank tensors cached on one Torch device."""
+def _torch_coherent_bank_data(bank: CoherentRTPathBank, *, runtime: TorchRuntime) -> dict:
+    """Cache invariant tensors separately for each device and precision."""
 
     import torch  # pylint: disable=import-outside-toplevel
 
-    cache_key = (id(bank), str(device))
+    device, dtype = runtime.device, runtime.float_dtype
+    cache_key = (id(bank), str(device), str(dtype))
     cached = _TORCH_COHERENT_BANK_CACHE.get(cache_key)
     if cached is not None and cached[0]() is bank:
         return cached[1]
 
-    dtype = torch.float64
     dynamic_paths = np.any(
         np.asarray(bank.dynamic_target_indices, dtype=np.int64) >= 0,
         axis=0,
@@ -825,9 +871,7 @@ def _torch_coherent_bank_data(bank: CoherentRTPathBank, *, device) -> dict:
         dtype=bool,
     )
     if path_indices.size and not np.all(np.any(active, axis=0)):
-        raise RuntimeError(
-            "dynamic coherent paths must contain at least one interaction"
-        )
+        raise RuntimeError("dynamic coherent paths must contain at least one interaction")
     primitives = np.asarray(
         bank.path_primitives[:, path_indices],
         dtype=np.int64,
@@ -851,26 +895,26 @@ def _torch_coherent_bank_data(bank: CoherentRTPathBank, *, device) -> dict:
             & (primitives < faces.shape[0])
         )
         depth_indices, local_path_indices = np.nonzero(mask)
-        triangle_vertex_indices = faces[
-            primitives[depth_indices, local_path_indices]
-        ]
-        target_hits.append((
-            torch.as_tensor(
-                depth_indices,
-                dtype=torch.int64,
-                device=device,
-            ),
-            torch.as_tensor(
-                local_path_indices,
-                dtype=torch.int64,
-                device=device,
-            ),
-            torch.as_tensor(
-                triangle_vertex_indices,
-                dtype=torch.int64,
-                device=device,
-            ),
-        ))
+        triangle_vertex_indices = faces[primitives[depth_indices, local_path_indices]]
+        target_hits.append(
+            (
+                torch.as_tensor(
+                    depth_indices,
+                    dtype=torch.int64,
+                    device=device,
+                ),
+                torch.as_tensor(
+                    local_path_indices,
+                    dtype=torch.int64,
+                    device=device,
+                ),
+                torch.as_tensor(
+                    triangle_vertex_indices,
+                    dtype=torch.int64,
+                    device=device,
+                ),
+            )
+        )
     tx_positions = np.asarray(bank.tx_positions, dtype=np.float64)
     rx_positions = np.asarray(bank.rx_positions, dtype=np.float64)
     vc_tx, vc_rx = resolve_virtual_channel_pairs(
@@ -898,7 +942,7 @@ def _torch_coherent_bank_data(bank: CoherentRTPathBank, *, device) -> dict:
         ),
         "coefficients": torch.as_tensor(
             bank.coefficients,
-            dtype=torch.complex128,
+            dtype=runtime.complex_dtype,
             device=device,
         ),
         "path_indices_numpy": path_indices,
@@ -989,12 +1033,14 @@ def _current_dynamic_path_points(
     bank: CoherentRTPathBank,
     target_vertices: tuple[np.ndarray, ...],
     path_indices: np.ndarray,
+    *,
+    dtype=np.float64,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Returns current interaction points for paths touching dynamic targets."""
 
     points = np.asarray(
         bank.path_vertices[:, path_indices, :],
-        dtype=np.float64,
+        dtype=dtype,
     ).copy()
     interactions = np.asarray(bank.path_interactions[:, path_indices])
     active = interactions != InteractionType.NONE
@@ -1008,7 +1054,7 @@ def _current_dynamic_path_points(
     )
     barycentrics = np.asarray(
         bank.dynamic_barycentrics[:, path_indices, :],
-        dtype=np.float64,
+        dtype=dtype,
     )
 
     for target_index, vertices in enumerate(target_vertices):
@@ -1026,7 +1072,7 @@ def _current_dynamic_path_points(
             continue
         depth_indices, local_path_indices = np.nonzero(mask)
         face_indices = primitives[depth_indices, local_path_indices]
-        triangles = np.asarray(vertices, dtype=np.float64)[faces[face_indices]]
+        triangles = np.asarray(vertices, dtype=dtype)[faces[face_indices]]
         weights = barycentrics[depth_indices, local_path_indices]
         points[depth_indices, local_path_indices] = np.einsum(
             "ij,ijk->ik",
@@ -1045,10 +1091,10 @@ def _shared_dynamic_path_geometry(
 
     num_paths = int(points.shape[1])
     seen = np.zeros(num_paths, dtype=bool)
-    first_points = np.zeros((num_paths, 3), dtype=np.float64)
+    first_points = np.zeros((num_paths, 3), dtype=points.dtype)
     previous_points = np.zeros_like(first_points)
-    internal_lengths = np.zeros(num_paths, dtype=np.float64)
-    internal_spreads = np.ones(num_paths, dtype=np.float64)
+    internal_lengths = np.zeros(num_paths, dtype=points.dtype)
+    internal_spreads = np.ones(num_paths, dtype=points.dtype)
 
     for depth_index in range(points.shape[0]):
         depth_active = active[depth_index]
@@ -1069,9 +1115,7 @@ def _shared_dynamic_path_geometry(
         seen |= depth_active
 
     if not np.all(seen):
-        raise RuntimeError(
-            "dynamic coherent paths must contain at least one interaction"
-        )
+        raise RuntimeError("dynamic coherent paths must contain at least one interaction")
     return first_points, previous_points, internal_lengths, internal_spreads
 
 
@@ -1086,8 +1130,8 @@ def _dynamic_endpoint_geometry(
 ) -> tuple[np.ndarray, np.ndarray]:
     """Adds virtual-channel endpoint segments to shared dynamic geometry."""
 
-    tx = np.asarray(tx_positions, dtype=np.float64)
-    rx = np.asarray(rx_positions, dtype=np.float64)
+    tx = np.asarray(tx_positions, dtype=first_points.dtype)
+    rx = np.asarray(rx_positions, dtype=first_points.dtype)
     tx_lengths = np.linalg.norm(
         first_points[None, :, :] - tx[:, None, :],
         axis=-1,
@@ -1098,9 +1142,7 @@ def _dynamic_endpoint_geometry(
     )
     lengths = tx_lengths + internal_lengths[None, :] + rx_lengths
     spreads = (
-        np.maximum(tx_lengths, 1e-18)
-        * internal_spreads[None, :]
-        * np.maximum(rx_lengths, 1e-18)
+        np.maximum(tx_lengths, 1e-18) * internal_spreads[None, :] * np.maximum(rx_lengths, 1e-18)
     )
     return lengths, spreads
 
@@ -1150,31 +1192,29 @@ def _path_lengths_and_spreads(
     lengths = np.zeros((len(vc_pairs), num_paths), dtype=np.float64)
     spreads = np.ones_like(lengths)
     for path_index in range(num_paths):
-        hit_depths = np.flatnonzero(
-            interactions[:, path_index] != InteractionType.NONE
-        )
+        hit_depths = np.flatnonzero(interactions[:, path_index] != InteractionType.NONE)
         for vc_index, (tx_index, rx_index) in enumerate(vc_pairs):
             points = [tx_positions[tx_index]]
             for depth_index in hit_depths:
-                points.append(_interaction_point(
-                    depth_index=depth_index,
-                    path_index=path_index,
-                    path_vertices=path_vertices,
-                    primitives=primitives,
-                    dynamic_target_indices=dynamic_target_indices,
-                    dynamic_barycentrics=dynamic_barycentrics,
-                    target_faces=target_faces,
-                    target_vertices=target_vertices,
-                ))
+                points.append(
+                    _interaction_point(
+                        depth_index=depth_index,
+                        path_index=path_index,
+                        path_vertices=path_vertices,
+                        primitives=primitives,
+                        dynamic_target_indices=dynamic_target_indices,
+                        dynamic_barycentrics=dynamic_barycentrics,
+                        target_faces=target_faces,
+                        target_vertices=target_vertices,
+                    )
+                )
             points.append(rx_positions[rx_index])
             segment_lengths = [
                 float(np.linalg.norm(np.asarray(end) - np.asarray(start)))
                 for start, end in zip(points[:-1], points[1:])
             ]
             lengths[vc_index, path_index] = float(np.sum(segment_lengths))
-            spreads[vc_index, path_index] = float(
-                np.prod(np.maximum(segment_lengths, 1e-18))
-            )
+            spreads[vc_index, path_index] = float(np.prod(np.maximum(segment_lengths, 1e-18)))
     return lengths, spreads
 
 

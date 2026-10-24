@@ -6,41 +6,18 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-import math
 import operator
 
-import numpy as np
+from ..values import nonzero_float, positive_float, positive_integer
+from ..naming import validate_tx_schedule
+from .adc import adc_mode, if_cutoff_hz
 
 
 def _finite_float(name: str, value: object, *, allow_negative: bool) -> float:
-    """Returns a normalized finite float for one waveform field."""
-
-    try:
-        scalar = float(value)
-    except (TypeError, ValueError, OverflowError) as exc:
-        raise ValueError(f"{name} must be a finite real scalar") from exc
-    if not math.isfinite(scalar):
-        raise ValueError(f"{name} must be finite")
-    if allow_negative:
-        if scalar == 0.0:
-            raise ValueError(f"{name} must be non-zero")
-    elif scalar <= 0.0:
-        raise ValueError(f"{name} must be positive")
-    return scalar
+    return nonzero_float(name, value) if allow_negative else positive_float(name, value)
 
 
-def _positive_integer(name: str, value: object) -> int:
-    """Returns an integer count without silently truncating floats or booleans."""
-
-    if isinstance(value, bool):
-        raise ValueError(f"{name} must be a positive integer")
-    try:
-        integer = operator.index(value)
-    except TypeError as exc:
-        raise ValueError(f"{name} must be a positive integer") from exc
-    if integer <= 0:
-        raise ValueError(f"{name} must be a positive integer")
-    return int(integer)
+_positive_integer = positive_integer
 
 
 @dataclass(frozen=True)
@@ -58,8 +35,11 @@ class FMCWConfig:
     :param num_chirps_per_frame: Number of chirps per frame
     :param frame_period: Time between frame starts [s]
     :param num_tx: Number of transmitters enabled by the chirp schedule
-    :param tdm_enabled: Whether transmitters occupy consecutive physical chirp
-        slots. When false, all transmitters are sampled simultaneously.
+    :param tx_schedule: ``simultaneous`` (default) samples every transmitter at
+        each chirp; ``tdm`` gives transmitters consecutive physical chirp slots.
+    :param adc_mode: ``complex1x`` (default), ``complex2x``, or ``real``.
+    :param if_bandwidth_hz: Optional analog IF cap. The effective cutoff is
+        the smaller of this cap and 0.9 fs (1x) / 0.45 fs (2x/real).
     """
 
     carrier_frequency: float
@@ -71,9 +51,12 @@ class FMCWConfig:
     num_chirps_per_frame: int
     frame_period: float
     num_tx: int = 1
-    tdm_enabled: bool = False
+    tx_schedule: str = "simultaneous"
+    adc_mode: str = "complex1x"
+    if_bandwidth_hz: float | None = None
 
     def __post_init__(self):
+        adc_mode(self)
         float_fields = {
             "carrier_frequency": _finite_float(
                 "carrier_frequency",
@@ -117,12 +100,21 @@ class FMCWConfig:
             ),
             "num_tx": _positive_integer("num_tx", self.num_tx),
         }
-        if not isinstance(self.tdm_enabled, (bool, np.bool_)):
-            raise ValueError("tdm_enabled must be a boolean")
-        object.__setattr__(self, "tdm_enabled", bool(self.tdm_enabled))
+        object.__setattr__(self, "tx_schedule", validate_tx_schedule(self.tx_schedule))
         for fields in (float_fields, integer_fields):
             for name, value in fields.items():
                 object.__setattr__(self, name, value)
+        if self.if_bandwidth_hz is not None:
+            object.__setattr__(
+                self,
+                "if_bandwidth_hz",
+                _finite_float("if_bandwidth_hz", self.if_bandwidth_hz, allow_negative=False),
+            )
+
+    @property
+    def effective_if_cutoff_hz(self) -> float:
+        """Effective ideal receiver cutoff after sampling-mode/HW limits."""
+        return if_cutoff_hz(self)
 
     @property
     def wavelength(self) -> float:
@@ -138,7 +130,7 @@ class FMCWConfig:
     def slow_time_interval(self) -> float:
         """Time between consecutive samples for one Tx-Rx pair [s]."""
 
-        multiplier = self.num_tx if self.tdm_enabled else 1
+        multiplier = self.num_tx if self.tx_schedule == "tdm" else 1
         return multiplier * self.chirp_repetition_time
 
     def chirp_time(self, frame_index: int, chirp_index: int) -> float:
@@ -146,13 +138,8 @@ class FMCWConfig:
         frame = _nonnegative_index("frame_index", frame_index)
         chirp = _nonnegative_index("chirp_index", chirp_index)
         if chirp >= self.num_chirps_per_frame:
-            raise ValueError(
-                "chirp_index must be smaller than num_chirps_per_frame"
-            )
-        return (
-            frame * self.frame_period
-            + chirp * self.slow_time_interval
-        )
+            raise ValueError("chirp_index must be smaller than num_chirps_per_frame")
+        return frame * self.frame_period + chirp * self.slow_time_interval
 
     def tx_chirp_time(
         self,
@@ -170,7 +157,7 @@ class FMCWConfig:
         tx = _nonnegative_index("tx_index", tx_index)
         if tx >= self.num_tx:
             raise ValueError("tx_index must be smaller than num_tx")
-        slot_offset = tx * self.chirp_repetition_time if self.tdm_enabled else 0.0
+        slot_offset = tx * self.chirp_repetition_time if self.tx_schedule == "tdm" else 0.0
         return self.chirp_time(frame_index, chirp_index) + slot_offset
 
 

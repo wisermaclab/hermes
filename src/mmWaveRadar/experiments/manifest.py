@@ -11,14 +11,9 @@ import json
 from pathlib import Path
 from typing import Any, Mapping
 
+from ..naming import validate_solver
 
-EXPERIMENT_MANIFEST_SCHEMA_VERSION = 1
-SUPPORTED_SOLVER_MODES = (
-    "rt_specular",
-    "rt_scattering",
-    "target_po",
-    "hybrid_rt_po",
-)
+EXPERIMENT_MANIFEST_SCHEMA_VERSION = 2
 SUPPORTED_FIDELITY_TIERS = ("preview", "high_fidelity")
 DEFAULT_EXPERIMENT_OUTPUTS = (
     "raw_adc",
@@ -73,23 +68,38 @@ class RadarExperimentConfig:
         )
 
 
+def _check_schema_version(version) -> None:
+    if int(version) != EXPERIMENT_MANIFEST_SCHEMA_VERSION:
+        raise ValueError(
+            f"unsupported experiment manifest schema version {version}; "
+            f"version {EXPERIMENT_MANIFEST_SCHEMA_VERSION} lists "
+            "solver.solvers (po, rt, hybrid_po) instead of a solver.mode family"
+        )
+
+
 @dataclass(frozen=True)
 class SolverExperimentConfig:
-    """Solver choice, execution tier, and explicit numerical controls."""
+    """Solvers used, execution tier, and explicit numerical controls.
 
-    mode: str
+    ``solvers`` lists every solver whose output the run contains: one entry
+    for a Dynamic Scenes run, and ``("rt", "po")`` for Static Target.
+    """
+
+    solvers: tuple[str, ...]
     fidelity: str = "preview"
     parameters: Mapping[str, Any] = field(default_factory=dict)
 
     def __post_init__(self):
-        if self.mode not in SUPPORTED_SOLVER_MODES:
-            raise ValueError(
-                "solver.mode must be one of: " + ", ".join(SUPPORTED_SOLVER_MODES)
-            )
+        if isinstance(self.solvers, str) or not self.solvers:
+            raise ValueError("solver.solvers must list at least one solver")
+        solvers = tuple(
+            validate_solver(solver, name="solver.solvers entry") for solver in self.solvers
+        )
+        if len(set(solvers)) != len(solvers):
+            raise ValueError("solver.solvers must not contain duplicates")
+        object.__setattr__(self, "solvers", solvers)
         if self.fidelity not in SUPPORTED_FIDELITY_TIERS:
-            raise ValueError(
-                "solver.fidelity must be 'preview' or 'high_fidelity'"
-            )
+            raise ValueError("solver.fidelity must be 'preview' or 'high_fidelity'")
         object.__setattr__(
             self,
             "parameters",
@@ -144,11 +154,7 @@ class ExperimentManifest:
     def __post_init__(self):
         if not isinstance(self.name, str) or not self.name.strip():
             raise ValueError("manifest.name must be a non-empty string")
-        if int(self.schema_version) != EXPERIMENT_MANIFEST_SCHEMA_VERSION:
-            raise ValueError(
-                "unsupported experiment manifest schema version "
-                f"{self.schema_version}"
-            )
+        _check_schema_version(self.schema_version)
         outputs = tuple(str(output) for output in self.outputs)
         if not outputs or any(not output for output in outputs):
             raise ValueError("manifest.outputs must contain non-empty names")
@@ -185,8 +191,7 @@ class ExperimentManifest:
         """Write a readable manifest without changing its canonical content."""
 
         Path(path).write_text(
-            json.dumps(self.to_dict(), indent=2, sort_keys=True, allow_nan=False)
-            + "\n",
+            json.dumps(self.to_dict(), indent=2, sort_keys=True, allow_nan=False) + "\n",
             encoding="utf-8",
         )
 
@@ -196,6 +201,7 @@ class ExperimentManifest:
 
         if not isinstance(data, Mapping):
             raise ValueError("experiment manifest must be a JSON object")
+        _check_schema_version(data.get("schema_version", EXPERIMENT_MANIFEST_SCHEMA_VERSION))
         scene = data.get("scene")
         radar = data.get("radar")
         solver = data.get("solver")
@@ -206,9 +212,7 @@ class ExperimentManifest:
         if not isinstance(solver, Mapping):
             raise ValueError("manifest.solver must be an object")
         measurement_data = data.get("measurement")
-        if measurement_data is not None and not isinstance(
-            measurement_data, Mapping
-        ):
+        if measurement_data is not None and not isinstance(measurement_data, Mapping):
             raise ValueError("manifest.measurement must be an object or null")
         return cls(
             name=str(data.get("name", "")),

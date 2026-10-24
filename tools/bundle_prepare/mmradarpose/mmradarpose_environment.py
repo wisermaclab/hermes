@@ -15,7 +15,6 @@ from __future__ import annotations
 import importlib.util
 import json
 from pathlib import Path
-import shutil
 import subprocess
 import sys
 import tempfile
@@ -23,7 +22,6 @@ from types import ModuleType
 from typing import Any
 
 import numpy as np
-
 
 TOOL_ROOT = Path(__file__).resolve().parent
 BUNDLE_PREPARE_ROOT = TOOL_ROOT.parent
@@ -89,7 +87,12 @@ def _auto_environment_source(dataset_dir: Path) -> Path | None:
             return candidate.resolve()
 
     stems = ("environment", "environment_laser", "background", "map", "laser_map")
-    roots = (dataset_dir, dataset_dir / "environment", dataset_dir / "laser", dataset_dir / "lidar")
+    roots = (
+        dataset_dir,
+        dataset_dir / "environment",
+        dataset_dir / "laser",
+        dataset_dir / "lidar",
+    )
     for root in roots:
         for stem in stems:
             for suffix in sorted(LASER_SUFFIXES):
@@ -127,14 +130,21 @@ def _load_pcd(path: Path) -> np.ndarray:
     if any(value != 1 for value in counts):
         raise ValueError(f"Vector-valued PCD fields are not supported: {path}")
     scalar_types = {
-        ("F", 4): "<f4", ("F", 8): "<f8",
-        ("U", 1): "u1", ("U", 2): "<u2", ("U", 4): "<u4",
-        ("I", 1): "i1", ("I", 2): "<i2", ("I", 4): "<i4",
+        ("F", 4): "<f4",
+        ("F", 8): "<f8",
+        ("U", 1): "u1",
+        ("U", 2): "<u2",
+        ("U", 4): "<u4",
+        ("I", 1): "i1",
+        ("I", 2): "<i2",
+        ("I", 4): "<i4",
     }
     try:
         dtype = np.dtype(
-            [(field, scalar_types[(kind.upper(), size)])
-             for field, kind, size in zip(fields, kinds, sizes)]
+            [
+                (field, scalar_types[(kind.upper(), size)])
+                for field, kind, size in zip(fields, kinds, sizes)
+            ]
         )
     except KeyError as exc:
         raise ValueError(f"Unsupported PCD scalar type: {path}") from exc
@@ -172,7 +182,9 @@ def load_laser_points(path: Path) -> np.ndarray:
         if not isinstance(archive, np.lib.npyio.NpzFile):
             raise ValueError(f"Expected an NPZ laser archive: {path}")
         with archive:
-            keys = [key for key in ("points", "xyz", "pointcloud", "vertices") if key in archive.files]
+            keys = [
+                key for key in ("points", "xyz", "pointcloud", "vertices") if key in archive.files
+            ]
             if len(keys) != 1:
                 raise ValueError(
                     "Laser NPZ must contain exactly one of points, xyz, pointcloud, or vertices"
@@ -331,9 +343,12 @@ def fit_laser_environment(
             sys.executable,
             str(RTPOSE_ROOT / "fit_rtpose_environment_geometry.py"),
             str(ply),
-            "--output-dir", str(output),
-            "--roi", roi,
-            "--wall-mode", "solid",
+            "--output-dir",
+            str(output),
+            "--roi",
+            roi,
+            "--wall-mode",
+            "solid",
             "--no-preview",
         ]
         try:
@@ -374,7 +389,9 @@ def prepare_environment_geometry(
             source,
             bundle_dir,
         )
-        outputs["geometry_source"] = "provided" if provided_geometry is not None else "dataset_cache"
+        outputs["geometry_source"] = (
+            "provided" if provided_geometry is not None else "dataset_cache"
+        )
         return outputs
     if source.suffix.lower() not in LASER_SUFFIXES:
         raise ValueError(
@@ -418,7 +435,8 @@ def generated_environment_files(outputs: dict[str, Any]) -> list[str]:
     files = {
         str(value)
         for key, value in outputs.items()
-        if key in {
+        if key
+        in {
             "scene_path",
             "environment_surfaces_json",
             "environment_obj",

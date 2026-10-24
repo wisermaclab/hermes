@@ -48,7 +48,6 @@ from typing import Any
 import numpy as np
 from scipy.io import loadmat
 
-
 # RT-Pose follows TI's MIMO-processing permutation after calibration. These are
 # physical AWR2243 receiver labels, not new receiver identities. Bundle
 # preparation converts this source order back to RX1..RX16 before export.
@@ -139,9 +138,7 @@ def capture_file_index(data_folder: Path) -> str:
         raise FileNotFoundError(f"No AWR2243 *_data.bin files found in {data_folder}")
     if len(indices) != 1:
         choices = ", ".join(sorted(indices))
-        raise ValueError(
-            f"Expected one AWR2243 capture set in {data_folder}; found {choices}"
-        )
+        raise ValueError(f"Expected one AWR2243 capture set in {data_folder}; found {choices}")
     return next(iter(indices))
 
 
@@ -256,9 +253,7 @@ def apply_calibration(
             * params.chirp_slope
             / params.slope_calib
         )
-        frequency *= 2.0 * np.pi / (
-            params.num_adc_samples * params.calibration_interp
-        )
+        frequency *= 2.0 * np.pi / (params.num_adc_samples * params.calibration_interp)
         frequency_correction = np.exp(-1j * sample_ids * frequency)[:, None, :]
         phase = peak_matrix[reference_tx, 0] / peak_matrix[tx, :]
         if params.phase_calib_only:
@@ -267,9 +262,7 @@ def apply_calibration(
                 raise ValueError("RT-Pose calibration contains a zero phase magnitude")
             phase = phase / magnitude
         calibrated[:, :, :, tx_slot] = (
-            adc[:, :, :, tx_slot]
-            * frequency_correction
-            * phase[None, None, :]
+            adc[:, :, :, tx_slot] * frequency_correction * phase[None, None, :]
         )
     return calibrated
 
@@ -294,8 +287,7 @@ def build_measured_adc_cube(
     params = RadarParams()
     adc = read_adc_cube(files, frame_index, params)
     calibration_file = (
-        dataset_dir
-        / "RT-POSE/data_processing/mmWave-Matlab/main/cascade/input/"
+        dataset_dir / "RT-POSE/data_processing/mmWave-Matlab/main/cascade/input/"
         "calibrateResults_high.mat"
     )
     adc = apply_calibration(adc, calibration_file, params)

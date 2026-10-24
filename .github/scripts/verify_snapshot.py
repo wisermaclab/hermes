@@ -13,6 +13,8 @@ import subprocess
 import sys
 import unicodedata
 
+from approved_fixtures import SOURCE_FIXTURES
+
 
 ROOT = Path(__file__).resolve().parents[2]
 SNAPSHOT_PATH = "PUBLIC_SNAPSHOT.json"
@@ -171,7 +173,7 @@ def snapshot_managed_data(path: str) -> bool:
     safe snapshot payloads while still checking their recorded hash and mode.
     """
 
-    return path.startswith("data/")
+    return path.startswith("data/") or path in SOURCE_FIXTURES
 
 
 def validate_relative_path(value: object) -> str:
@@ -445,6 +447,9 @@ def main() -> None:
         if not managed_data and file_path.stat().st_size > MAX_MANAGED_FILE_BYTES:
             errors.append(f"{path}: exceeds public file-size limit")
         actual_hash = sha256(file_path)
+        approved = SOURCE_FIXTURES.get(path)
+        if approved is not None and (file_path.stat().st_size, actual_hash) != approved:
+            errors.append(f"{path}: synthetic fixture does not match its approved size/hash")
         if actual_hash != expected_hash:
             errors.append(f"{path}: sha256 does not match the snapshot")
         actual_mode = entries.get(path)

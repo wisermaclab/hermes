@@ -4,6 +4,7 @@
 """Subspace and adaptive array-processing helpers."""
 
 from __future__ import annotations
+from .arrays import snapshot_matrix, flatten_steering
 
 from typing import Any, Dict, Iterable
 
@@ -24,6 +25,8 @@ def steering_matrix(
     ``[num_channels, 1]``, or ``[num_channels, 2]``. The first coordinate is the
     horizontal aperture coordinate and the optional second coordinate is the
     vertical aperture coordinate. ``u`` and ``v`` are direction cosines.
+    Vectors match ``tx(t) * conj(rx(t))`` ADC snapshots, whose element phase
+    for a source at ``(u, v)`` is ``exp(-j 2 pi p . (u, v))``.
     """
 
     positions = _as_positions_lambda(virtual_positions_lambda)
@@ -37,7 +40,7 @@ def steering_matrix(
             positions[:, 0, None, None] * uu[None, :, :]
             + positions[:, 1, None, None] * vv[None, :, :]
         )
-    steering = np.exp(1j * 2.0 * np.pi * phase)
+    steering = np.exp(-1j * 2.0 * np.pi * phase)
     if normalize:
         steering = steering / np.sqrt(float(positions.shape[0]))
     return steering
@@ -189,19 +192,7 @@ def _as_positions_lambda(positions: np.ndarray) -> np.ndarray:
     return pos
 
 
-def _snapshot_matrix(snapshots: np.ndarray) -> np.ndarray:
-    """Flattens leading snapshot axes while preserving the channel axis."""
-
-    x = np.asarray(snapshots, dtype=np.complex128)
-    if x.ndim == 0:
-        raise ValueError("snapshots must include a virtual-channel axis")
-    channels = int(x.shape[-1])
-    if channels < 2:
-        raise ValueError("at least two virtual channels are required")
-    x = x.reshape((-1, channels))
-    if x.shape[0] < 1:
-        raise ValueError("at least one snapshot is required")
-    return x
+_snapshot_matrix = snapshot_matrix
 
 
 def _apply_diagonal_loading(cov: np.ndarray, diagonal_loading: float) -> np.ndarray:
@@ -318,16 +309,10 @@ def _check_covariance_shape(cov: np.ndarray, num_channels: int) -> None:
     """Validates that a covariance matrix matches the virtual-channel count."""
 
     if cov.shape != (num_channels, num_channels):
-        raise ValueError(
-            "snapshots last axis must match virtual_positions_lambda channels"
-        )
+        raise ValueError("snapshots last axis must match virtual_positions_lambda channels")
 
 
-def _flatten_steering(steering: np.ndarray) -> tuple[np.ndarray, tuple[int, ...]]:
-    """Flattens steering grid axes into columns and returns the original grid shape."""
-
-    out_shape = steering.shape[1:]
-    return steering.reshape((steering.shape[0], -1)), out_shape
+_flatten_steering = flatten_steering
 
 
 def _spectrum_result(

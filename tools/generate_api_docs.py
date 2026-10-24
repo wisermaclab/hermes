@@ -12,7 +12,6 @@ from html import escape
 from pathlib import Path
 import re
 
-
 PUBLIC_ROOT = Path(__file__).resolve().parents[1]
 SOURCE_ROOT = PUBLIC_ROOT / "src" / "mmWaveRadar"
 DEFAULT_OUTPUT = PUBLIC_ROOT / "docs" / "api" / "index.html"
@@ -31,9 +30,7 @@ def _slug(value: str) -> str:
 
 def _function_signature(node: ast.FunctionDef | ast.AsyncFunctionDef) -> str:
     clone_type = (
-        ast.AsyncFunctionDef
-        if isinstance(node, ast.AsyncFunctionDef)
-        else ast.FunctionDef
+        ast.AsyncFunctionDef if isinstance(node, ast.AsyncFunctionDef) else ast.FunctionDef
     )
     clone = clone_type(
         name=node.name,
@@ -50,16 +47,14 @@ def _function_signature(node: ast.FunctionDef | ast.AsyncFunctionDef) -> str:
 
 def _class_signature(node: ast.ClassDef) -> str:
     bases = [ast.unparse(base) for base in node.bases]
-    bases.extend(
-        f"{keyword.arg}={ast.unparse(keyword.value)}"
-        for keyword in node.keywords
-    )
+    bases.extend(f"{keyword.arg}={ast.unparse(keyword.value)}" for keyword in node.keywords)
     suffix = f"({', '.join(bases)})" if bases else ""
     return f"class {node.name}{suffix}"
 
 
 def _public_entries(tree: ast.Module):
-    for node in tree.body:
+    preferred = {"simulate_human_room", "simulate_static_target"}
+    for node in sorted(tree.body, key=lambda entry: getattr(entry, "name", "") not in preferred):
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
             if not node.name.startswith("_"):
                 yield "function", node
@@ -108,9 +103,7 @@ def _render_entry(module: str, kind: str, node: ast.AST) -> str:
     name = node.name
     anchor = _slug(f"{module}-{name}")
     signature = (
-        _class_signature(node)
-        if isinstance(node, ast.ClassDef)
-        else _function_signature(node)
+        _class_signature(node) if isinstance(node, ast.ClassDef) else _function_signature(node)
     )
     methods = _method_table(node) if isinstance(node, ast.ClassDef) else ""
     return f"""
@@ -120,6 +113,36 @@ def _render_entry(module: str, kind: str, node: ast.AST) -> str:
         <pre><code>{escape(signature)}</code></pre>
         <p>{escape(_summary(ast.get_docstring(node)))}</p>{methods}
       </article>"""
+
+
+def _experiment_quickstart() -> str:
+    return """
+<section id="experiment-api">
+<h2>Start with the grouped experiment API</h2>
+<p>Use <code>simulate_human_room(HumanRoomSettings(...))</code> for motion in a room,
+or <code>simulate_static_target(StaticTargetSettings(...))</code> for plates,
+corners and static meshes. Settings group geometry/motion, scene, radar and
+solver options; use <code>dataclasses.replace</code> to vary one group.</p>
+<pre><code>from mmWaveRadar.experiments import (
+    HumanMotionSettings, HumanRoomSettings, HumanRoomSolverSettings,
+    RoomSceneSettings, simulate_human_room,
+)
+
+settings = HumanRoomSettings(
+    motion=HumanMotionSettings(
+        human_motion="/path/to/human_motion.npz",
+        human_position_m=None,
+        num_frames=2,
+    ),
+    scene=RoomSceneSettings(room_preset="empty_room"),
+    solver=HumanRoomSolverSettings(solver="po"),
+)
+result = simulate_human_room(settings)</code></pre>
+<p>The flat <code>run_human_room_experiment</code> and
+<code>run_static_target_experiment</code> functions remain supported for
+compatibility. See the <a href="../tutorial/index.html#python">Python tutorial</a>
+for grouped human/static examples and conversion of an existing CLI JSON.</p>
+</section>"""
 
 
 def generate(*, updated: str) -> str:
@@ -136,18 +159,17 @@ def generate(*, updated: str) -> str:
     content = []
     for package, modules in packages.items():
         package_anchor = _slug(package)
-        navigation.append(
-            f'<a class="nav-package" href="#{package_anchor}">{escape(package)}</a>'
-        )
+        navigation.append(f'<a class="nav-package" href="#{package_anchor}">{escape(package)}</a>')
         module_sections = []
         for module, relative, tree, entries in modules:
             module_anchor = _slug(module)
             navigation.append(
                 f'<a class="nav-module" href="#{module_anchor}">{escape(module.split(".")[-1])}</a>'
             )
-            cards = "".join(
-                _render_entry(module, kind, node) for kind, node in entries
-            ) or '<p class="empty">No public classes or functions.</p>'
+            cards = (
+                "".join(_render_entry(module, kind, node) for kind, node in entries)
+                or '<p class="empty">No public classes or functions.</p>'
+            )
             module_sections.append(f"""
               <section class="module-section" id="{module_anchor}">
                 <div class="module-header"><div><h3>{escape(module)}</h3>
@@ -174,14 +196,14 @@ main{{min-width:0}}.hero{{padding:50px clamp(24px,5vw,72px) 34px;background:line
 .api-card{{background:var(--surface);border:1px solid var(--border);border-radius:10px;padding:18px;margin:13px 0}}.api-title{{display:flex;gap:10px;align-items:center}}.api-title h4{{font-size:19px;margin:0;flex:1}}.api-title a{{color:var(--muted);text-decoration:none}}pre{{overflow:auto;background:#07101c;border-radius:7px;padding:12px}}code{{font-family:ui-monospace,SFMono-Regular,Menlo,monospace}}details{{margin-top:12px}}table{{border-collapse:collapse;width:100%;margin-top:8px}}th,td{{text-align:left;vertical-align:top;padding:8px;border-bottom:1px solid var(--border)}}th{{color:var(--muted)}}.empty{{color:var(--muted)}}
 @media(max-width:900px){{.layout{{grid-template-columns:1fr}}nav{{position:relative;height:auto;border-right:0;border-bottom:1px solid var(--border)}}.nav-module{{display:none}}}}
 </style></head><body><div class="layout"><nav><h2>API Reference</h2>
-<a href="#overview">Overview</a>{''.join(navigation)}</nav><main>
+<a href="#overview">Overview</a><a href="#experiment-api">Start with experiments</a>{''.join(navigation)}</nav><main>
 <header class="hero" id="overview"><h1>HERMES Developer API Reference</h1>
 <p>Public Python classes and functions for radar hardware, targets, simulation,
 DSP, experiments, bundle measurements, diagnostics, visualization, and the local GUI.</p>
 <div class="meta"><span class="pill">Updated {escape(updated)}</span>
 <span class="pill">{callable_count} public classes/functions</span>
 <span class="pill">{len(records)} modules</span></div></header>
-<div class="content">{''.join(content)}</div></main></div></body></html>
+<div class="content">{_experiment_quickstart()}{''.join(content)}</div></main></div></body></html>
 """
 
 

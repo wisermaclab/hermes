@@ -6,7 +6,26 @@
 import numpy as np
 import pytest
 
-from mmWaveRadar.dsp import direction_cosine_valid_mask, select_range_bin
+from mmWaveRadar.dsp import direction_cosine_valid_mask, range_profile_from_cube, select_range_bin
+
+
+def test_channel_profiles_average_power_without_mixing_channels_or_phases():
+    cube = np.asarray(
+        [
+            [[1, 2j], [3j, 4]],
+            [[-1, -2j], [-3j, -4]],
+        ]
+    )
+    profiles = range_profile_from_cube(
+        cube,
+        combine_antennas="none",
+        combine_chirps="mean",
+    )
+    np.testing.assert_array_equal(profiles, [[1, 4], [9, 16]])
+    np.testing.assert_array_equal(
+        profiles.sum(axis=-1),
+        range_profile_from_cube(cube, combine_chirps="mean"),
+    )
 
 
 def test_select_range_bin_target_mode_uses_nearest_target_bin():

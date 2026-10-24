@@ -1,0 +1,19 @@
+{
+  "schema_version": 1,
+  "seeds": [0, 1, 2, 3, 4, 5, 6, 7],
+  "settings": {
+    "rt_samples_per_source": 10000,
+    "rt_max_paths_per_source": 10000,
+    "rt_max_depth": 3,
+    "rt_diffuse_reflection": true,
+    "rt_human_specular_reflection": true,
+    "po_integration_mode": "parent_face_adaptive_analytic",
+    "hybrid_calibration": "none"
+  },
+  "fixtures": [
+    {"id": "pec-plate", "kind": "synthetic", "generate": "pec_plate",
+     "target_material": {"relative_permittivity": 1.0, "conductivity": 1e12, "scattering_coefficient": 0.0}},
+    {"id": "rough-plate", "kind": "synthetic", "generate": "pec_plate",
+     "target_material": {"relative_permittivity": 1.0, "conductivity": 1e7, "scattering_coefficient": 0.3}}
+  ]
+}

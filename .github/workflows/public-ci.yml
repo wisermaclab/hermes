@@ -28,6 +28,8 @@ jobs:
           persist-credentials: false
       - name: Verify public snapshot boundary
         run: python .github/scripts/verify_snapshot.py
+      - name: Verify distribution fixture policy
+        run: python -m unittest discover -s .github/scripts -p 'test_*.py'
 
   tests:
     name: Tests (Python ${{ matrix.python-version }})
@@ -61,7 +63,13 @@ jobs:
         if: steps.project.outputs.present == 'true'
         run: |
           python -m pip install --upgrade pip
-          python -m pip install -e ".[test,gui]"
+          python -m pip install -e ".[dev,gui]"
+      - name: Check Python formatting and dependencies
+        if: steps.project.outputs.present == 'true'
+        run: |
+          python -m black --check src validation tools benchmarks tests
+          python -m pylint src validation tools benchmarks
+          python -m mypy --python-version "${{ matrix.python-version }}"
       - name: Compile Python sources
         if: steps.project.outputs.present == 'true'
         run: python -m compileall -q src validation tools benchmarks tests

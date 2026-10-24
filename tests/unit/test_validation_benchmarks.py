@@ -8,7 +8,11 @@ from __future__ import annotations
 from dataclasses import replace
 import json
 from pathlib import Path
+import shutil
 from types import SimpleNamespace
+import zipfile
+
+from validation import simulation as _validation_simulation
 
 import numpy as np
 import pytest
@@ -35,13 +39,12 @@ from validation.metrics import (
 from validation.runner import (
     _BundleFrameMeshSequence,
     _PlacedBundleMotionSequence,
-    DEFAULT_VALIDATION_MOBILITY_MODES,
-    VALIDATION_MOBILITY_MODES,
+    DEFAULT_VALIDATION_SOLVERS,
+    VALIDATION_SOLVERS,
     BenchmarkRunConfig,
     _channel_tx_rx_indices_1based,
-    _hybrid_static_env_po_config,
     _clip_uses_tdm_virtual_adc,
-    _labeled_mobility_modes,
+    _labeled_solvers,
     _load_amass_motion_sequence,
     _resolve_clutter_removal,
     _resolve_scene_path,
@@ -76,12 +79,10 @@ def _stub_amass_runtime(monkeypatch):
             [[2.0, -0.2, 0.0], [2.0, 0.2, 0.0], [2.0, 0.0, 0.5]],
             dtype=np.float32,
         )
-        vertices = np.stack(
-            [base + translation for translation in translations], axis=0
-        )
+        vertices = np.stack([base + translation for translation in translations], axis=0)
         return MeshSequence(vertices=vertices, faces=faces, times=times)
 
-    monkeypatch.setattr(runner, "_load_amass_motion_sequence", load_motion)
+    monkeypatch.setattr(_validation_simulation, "load_amass_motion_sequence", load_motion)
 
 
 def test_simulate_bundle_adc_builds_bundle_aware_runtime_config(monkeypatch):
@@ -90,29 +91,29 @@ def test_simulate_bundle_adc_builds_bundle_aware_runtime_config(monkeypatch):
     captured = {}
     expected = np.ones((1, 2, 4, 3), dtype=np.complex64)
 
-    def simulate(clip, config, *, mobility_mode, cancel_check=None):
+    def simulate(clip, config, *, solver, cancel_check=None):
         captured.update(
             clip=clip,
             config=config,
-            mobility_mode=mobility_mode,
+            solver=solver,
             cancel_check=cancel_check,
         )
         return expected
 
-    monkeypatch.setattr(runner, "_simulate_adc", simulate)
+    monkeypatch.setattr(_validation_simulation, "simulate_adc", simulate)
     clip = SimpleNamespace(root=Path("bundle"))
 
     result = simulate_bundle_adc(
         clip,
-        mobility_mode="rt_coherent_bank",
+        solver="rt",
         smpl_model_dir="/models/smpl",
     )
 
     assert result is expected
     assert captured["clip"] is clip
-    assert captured["mobility_mode"] == "rt_coherent_bank"
+    assert captured["solver"] == "rt"
     assert captured["cancel_check"] is None
-    assert captured["config"].mobility_modes == ("rt_coherent_bank",)
+    assert captured["config"].solvers == ("rt",)
     assert captured["config"].smpl_model_dir == "/models/smpl"
     sensor = SimpleNamespace(
         hardware=SimpleNamespace(
@@ -127,28 +128,38 @@ def test_simulate_bundle_adc_builds_bundle_aware_runtime_config(monkeypatch):
         sensor_config=SimpleNamespace(metadata={}),
         sensor=lambda: sensor,
     )
-    assert simulate_bundle_adc(
-        channel_clip,
-        mobility_mode="human_only_po",
-        channel_zero_only=True,
-    ) is expected
-    assert captured["config"].subarray_tx_indices == (1,)
-    assert captured["config"].subarray_rx_indices == (1,)
+    assert (
+        simulate_bundle_adc(
+            channel_clip,
+            solver="po",
+            channel_zero_only=True,
+        )
+        is expected
+    )
+    assert captured["config"].selected_tx_indices == (0,)
+    assert captured["config"].selected_rx_indices == (0,)
     cancel_check = lambda: False
-    assert simulate_bundle_adc(
-        clip,
-        mobility_mode="human_only_po",
-        cancel_check=cancel_check,
-    ) is expected
+    assert (
+        simulate_bundle_adc(
+            clip,
+            solver="po",
+            cancel_check=cancel_check,
+        )
+        is expected
+    )
     assert captured["cancel_check"] is cancel_check
     with pytest.raises(ValueError, match="cancel_check must be callable"):
         simulate_bundle_adc(
             clip,
-            mobility_mode="human_only_po",
+            solver="po",
             cancel_check=False,
         )
-    with pytest.raises(ValueError, match="mobility_mode must be one of"):
-        simulate_bundle_adc(clip, mobility_mode="unknown")
+    with pytest.raises(ValueError, match="solver must be one of"):
+        simulate_bundle_adc(clip, solver="unknown")
+    with pytest.raises(ValueError, match="replaced by 'rt' with rt_refresh_frames=1"):
+        simulate_bundle_adc(clip, solver="rt_coherent_bank")
+    with pytest.raises(TypeError, match="mobility_mode was renamed to solver"):
+        simulate_bundle_adc(clip, solver="po", mobility_mode="human_only_po")
 
 
 def _write_clip(root: Path, *, adc_ndim: int = 4) -> np.ndarray:
@@ -181,7 +192,7 @@ def _write_clip(root: Path, *, adc_ndim: int = 4) -> np.ndarray:
             "dataset": "RT-Pose",
             "tdm_virtual_adc": True,
             "source_adc_axes": ["adc_sample", "chirp_loop", "rx", "tx"],
-            "tx_to_enable": [12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1],
+            "tx_to_enable": [3, 2, 1],
         },
         "radar": {
             "position": [0.0, 0.0, 0.0],
@@ -189,6 +200,7 @@ def _write_clip(root: Path, *, adc_ndim: int = 4) -> np.ndarray:
         },
         "fmcw": {
             "carrier_frequency_hz": 60.0e9,
+            "carrier_reference": "first_adc_sample",
             "slope_hz_per_s": 20.0e12,
             "chirp_duration_s": 60.0e-6,
             "chirp_repetition_time_s": 80.0e-6,
@@ -252,8 +264,34 @@ def test_bundle_sensor_maps_legacy_tdm_adc_metadata_to_fmcw(tmp_path):
 
     sensor = BenchmarkSensorConfig.from_json(tmp_path / "sensor.json").to_sensor()
 
-    assert sensor.fmcw.tdm_enabled is True
+    assert sensor.fmcw.tx_schedule == "tdm"
     assert sensor.fmcw.slow_time_interval == pytest.approx(3 * 80.0e-6)
+
+
+def test_bundle_sensor_explicit_tx_schedule_takes_precedence(tmp_path):
+    _write_clip(tmp_path)
+    path = tmp_path / "sensor.json"
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    payload["fmcw"]["tx_schedule"] = "simultaneous"
+    payload["fmcw"]["tdm_enabled"] = True
+    payload["metadata"]["tdm_virtual_adc"] = True
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    sensor = BenchmarkSensorConfig.from_json(path).to_sensor()
+
+    assert sensor.fmcw.tx_schedule == "simultaneous"
+    assert sensor.fmcw.slow_time_interval == pytest.approx(80.0e-6)
+
+
+def test_bundle_sensor_rejects_unknown_tx_schedule(tmp_path):
+    _write_clip(tmp_path)
+    path = tmp_path / "sensor.json"
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    payload["fmcw"]["tx_schedule"] = "round_robin"
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="tx_schedule must be one of"):
+        BenchmarkSensorConfig.from_json(path)
 
 
 def test_bundle_sensor_explicit_tdm_flag_takes_precedence(tmp_path):
@@ -266,11 +304,11 @@ def test_bundle_sensor_explicit_tdm_flag_takes_precedence(tmp_path):
 
     sensor = BenchmarkSensorConfig.from_json(path).to_sensor()
 
-    assert sensor.fmcw.tdm_enabled is False
+    assert sensor.fmcw.tx_schedule == "simultaneous"
     assert sensor.fmcw.slow_time_interval == pytest.approx(80.0e-6)
 
 
-def test_bundle_sensor_accepts_explicit_fmcw_tdm_flag(tmp_path):
+def test_bundle_sensor_accepts_legacy_fmcw_tdm_flag(tmp_path):
     _write_clip(tmp_path)
     path = tmp_path / "sensor.json"
     payload = json.loads(path.read_text(encoding="utf-8"))
@@ -280,7 +318,7 @@ def test_bundle_sensor_accepts_explicit_fmcw_tdm_flag(tmp_path):
 
     sensor = BenchmarkSensorConfig.from_json(path).to_sensor()
 
-    assert sensor.fmcw.tdm_enabled is True
+    assert sensor.fmcw.tx_schedule == "tdm"
     assert sensor.fmcw.slow_time_interval == pytest.approx(3 * 80.0e-6)
 
     clip = BenchmarkClip.load(tmp_path)
@@ -297,7 +335,7 @@ def test_bundle_sensor_without_tdm_marker_defaults_to_simultaneous(tmp_path):
 
     sensor = BenchmarkSensorConfig.from_json(path).to_sensor()
 
-    assert sensor.fmcw.tdm_enabled is False
+    assert sensor.fmcw.tx_schedule == "simultaneous"
     assert sensor.fmcw.slow_time_interval == pytest.approx(80.0e-6)
 
 
@@ -310,28 +348,30 @@ def test_bundle_sensor_recognizes_legacy_tdm_adc_axes(tmp_path):
 
     sensor = BenchmarkSensorConfig.from_json(path).to_sensor()
 
-    assert sensor.fmcw.tdm_enabled is True
+    assert sensor.fmcw.tx_schedule == "tdm"
 
 
 def test_validation_cli_defaults_to_running_simulation():
     args = _parse_args(["--clip", "clip", "--out", "out"])
 
     assert args.simulated_adc is None
-    assert args.mobility_mode == DEFAULT_VALIDATION_MOBILITY_MODES
+    assert args.solvers == DEFAULT_VALIDATION_SOLVERS
+    assert args.rt_refresh_frames == 1
     assert args.background_subtract is False
-    assert args.hybrid_po_calibration == "rt_first_pose"
+    assert args.hybrid_calibration == "rt_first_pose"
     assert args.ignore_tdm_timing is False
 
 
-def test_validation_cli_help_lists_mobility_modes_and_preprocessing(capsys):
+def test_validation_cli_help_lists_solvers_and_preprocessing(capsys):
     with pytest.raises(SystemExit) as exc:
         _parse_args(["-h"])
 
     assert exc.value.code == 0
     output = capsys.readouterr().out
     flat_output = " ".join(output.split())
-    for mode in VALIDATION_MOBILITY_MODES:
-        assert mode in output
+    for solver in VALIDATION_SOLVERS:
+        assert solver in output
+    assert "--mobility-mode" not in flat_output
     assert "--background-subtract" in flat_output
     assert "--no-background-subtract" not in flat_output
     assert "Default behavior is no real-ADC background subtraction" in flat_output
@@ -341,14 +381,16 @@ def test_validation_cli_help_lists_mobility_modes_and_preprocessing(capsys):
 
 
 def test_validation_cli_parses_optional_simulated_adc():
-    args = _parse_args([
-        "--clip",
-        "clip",
-        "--out",
-        "out",
-        "--simulated-adc",
-        "sim_adc.npz",
-    ])
+    args = _parse_args(
+        [
+            "--clip",
+            "clip",
+            "--out",
+            "out",
+            "--simulated-adc",
+            "sim_adc.npz",
+        ]
+    )
 
     assert str(args.simulated_adc) == "sim_adc.npz"
 
@@ -366,10 +408,13 @@ def test_default_clutter_removal_is_none_and_ignores_bundle_metadata(tmp_path):
 
     clip = BenchmarkClip.load(tmp_path)
     assert _resolve_clutter_removal(clip, BenchmarkRunConfig()) == "none"
-    assert _resolve_clutter_removal(
-        clip,
-        BenchmarkRunConfig(clutter_removal="mean"),
-    ) == "mean"
+    assert (
+        _resolve_clutter_removal(
+            clip,
+            BenchmarkRunConfig(clutter_removal="mean"),
+        )
+        == "mean"
+    )
 
 
 def test_benchmark_clip_loads_3d_background_with_chirp_times(tmp_path):
@@ -434,7 +479,7 @@ def test_background_subtraction_is_opt_in_and_requires_background_file(tmp_path)
         ),
     )
     assert metrics["background_subtract"] is False
-    assert metrics["fmcw"]["tdm_enabled"] is True
+    assert metrics["fmcw"]["tx_schedule"] == "tdm"
 
     with pytest.raises(ValueError, match="background_adc\\.npz"):
         run_validation_benchmark(
@@ -451,64 +496,137 @@ def test_background_subtraction_is_opt_in_and_requires_background_file(tmp_path)
 
 
 def test_validation_cli_parses_simulation_controls():
-    args = _parse_args([
-        "--clip",
-        "clip",
-        "--out",
-        "out",
-        "--mobility-mode",
-        "hybrid_static_env_po",
-        "rt_retrace",
-        "--no-diffuse-reflection",
-        "--refraction",
-        "--human-specular-reflection",
-        "--hybrid-po-calibration",
-        "rt_sequence",
-        "--ignore-tdm-timing",
-    ])
-
-    assert args.mobility_mode == ["hybrid_static_env_po", "rt_retrace"]
-    assert args.no_diffuse_reflection is True
-    assert args.refraction is True
-    assert args.human_specular_reflection is True
-    assert args.hybrid_po_calibration == "rt_sequence"
-    assert args.ignore_tdm_timing is True
-
-
-def test_validation_hybrid_po_calibration_defaults_to_first_pose():
-    config = BenchmarkRunConfig()
-    hybrid = _hybrid_static_env_po_config(
-        "hybrid_static_env_po",
-        config.hybrid_po_calibration_mode,
-    )
-
-    assert config.hybrid_po_calibration_mode == "rt_first_pose"
-    assert hybrid.human_po_config.calibration.mode == "rt_first_pose"
-    assert _hybrid_static_env_po_config("rt_retrace") is None
-
-
-def test_validation_hybrid_po_calibration_can_be_disabled():
-    hybrid = _hybrid_static_env_po_config("hybrid_static_env_po", "none")
-
-    assert hybrid.human_po_config.calibration.mode == "none"
-
-
-def test_validation_rejects_unknown_hybrid_po_calibration_mode():
-    with pytest.raises(ValueError, match="hybrid_po_calibration_mode"):
-        BenchmarkRunConfig(hybrid_po_calibration_mode="unknown")
-
-
-def test_validation_cli_rejects_duplicate_mobility_modes():
-    with pytest.raises(SystemExit):
-        _parse_args([
+    args = _parse_args(
+        [
             "--clip",
             "clip",
             "--out",
             "out",
-            "--mobility-mode",
-            "rt_retrace",
-            "rt_retrace",
-        ])
+            "--solvers",
+            "hybrid_po",
+            "rt",
+            "--rt-refresh-frames",
+            "0",
+            "--no-rt-diffuse-reflection",
+            "--rt-refraction",
+            "--rt-human-specular-reflection",
+            "--hybrid-calibration",
+            "rt_sequence",
+            "--ignore-tdm-timing",
+        ]
+    )
+
+    assert args.solvers == ["hybrid_po", "rt"]
+    assert args.rt_refresh_frames == 0
+    assert args.no_rt_diffuse_reflection is True
+    assert args.rt_refraction is True
+    assert args.rt_human_specular_reflection is True
+    assert args.hybrid_calibration == "rt_sequence"
+    assert args.ignore_tdm_timing is True
+
+
+@pytest.mark.parametrize(
+    ("removed", "replacement"),
+    [
+        (["--mobility-mode", "human_only_po"], "--solvers"),
+        (["--no-diffuse-reflection"], "--no-rt-diffuse-reflection"),
+        (["--refraction"], "--rt-refraction"),
+        (["--human-specular-reflection"], "--rt-human-specular-reflection"),
+        (["--hybrid-po-calibration", "none"], "--hybrid-calibration"),
+        (["--subarray-tx", "1"], "--tx-indices, which is zero-based (TI's TX1 is 0)"),
+        (["--subarray-rx", "1"], "--rx-indices, which is zero-based (TI's RX1 is 0)"),
+    ],
+)
+def test_validation_cli_names_replacements_for_removed_flags(
+    removed,
+    replacement,
+    capsys,
+):
+    with pytest.raises(SystemExit) as exc:
+        _parse_args(["--clip", "clip", "--out", "out", *removed])
+
+    assert exc.value.code == 2
+    error = capsys.readouterr().err
+    assert f"{removed[0]} was removed; use {replacement}" in error
+
+
+def test_validation_hybrid_calibration_defaults_to_first_pose(monkeypatch):
+    import validation.runner as runner
+    import mmWaveRadar.simulation as simulation
+
+    built = []
+    monkeypatch.setattr(
+        simulation,
+        "MmWaveRadarSimulator",
+        lambda **kwargs: built.append(kwargs),
+    )
+    config = BenchmarkRunConfig()
+    runner._validation_simulator(config, "hybrid_po")
+    runner._validation_simulator(config, "rt")
+
+    assert config.hybrid_calibration == "rt_first_pose"
+    hybrid_config = built[0]["hybrid_config"]
+    assert built[0]["solver"] == "hybrid_po"
+    assert hybrid_config.hybrid_calibration.mode == "rt_first_pose"
+    assert built[1]["solver"] == "rt"
+    assert built[1]["hybrid_config"] is None
+    assert built[1]["rt_refresh_frames"] == 1
+
+    runner._validation_simulator(BenchmarkRunConfig(hybrid_calibration="none"), "hybrid_po")
+    assert built[2]["hybrid_config"].hybrid_calibration.mode == "none"
+
+
+def test_validation_rejects_unknown_hybrid_calibration():
+    with pytest.raises(ValueError, match="hybrid_calibration"):
+        BenchmarkRunConfig(hybrid_calibration="unknown")
+
+
+def test_validation_rejects_removed_solver_names():
+    with pytest.raises(ValueError, match="replaced by 'po'"):
+        BenchmarkRunConfig(solvers=("human_only_po",))
+    with pytest.raises(ValueError, match="rt_refresh_frames"):
+        BenchmarkRunConfig(rt_refresh_frames=-1)
+
+
+def test_validation_antenna_selection_is_zero_based():
+    args = _parse_args(
+        [
+            "--clip",
+            "clip",
+            "--out",
+            "out",
+            "--tx-indices",
+            "0-2,9",
+            "--rx-indices",
+            "4",
+        ]
+    )
+    assert args.tx_indices == (0, 1, 2, 9)
+    assert args.rx_indices == (4,)
+    with pytest.raises(SystemExit):
+        _parse_args(["--clip", "clip", "--out", "out", "--tx-indices", "-1"])
+    assert BenchmarkRunConfig(selected_tx_indices=[0, 2]).selected_tx_indices == (0, 2)
+    with pytest.raises(ValueError, match="non-negative"):
+        BenchmarkRunConfig(selected_tx_indices=(-1,))
+    with pytest.raises(ValueError, match="duplicates"):
+        BenchmarkRunConfig(selected_rx_indices=(1, 1))
+    with pytest.raises(TypeError, match="subarray_tx_indices"):
+        BenchmarkRunConfig(subarray_tx_indices=(1,))
+
+
+def test_validation_cli_rejects_duplicate_solvers():
+    with pytest.raises(SystemExit):
+        _parse_args(
+            [
+                "--clip",
+                "clip",
+                "--out",
+                "out",
+                "--solvers",
+                "rt",
+                "rt",
+            ]
+        )
 
 
 def test_validation_range_gate_uses_exact_mesh_extent_without_margin():
@@ -528,17 +646,13 @@ def test_validation_range_gate_uses_exact_mesh_extent_without_margin():
     ]
 
 
-def test_validation_runner_labels_common_po_rt_mobility_pair():
-    assert _labeled_mobility_modes(("human_only_po", "rt_coherent_bank")) == (
-        ("po", "human_only_po"),
-        ("rt", "rt_coherent_bank"),
-    )
-    assert _labeled_mobility_modes(("hybrid_static_env_po",)) == (
-        ("sim", "hybrid_static_env_po"),
-    )
-    assert _labeled_mobility_modes(("rt_retrace", "rt_coherent_bank")) == (
-        ("rt_retrace", "rt_retrace"),
-        ("rt_coherent_bank", "rt_coherent_bank"),
+def test_validation_runner_labels_solvers():
+    assert _labeled_solvers(("po", "rt")) == (("po", "po"), ("rt", "rt"))
+    assert _labeled_solvers(("hybrid_po",)) == (("sim", "hybrid_po"),)
+    assert _labeled_solvers(("po", "rt", "hybrid_po")) == (
+        ("po", "po"),
+        ("rt", "rt"),
+        ("hybrid_po", "hybrid_po"),
     )
 
 
@@ -547,9 +661,7 @@ def _synthetic_adc(*, frames: int, chirps: int, samples: int, channels: int):
     chirp = np.arange(chirps, dtype=float)[None, :, None, None]
     sample = np.arange(samples, dtype=float)[None, None, :, None]
     channel = np.arange(channels, dtype=float)[None, None, None, :]
-    phase = 2.0 * np.pi * (
-        0.18 * sample + 0.07 * chirp + 0.01 * channel + 0.03 * frame
-    )
+    phase = 2.0 * np.pi * (0.18 * sample + 0.07 * chirp + 0.01 * channel + 0.03 * frame)
     amplitude = 1.0 + 0.05 * frame
     return (amplitude * np.exp(1j * phase)).astype(np.complex64)
 
@@ -579,6 +691,7 @@ def test_benchmark_clip_loads_environment_json_scene_path(tmp_path):
         encoding="utf-8",
     )
 
+    (tmp_path / "environment_scene.xml").write_text('<scene version="2.1.0"/>')
     clip = BenchmarkClip.load(tmp_path)
     scene_path = _resolve_scene_path(clip, BenchmarkRunConfig(out_dir=tmp_path / "out"))
 
@@ -603,14 +716,14 @@ def test_simulated_adc_cache_invalidates_when_sensor_json_changes(tmp_path):
         adc,
         clip,
         config,
-        mobility_mode="human_only_po",
+        solver="po",
     )
     with np.load(cache_path, allow_pickle=False) as data:
         assert _simulated_adc_cache_matches(
             data,
             clip,
             config,
-            mobility_mode="human_only_po",
+            solver="po",
         )
 
     sensor = json.loads((tmp_path / "sensor.json").read_text(encoding="utf-8"))
@@ -623,7 +736,7 @@ def test_simulated_adc_cache_invalidates_when_sensor_json_changes(tmp_path):
             data,
             changed_clip,
             config,
-            mobility_mode="human_only_po",
+            solver="po",
         )
 
 
@@ -633,14 +746,14 @@ def test_sensor_cache_payload_distinguishes_tdm_from_simultaneous(tmp_path):
     tdm_payload = _sensor_config_cache_payload(clip)
     simultaneous_sensor = replace(
         clip.sensor_config,
-        fmcw=replace(clip.sensor_config.fmcw, tdm_enabled=False),
+        fmcw=replace(clip.sensor_config.fmcw, tx_schedule="simultaneous"),
     )
     simultaneous_payload = _sensor_config_cache_payload(
         SimpleNamespace(sensor_config=simultaneous_sensor)
     )
 
-    assert tdm_payload["fmcw"]["tdm_enabled"] is True
-    assert simultaneous_payload["fmcw"]["tdm_enabled"] is False
+    assert tdm_payload["fmcw"]["tx_schedule"] == "tdm"
+    assert simultaneous_payload["fmcw"]["tx_schedule"] == "simultaneous"
     assert tdm_payload != simultaneous_payload
 
 
@@ -654,7 +767,7 @@ def test_simulated_adc_cache_invalidates_when_amass_sequence_changes(tmp_path):
         adc,
         clip,
         config,
-        mobility_mode="human_only_po",
+        solver="po",
     )
 
     motion_path = tmp_path / "amass_sequence.npz"
@@ -669,7 +782,7 @@ def test_simulated_adc_cache_invalidates_when_amass_sequence_changes(tmp_path):
             data,
             changed_clip,
             config,
-            mobility_mode="human_only_po",
+            solver="po",
         )
 
 
@@ -683,7 +796,7 @@ def test_simulated_adc_cache_invalidates_when_tdm_timing_policy_changes(tmp_path
         adc,
         clip,
         cached_config,
-        mobility_mode="human_only_po",
+        solver="po",
     )
 
     simultaneous_config = BenchmarkRunConfig(
@@ -695,7 +808,7 @@ def test_simulated_adc_cache_invalidates_when_tdm_timing_policy_changes(tmp_path
             data,
             clip,
             simultaneous_config,
-            mobility_mode="human_only_po",
+            solver="po",
         )
 
 
@@ -714,14 +827,14 @@ def test_simulated_adc_cache_invalidates_when_scene_file_changes(tmp_path):
         adc,
         clip,
         config,
-        mobility_mode="hybrid_static_env_po",
+        solver="hybrid_po",
     )
     with np.load(cache_path, allow_pickle=False) as data:
         assert _simulated_adc_cache_matches(
             data,
             clip,
             config,
-            mobility_mode="hybrid_static_env_po",
+            solver="hybrid_po",
         )
 
     scene_path.write_text("<scene version='2'/>", encoding="utf-8")
@@ -731,7 +844,7 @@ def test_simulated_adc_cache_invalidates_when_scene_file_changes(tmp_path):
             data,
             clip,
             config,
-            mobility_mode="hybrid_static_env_po",
+            solver="hybrid_po",
         )
 
 
@@ -745,8 +858,7 @@ def test_simulated_adc_cache_invalidates_when_referenced_scene_asset_changes(
     mesh_path.write_text("v 0 0 0\n", encoding="utf-8")
     include_path = scene_dir / "geometry.xml"
     include_path.write_text(
-        "<scene><shape type='obj'><string name='filename' "
-        "value='room.obj'/></shape></scene>",
+        "<scene><shape type='obj'><string name='filename' " "value='room.obj'/></shape></scene>",
         encoding="utf-8",
     )
     scene_path = scene_dir / "scene.xml"
@@ -765,7 +877,7 @@ def test_simulated_adc_cache_invalidates_when_referenced_scene_asset_changes(
         adc,
         clip,
         config,
-        mobility_mode="hybrid_static_env_po",
+        solver="hybrid_po",
     )
 
     mesh_path.write_text("v 1 0 0\n", encoding="utf-8")
@@ -775,7 +887,7 @@ def test_simulated_adc_cache_invalidates_when_referenced_scene_asset_changes(
             data,
             clip,
             config,
-            mobility_mode="hybrid_static_env_po",
+            solver="hybrid_po",
         )
 
 
@@ -797,7 +909,7 @@ def test_simulated_adc_cache_invalidates_when_environment_scene_changes(tmp_path
         adc,
         clip,
         config,
-        mobility_mode="hybrid_static_env_po",
+        solver="hybrid_po",
     )
 
     environment_path.write_text(
@@ -811,7 +923,7 @@ def test_simulated_adc_cache_invalidates_when_environment_scene_changes(tmp_path
             data,
             changed_clip,
             config,
-            mobility_mode="hybrid_static_env_po",
+            solver="hybrid_po",
         )
 
 
@@ -831,7 +943,7 @@ def test_simulated_adc_cache_invalidates_when_smpl_model_changes(tmp_path):
         adc,
         clip,
         config,
-        mobility_mode="human_only_po",
+        solver="po",
     )
 
     model_file.write_bytes(b"model version two")
@@ -841,7 +953,7 @@ def test_simulated_adc_cache_invalidates_when_smpl_model_changes(tmp_path):
             data,
             clip,
             config,
-            mobility_mode="human_only_po",
+            solver="po",
         )
 
 
@@ -880,13 +992,13 @@ def test_unreadable_simulated_adc_cache_is_rebuilt(tmp_path, monkeypatch):
         calls.append(True)
         return adc
 
-    monkeypatch.setattr(runner, "_simulate_adc", fake_simulate)
+    monkeypatch.setattr(_validation_simulation, "simulate_adc", fake_simulate)
 
     rebuilt_adc, cache = runner._load_or_simulate_cached_adc(
         clip,
         config,
         label="sim",
-        mobility_mode="human_only_po",
+        solver="po",
     )
 
     assert len(calls) == 1
@@ -908,7 +1020,7 @@ def test_simulated_adc_cache_rejects_nonfinite_adc(tmp_path):
         corrupted,
         clip,
         config,
-        mobility_mode="human_only_po",
+        solver="po",
     )
 
     with np.load(cache_path, allow_pickle=False) as data:
@@ -916,7 +1028,7 @@ def test_simulated_adc_cache_rejects_nonfinite_adc(tmp_path):
             data,
             clip,
             config,
-            mobility_mode="human_only_po",
+            solver="po",
         )
 
 
@@ -930,19 +1042,19 @@ def test_simulated_adc_cache_invalidates_when_hybrid_calibration_changes(tmp_pat
         adc,
         clip,
         calibrated,
-        mobility_mode="hybrid_static_env_po",
+        solver="hybrid_po",
     )
 
     uncalibrated = BenchmarkRunConfig(
         out_dir=tmp_path / "out",
-        hybrid_po_calibration_mode="none",
+        hybrid_calibration="none",
     )
     with np.load(cache_path, allow_pickle=False) as data:
         assert not _simulated_adc_cache_matches(
             data,
             clip,
             uncalibrated,
-            mobility_mode="hybrid_static_env_po",
+            solver="hybrid_po",
         )
 
 
@@ -1032,9 +1144,7 @@ def test_bundle_human_placement_is_applied_to_parameterized_motion():
     initial = motion.vertices_at(0.0)
     bounds_center = 0.5 * (np.min(initial, axis=0) + np.max(initial, axis=0))
     assert bounds_center == pytest.approx([1.5, -0.25, 0.4])
-    assert motion.vertices_at(0.1)[0] - initial[0] == pytest.approx(
-        [0.0, 0.1, 0.0]
-    )
+    assert motion.vertices_at(0.1)[0] - initial[0] == pytest.approx([0.0, 0.1, 0.0])
 
 
 def test_validation_rejects_motion_that_ends_before_final_physical_chirp(tmp_path):
@@ -1049,12 +1159,12 @@ def test_validation_rejects_motion_that_ends_before_final_physical_chirp(tmp_pat
         times=np.asarray([0.0, 0.1]),
     )
     clip = BenchmarkClip.load(tmp_path)
+    assert not clip.can_resimulate
+    from validation.runner import _simulation_mesh_sequence
 
+    # Fail before looking for a licensed model or entering a solver.
     with pytest.raises(ValueError, match="does not cover the full radar acquisition"):
-        _simulation_mesh_sequence(
-            clip,
-            BenchmarkRunConfig(out_dir=tmp_path / "out", smpl_model_dir=tmp_path),
-        )
+        _simulation_mesh_sequence(clip, BenchmarkRunConfig())
 
 
 def test_smpl_loaders_reject_pickled_object_arrays(tmp_path):
@@ -1099,7 +1209,7 @@ def test_aw2243_cascade_sensor_config_from_profile(tmp_path):
     assert sensor.hardware.num_virtual_channels == 192
     assert sensor.fmcw.num_adc_samples == 256
     assert sensor.fmcw.num_chirps_per_frame == 64
-    assert sensor.fmcw.tdm_enabled is True
+    assert sensor.fmcw.tx_schedule == "tdm"
 
 
 def test_tdm_profile_uses_per_transmitter_slow_time_count(tmp_path):
@@ -1118,7 +1228,7 @@ def test_tdm_profile_uses_per_transmitter_slow_time_count(tmp_path):
 
     sensor = BenchmarkSensorConfig.from_json(sensor_path).to_sensor()
 
-    assert sensor.fmcw.tdm_enabled is True
+    assert sensor.fmcw.tx_schedule == "tdm"
     assert sensor.fmcw.num_chirps_per_frame == 64
     assert sensor.fmcw.slow_time_interval == pytest.approx(12 * 65.0e-6)
 
@@ -1150,14 +1260,10 @@ def test_ti_cascade_mimo_profiles_use_per_tx_slow_time_count(
 
     sensor = BenchmarkSensorConfig.from_json(sensor_path).to_sensor()
 
-    assert sensor.fmcw.tdm_enabled is True
+    assert sensor.fmcw.tx_schedule == "tdm"
     assert sensor.fmcw.num_chirps_per_frame == 128
-    assert sensor.fmcw.slow_time_interval == pytest.approx(
-        12 * chirp_repetition_time_s
-    )
-    assert sensor.fmcw.frame_period == pytest.approx(
-        128 * 12 * chirp_repetition_time_s
-    )
+    assert sensor.fmcw.slow_time_interval == pytest.approx(12 * chirp_repetition_time_s)
+    assert sensor.fmcw.frame_period == pytest.approx(128 * 12 * chirp_repetition_time_s)
     assert sensor.fmcw.frame_period > published_frame_period_s
     assert sensor.fmcw.chirp_time(1, 0) >= sensor.fmcw.frame_duration
 
@@ -1177,7 +1283,7 @@ def test_ti_cascade_txbf_profile_remains_simultaneous(tmp_path):
 
     sensor = BenchmarkSensorConfig.from_json(sensor_path).to_sensor()
 
-    assert sensor.fmcw.tdm_enabled is False
+    assert sensor.fmcw.tx_schedule == "simultaneous"
     assert sensor.fmcw.num_chirps_per_frame == 128
     assert sensor.fmcw.slow_time_interval == pytest.approx(27.0e-6)
 
@@ -1314,18 +1420,20 @@ def test_validation_cli_smoke_writes_metrics_maps_and_plots(tmp_path):
     np.savez(sim_path, adc=adc)
     out_dir = tmp_path / "out"
 
-    code = validation_main([
-        "--clip",
-        str(clip_dir),
-        "--suite",
-        "smoke",
-        "--out",
-        str(out_dir),
-        "--simulated-adc",
-        str(sim_path),
-        "--clutter-removal",
-        "mean",
-    ])
+    code = validation_main(
+        [
+            "--clip",
+            str(clip_dir),
+            "--suite",
+            "smoke",
+            "--out",
+            str(out_dir),
+            "--simulated-adc",
+            str(sim_path),
+            "--clutter-removal",
+            "mean",
+        ]
+    )
 
     metrics = json.loads((out_dir / "metrics.json").read_text(encoding="utf-8"))
     assert code == 0
@@ -1361,6 +1469,155 @@ def test_validation_cli_smoke_writes_metrics_maps_and_plots(tmp_path):
     )
 
 
+@pytest.mark.parametrize("precomputed", [False, True])
+def test_validation_cli_zip_compares_adc_and_keeps_assets_until_finished(
+    tmp_path,
+    monkeypatch,
+    precomputed,
+):
+    import validation.cli as cli
+    import validation.runner as runner
+
+    clip_dir = tmp_path / "clip"
+    adc = _write_clip(clip_dir)
+    scene_dir = clip_dir / "room"
+    scene_dir.mkdir()
+    (scene_dir / "wall.obj").write_text(
+        "v 0 0 0\nv 0 1 0\nv 0 0 1\nf 1 2 3\n",
+        encoding="utf-8",
+    )
+    (scene_dir / "scene.xml").write_text(
+        "<scene version='3.0.0'><shape type='obj'>"
+        "<string name='filename' value='wall.obj'/></shape></scene>",
+        encoding="utf-8",
+    )
+    descriptor = json.loads((clip_dir / "bundle.json").read_text())
+    descriptor["scene"] = {"file": "room/scene.xml"}
+    (clip_dir / "bundle.json").write_text(json.dumps(descriptor))
+    archive = Path(shutil.make_archive(str(tmp_path / "capture"), "zip", clip_dir))
+    original_archive = archive.read_bytes()
+    shutil.rmtree(clip_dir)
+    roots = []
+    simulated_solvers = []
+    check_and_load = cli.check_and_load_bundle
+
+    def checked_load(root):
+        roots.append(root)
+        return check_and_load(root)
+
+    def simulate(clip, config, *, solver):
+        assert clip.scene_path == (clip.root / "room/scene.xml").resolve()
+        assert (clip.scene_path.parent / "wall.obj").is_file()
+        assert (clip.root / "amass_sequence.npz").is_file()
+        simulated_solvers.append(solver)
+        return adc.copy()
+
+    monkeypatch.setattr(cli, "check_and_load_bundle", checked_load)
+    monkeypatch.setattr(_validation_simulation, "simulate_adc", simulate)
+    out_dir = tmp_path / "out"
+    arguments = [
+        "--clip",
+        str(archive),
+        "--out",
+        str(out_dir),
+        "--suite",
+        "smoke",
+        "--solvers",
+        "po",
+        "rt",
+        "hybrid_po",
+    ]
+    if precomputed:
+        sim_path = tmp_path / "simulated.npz"
+        np.savez(sim_path, adc=adc)
+        arguments += ["--simulated-adc", str(sim_path)]
+
+    assert validation_main(arguments) == 0
+
+    metrics = json.loads((out_dir / "metrics.json").read_text())
+    assert metrics["clip"] == str(archive)
+    assert metrics["scene_path"] == f"{archive}!/room/scene.xml"
+    assert metrics["range_time"]["normalized_correlation"] == pytest.approx(1.0)
+    assert simulated_solvers == ([] if precomputed else ["po", "rt", "hybrid_po"])
+    if not precomputed:
+        assert set(metrics["comparisons"]) == {"po", "rt", "hybrid_po"}
+        for label in ("po", "rt", "hybrid_po"):
+            with np.load(out_dir / f"simulated_adc_{label}.npz") as cache:
+                np.testing.assert_array_equal(cache["adc"], adc)
+    assert (out_dir / "maps.npz").is_file()
+    assert list(out_dir.glob("range_profile_real_vs_*.png"))
+    assert len(roots) == 1  # One complete integrity check and load per invocation.
+    assert not roots[0].exists()
+    assert archive.read_bytes() == original_archive
+    if not precomputed:
+        # A fresh extraction of the same ZIP must reuse all three solver caches.
+        assert validation_main(arguments) == 0
+        cached = json.loads((out_dir / "metrics.json").read_text())
+        assert {entry["status"] for entry in cached["simulated_adc_cache"].values()} == {"hit"}
+        assert simulated_solvers == ["po", "rt", "hybrid_po"]
+        assert roots[0] != roots[1]
+        assert archive.read_bytes() == original_archive
+        # Referenced scene asset edits must invalidate them, even if the XML is unchanged.
+        with zipfile.ZipFile(archive) as source:
+            members = {name: source.read(name) for name in source.namelist()}
+        members["room/wall.obj"] = members["room/wall.obj"].replace(b"v 0 0 0", b"v 0.1 0 0")
+        with zipfile.ZipFile(archive, "w") as destination:
+            for name, payload in members.items():
+                destination.writestr(name, payload)
+        assert validation_main(arguments) == 0
+        refreshed = json.loads((out_dir / "metrics.json").read_text())
+        assert {entry["status"] for entry in refreshed["simulated_adc_cache"].values()} == {
+            "miss_rebuilt"
+        }
+        assert simulated_solvers == ["po", "rt", "hybrid_po", "po", "rt", "hybrid_po"]
+        assert all(not root.exists() for root in roots)
+
+
+@pytest.mark.parametrize("error", [RuntimeError, KeyboardInterrupt])
+def test_validation_cli_zip_cleans_up_after_simulation_failure(
+    tmp_path,
+    monkeypatch,
+    error,
+):
+    import validation.cli as cli
+
+    clip_dir = tmp_path / "clip"
+    _write_clip(clip_dir)
+    archive = Path(shutil.make_archive(str(tmp_path / "capture"), "zip", clip_dir))
+    original_archive = archive.read_bytes()
+    roots = []
+
+    def fail(clip, config):
+        roots.append(clip.root)
+        assert (clip.root / "radar_adc.npz").is_file()
+        raise error("simulation interrupted")
+
+    monkeypatch.setattr(cli, "run_validation_benchmark", fail)
+    with pytest.raises(error, match="simulation interrupted"):
+        validation_main(["--clip", str(archive), "--out", str(tmp_path / "out")])
+
+    assert len(roots) == 1
+    assert not roots[0].exists()
+    assert archive.read_bytes() == original_archive
+
+
+def test_validation_cli_zip_rejects_unsafe_members_before_running(tmp_path, monkeypatch):
+    import validation.cli as cli
+
+    archive = tmp_path / "unsafe.zip"
+    with zipfile.ZipFile(archive, "w") as output:
+        output.writestr("../outside.txt", "must not be extracted")
+
+    def unexpected_run(*args):
+        pytest.fail("invalid ZIP must be rejected before simulation")
+
+    monkeypatch.setattr(cli, "run_validation_benchmark", unexpected_run)
+    with pytest.raises(ValueError, match="unsafe bundle ZIP member"):
+        validation_main(["--clip", str(archive), "--out", str(tmp_path / "out")])
+
+    assert not (tmp_path / "outside.txt").exists()
+
+
 def test_validation_cli_subarray_selects_tdm_tx_rx_channels(tmp_path):
     clip_dir = tmp_path / "clip"
     adc = _write_clip(clip_dir)
@@ -1372,23 +1629,25 @@ def test_validation_cli_subarray_selects_tdm_tx_rx_channels(tmp_path):
     np.savez(sim_path, adc=adc)
     out_dir = tmp_path / "out"
 
-    code = validation_main([
-        "--clip",
-        str(clip_dir),
-        "--suite",
-        "smoke",
-        "--out",
-        str(out_dir),
-        "--simulated-adc",
-        str(sim_path),
-        "--subarray-tx",
-        "1,3",
-        "--subarray-rx",
-        "2-3",
-        "--clutter-removal",
-        "none",
-        "--no-plots",
-    ])
+    code = validation_main(
+        [
+            "--clip",
+            str(clip_dir),
+            "--suite",
+            "smoke",
+            "--out",
+            str(out_dir),
+            "--simulated-adc",
+            str(sim_path),
+            "--tx-indices",
+            "0,2",
+            "--rx-indices",
+            "1-2",
+            "--clutter-removal",
+            "none",
+            "--no-plots",
+        ]
+    )
 
     metrics = json.loads((out_dir / "metrics.json").read_text(encoding="utf-8"))
     subarray = metrics["subarray"]
@@ -1399,8 +1658,11 @@ def test_validation_cli_subarray_selects_tdm_tx_rx_channels(tmp_path):
     assert metrics["adc_shape"] == [2, 4, 16, 4]
     assert subarray["enabled"] is True
     assert subarray["channel_indices"] == [1, 2, 9, 10]
-    assert subarray["channel_tx_indices_1based"] == [3, 3, 1, 1]
-    assert subarray["channel_rx_indices_1based"] == [2, 3, 2, 3]
+    assert subarray["selected_tx_indices"] == [0, 2]
+    assert subarray["selected_rx_indices"] == [1, 2]
+    assert subarray["channel_tx_indices"] == [2, 2, 0, 0]
+    assert subarray["channel_rx_indices"] == [1, 2, 1, 2]
+    assert cube["channel_tx_indices"].tolist() == [2, 2, 0, 0]
     assert cube["real_adc"].shape == (2, 4, 16, 4)
     assert cube["sim_adc"].shape == (2, 4, 16, 4)
     assert np.array_equal(cube["real_adc"], adc[..., [1, 2, 9, 10]])
@@ -1447,7 +1709,7 @@ def test_tdm_slot_mapping_uses_actual_virtual_channel_pairs(
         num_chirps_per_frame=4,
         frame_period=0.1,
         num_tx=2,
-        tdm_enabled=True,
+        tx_schedule="tdm",
     )
     sensor = RadarSensor(
         name="ordered-validation-radar",
@@ -1477,11 +1739,14 @@ def test_tdm_slot_mapping_uses_actual_virtual_channel_pairs(
 
     np.testing.assert_array_equal(actual_tx, np.asarray(channel_tx) + 1)
     np.testing.assert_array_equal(actual_rx, np.asarray(channel_rx) + 1)
-    assert _tdm_slot_rx_outputs(
-        selection,
-        tx_order=np.asarray([1, 0]),
-        hardware=hardware,
-    ) == expected_outputs
+    assert (
+        _tdm_slot_rx_outputs(
+            selection,
+            tx_order=np.asarray([1, 0]),
+            hardware=hardware,
+        )
+        == expected_outputs
+    )
 
 
 def test_ignore_tdm_timing_uses_one_simultaneous_selected_hardware_run(
@@ -1499,8 +1764,8 @@ def test_ignore_tdm_timing_uses_one_simultaneous_selected_hardware_run(
     clip = BenchmarkClip.load(clip_dir)
     config = BenchmarkRunConfig(
         ignore_tdm_timing=True,
-        subarray_tx_indices=(1, 3),
-        subarray_rx_indices=(2, 3),
+        selected_tx_indices=(0, 2),
+        selected_rx_indices=(1, 2),
     )
     selection = _subarray_selection(clip, config, full_channels=12)
     sensor, output_order = _simultaneous_tdm_sensor(clip, selection)
@@ -1510,7 +1775,7 @@ def test_ignore_tdm_timing_uses_one_simultaneous_selected_hardware_run(
     assert sensor.hardware.num_virtual_channels == 4
     assert sensor.fmcw.num_tx == 2
     assert sensor.fmcw.chirp_repetition_time == pytest.approx(3 * 80.0e-6)
-    assert sensor.fmcw.tdm_enabled is False
+    assert sensor.fmcw.tx_schedule == "simultaneous"
     assert sensor.fmcw.slow_time_interval == pytest.approx(3 * 80.0e-6)
     assert output_order.tolist() == [2, 3, 0, 1]
 
@@ -1523,10 +1788,10 @@ def test_ignore_tdm_timing_uses_one_simultaneous_selected_hardware_run(
     def fail_slot_simulation(*_args, **_kwargs):
         raise AssertionError("per-slot TDM simulation must not run")
 
-    monkeypatch.setattr(runner, "_simulate_simultaneous_tdm_adc", fake_simultaneous)
-    monkeypatch.setattr(runner, "_simulate_tdm_virtual_adc", fail_slot_simulation)
+    monkeypatch.setattr(_validation_simulation, "simulate_simultaneous_tdm_adc", fake_simultaneous)
+    monkeypatch.setattr(_validation_simulation, "simulate_tdm_virtual_adc", fail_slot_simulation)
 
-    adc = _simulate_adc(clip, config, mobility_mode="human_only_po")
+    adc = _simulate_adc(clip, config, solver="po")
 
     assert adc.shape == (2, 4, 16, 4)
     assert len(calls) == 1
@@ -1545,11 +1810,12 @@ def test_validation_cli_passes_smpl_model_dir(tmp_path, monkeypatch):
         captured["clip_root"] = clip.root
         captured["smpl_model_dir"] = config.smpl_model_dir
         captured["simulate"] = config.simulate
-        captured["mobility_modes"] = config.mobility_modes
-        captured["diffuse_reflection"] = config.diffuse_reflection
-        captured["refraction"] = config.refraction
-        captured["human_specular_reflection"] = config.human_specular_reflection
-        captured["hybrid_po_calibration_mode"] = config.hybrid_po_calibration_mode
+        captured["solvers"] = config.solvers
+        captured["rt_refresh_frames"] = config.rt_refresh_frames
+        captured["rt_diffuse_reflection"] = config.rt_diffuse_reflection
+        captured["rt_refraction"] = config.rt_refraction
+        captured["rt_human_specular_reflection"] = config.rt_human_specular_reflection
+        captured["hybrid_calibration"] = config.hybrid_calibration
         captured["ignore_tdm_timing"] = config.ignore_tdm_timing
         return {}
 
@@ -1559,33 +1825,38 @@ def test_validation_cli_passes_smpl_model_dir(tmp_path, monkeypatch):
         fake_run_validation_benchmark,
     )
 
-    code = validation_cli.main([
-        "--clip",
-        str(clip_dir),
-        "--suite",
-        "smoke",
-        "--out",
-        str(out_dir),
-        "--mobility-mode",
-        "hybrid_static_env_po",
-        "rt_retrace",
-        "--no-diffuse-reflection",
-        "--refraction",
-        "--human-specular-reflection",
-        "--ignore-tdm-timing",
-        "--smpl-model-dir",
-        str(smpl_model_dir),
-    ])
+    code = validation_cli.main(
+        [
+            "--clip",
+            str(clip_dir),
+            "--suite",
+            "smoke",
+            "--out",
+            str(out_dir),
+            "--solvers",
+            "hybrid_po",
+            "rt",
+            "--rt-refresh-frames",
+            "2",
+            "--no-rt-diffuse-reflection",
+            "--rt-refraction",
+            "--rt-human-specular-reflection",
+            "--ignore-tdm-timing",
+            "--smpl-model-dir",
+            str(smpl_model_dir),
+        ]
+    )
 
     assert code == 0
     assert captured["clip_root"] == clip_dir
     assert captured["smpl_model_dir"] == str(smpl_model_dir)
     assert captured["simulate"] is True
-    assert captured["mobility_modes"] == ("hybrid_static_env_po", "rt_retrace")
-    assert captured["diffuse_reflection"] is False
-    assert captured["refraction"] is True
-    assert captured["human_specular_reflection"] is True
-    assert captured["hybrid_po_calibration_mode"] == "rt_first_pose"
+    assert captured["solvers"] == ("hybrid_po", "rt")
+    assert captured["rt_refresh_frames"] == 2
+    assert captured["rt_diffuse_reflection"] is False
+    assert captured["rt_refraction"] is True
+    assert captured["rt_human_specular_reflection"] is True
+    assert captured["hybrid_calibration"] == "rt_first_pose"
     assert captured["ignore_tdm_timing"] is True
 
 
@@ -1608,14 +1879,16 @@ def test_validation_cli_uses_smpl_model_dir_environment(tmp_path, monkeypatch):
         fake_run_validation_benchmark,
     )
 
-    code = validation_cli.main([
-        "--clip",
-        str(clip_dir),
-        "--suite",
-        "smoke",
-        "--out",
-        str(tmp_path / "out"),
-    ])
+    code = validation_cli.main(
+        [
+            "--clip",
+            str(clip_dir),
+            "--suite",
+            "smoke",
+            "--out",
+            str(tmp_path / "out"),
+        ]
+    )
 
     assert code == 0
     assert captured["smpl_model_dir"] == str(environment_model_dir)
@@ -1691,22 +1964,20 @@ def test_validation_multi_mode_plot_outputs_name_and_label_every_mode(
         "real_range_time_power": np.ones((4, 8)),
         "po_range_time_power": np.ones((4, 8)) * 0.5,
         "rt_range_time_power": np.ones((4, 8)) * 0.25,
-        "hybrid_static_env_po_range_time_power": np.ones((4, 8)) * 0.125,
+        "hybrid_po_range_time_power": np.ones((4, 8)) * 0.125,
         "sim_range_time_power": np.ones((4, 8)) * 0.5,
         "range_time_ranges_m": np.linspace(0.0, 1.0, 8),
         "real_range_doppler_power": np.ones((1, 4, 8)),
         "po_range_doppler_power": np.ones((1, 4, 8)) * 0.5,
         "rt_range_doppler_power": np.ones((1, 4, 8)) * 0.25,
-        "hybrid_static_env_po_range_doppler_power": (
-            np.ones((1, 4, 8)) * 0.125
-        ),
+        "hybrid_po_range_doppler_power": (np.ones((1, 4, 8)) * 0.125),
         "sim_range_doppler_power": np.ones((1, 4, 8)) * 0.5,
         "range_doppler_ranges_m": np.linspace(0.0, 1.0, 8),
         "range_doppler_velocities_mps": np.linspace(-0.5, 0.5, 4),
         "real_angle_fft_power": np.ones((1, 8, 16)),
         "po_angle_fft_power": np.ones((1, 8, 16)) * 0.5,
         "rt_angle_fft_power": np.ones((1, 8, 16)) * 0.25,
-        "hybrid_static_env_po_angle_fft_power": np.ones((1, 8, 16)) * 0.125,
+        "hybrid_po_angle_fft_power": np.ones((1, 8, 16)) * 0.125,
         "sim_angle_fft_power": np.ones((1, 8, 16)) * 0.5,
         "angle_fft_u": np.linspace(-1.0, 1.0, 16),
         "angle_fft_v": np.linspace(-1.0, 1.0, 8),
@@ -1715,17 +1986,14 @@ def test_validation_multi_mode_plot_outputs_name_and_label_every_mode(
     _write_plots(
         out_dir,
         maps,
-        simulation_modes=(
-            ("po", "human_only_po"),
-            ("rt", "rt_coherent_bank"),
-            ("hybrid_static_env_po", "hybrid_static_env_po"),
+        simulated_solvers=(
+            ("po", "po"),
+            ("rt", "rt"),
+            ("hybrid_po", "hybrid_po"),
         ),
     )
 
-    suffix = (
-        "real_vs_human_only_po_vs_rt_coherent_bank_"
-        "vs_hybrid_static_env_po.png"
-    )
+    suffix = "real_vs_po_vs_rt_vs_hybrid_po.png"
     assert (out_dir / f"range_profile_{suffix}").exists()
     assert (out_dir / f"range_time_{suffix}").exists()
     assert (out_dir / f"range_doppler_{suffix}").exists()
@@ -1734,9 +2002,11 @@ def test_validation_multi_mode_plot_outputs_name_and_label_every_mode(
     assert not (out_dir / "range_time_real_vs_sim.png").exists()
     assert not (out_dir / "range_doppler_real_vs_sim.png").exists()
     assert not (out_dir / "angle_fft_real_vs_sim.png").exists()
-    assert legend_labels == [[
-        "Real",
-        "human_only_po",
-        "rt_coherent_bank",
-        "hybrid_static_env_po",
-    ]]
+    assert legend_labels == [
+        [
+            "Real",
+            "PO",
+            "RT",
+            "Hybrid PO",
+        ]
+    ]

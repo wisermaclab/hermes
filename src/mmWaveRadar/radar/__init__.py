@@ -6,6 +6,7 @@
 from .fmcw import FMCWConfig
 from .hardware import RadarHardware
 from .sensor import RadarSensor
+from .ti_cli import parse_ti_cli_config
 from .ti import (
     TIBoardSpec,
     TIDigitizedPattern,
@@ -22,6 +23,7 @@ __all__ = [
     "FMCWConfig",
     "RadarHardware",
     "RadarSensor",
+    "parse_ti_cli_config",
     "TIBoardSpec",
     "TIDigitizedPattern",
     "TIDigitizedPatternUnavailableError",

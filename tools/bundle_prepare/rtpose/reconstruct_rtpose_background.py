@@ -20,7 +20,6 @@ from typing import Any
 import numpy as np
 from PIL import Image
 
-
 ROI_XYZ = (0.0, 11.6, -6.0, 8.0, -1.6, 3.2)
 BODY_BBOX_PAD_XYZ = (0.25, 0.35, 0.30)
 BODY_IMAGE_PAD_XY = (85.0, 120.0)
@@ -73,9 +72,7 @@ def pcd_dtype(
         try:
             base = scalar_types[(pcd_type, size)]
         except KeyError as exc:
-            raise ValueError(
-                f"Unsupported PCD field type: {field} {pcd_type}{size}"
-            ) from exc
+            raise ValueError(f"Unsupported PCD field type: {field} {pcd_type}{size}") from exc
         dtype_fields.append((field, base if count == 1 else (base, count)))
     return np.dtype(dtype_fields)
 
@@ -121,8 +118,7 @@ def read_pcd(path: Path) -> tuple[np.ndarray, dict[str, Any]]:
             raw = raw[None, :]
         if raw.shape != (points, len(fields)):
             raise ValueError(
-                f"PCD ASCII payload has shape {raw.shape}, expected "
-                f"({points}, {len(fields)})"
+                f"PCD ASCII payload has shape {raw.shape}, expected " f"({points}, {len(fields)})"
             )
         cloud = np.empty(points, dtype=dtype)
         for column, field in enumerate(fields):
@@ -133,9 +129,7 @@ def read_pcd(path: Path) -> tuple[np.ndarray, dict[str, Any]]:
     missing = [field for field in ("x", "y", "z") if field not in fields]
     if missing:
         raise ValueError(f"PCD is missing XYZ fields {missing}: {path}")
-    xyz = np.stack([cloud["x"], cloud["y"], cloud["z"]], axis=1).astype(
-        np.float64
-    )
+    xyz = np.stack([cloud["x"], cloud["y"], cloud["z"]], axis=1).astype(np.float64)
     if xyz.shape != (points, 3) or not np.all(np.isfinite(xyz)):
         raise ValueError(f"PCD XYZ values must be finite: {path}")
     return xyz, {"fields": fields, "data": data_kind, "points": points}
@@ -160,10 +154,7 @@ def load_camera(
     source_frame_id: str,
 ) -> CameraProjection:
     calibration_path = dataset_dir / f"Data/calib/camera/{side}.json"
-    image_path = (
-        dataset_dir
-        / f"Data/sequences/{sequence}/camera/{side}/{source_frame_id}.png"
-    )
+    image_path = dataset_dir / f"Data/sequences/{sequence}/camera/{side}/{source_frame_id}.png"
     for label, path in (("calibration", calibration_path), ("image", image_path)):
         if path.is_symlink() or not path.is_file():
             raise FileNotFoundError(f"RT-Pose {side} camera {label} was not found: {path}")
@@ -186,8 +177,7 @@ def project_points(points: np.ndarray, camera: CameraProjection) -> ProjectionRe
     points_h = np.column_stack((points, np.ones(len(points), dtype=np.float64)))
     cam_xyz = (camera.extrinsic @ points_h.T).T[:, :3]
     uvw = (
-        camera.intrinsic
-        @ np.column_stack((cam_xyz, np.ones(len(cam_xyz), dtype=np.float64))).T
+        camera.intrinsic @ np.column_stack((cam_xyz, np.ones(len(cam_xyz), dtype=np.float64))).T
     ).T
     uv = np.full((len(points), 2), np.nan, dtype=np.float64)
     valid_depth = np.abs(uvw[:, 2]) > 1.0e-8
@@ -264,19 +254,14 @@ def body_cull_mask(
     in_world_box = np.all((points >= mins) & (points <= maxs), axis=1)
 
     vertex_projection = project_points(vertices, camera)
-    valid_vertices = (
-        (vertex_projection.cam_xyz[:, 2] > 0.0)
-        & np.isfinite(vertex_projection.uv).all(axis=1)
-    )
+    valid_vertices = (vertex_projection.cam_xyz[:, 2] > 0.0) & np.isfinite(
+        vertex_projection.uv
+    ).all(axis=1)
     in_image_box = np.zeros(len(points), dtype=bool)
     projected_bbox: list[float] | None = None
     if np.any(valid_vertices):
-        low = vertex_projection.uv[valid_vertices].min(axis=0) - np.asarray(
-            BODY_IMAGE_PAD_XY
-        )
-        high = vertex_projection.uv[valid_vertices].max(axis=0) + np.asarray(
-            BODY_IMAGE_PAD_XY
-        )
+        low = vertex_projection.uv[valid_vertices].min(axis=0) - np.asarray(BODY_IMAGE_PAD_XY)
+        high = vertex_projection.uv[valid_vertices].max(axis=0) + np.asarray(BODY_IMAGE_PAD_XY)
         vertex_depths = vertex_projection.cam_xyz[valid_vertices, 2]
         min_depth = float(vertex_depths.min() - BODY_DEPTH_PAD[0])
         max_depth = float(vertex_depths.max() + BODY_DEPTH_PAD[1])
@@ -358,8 +343,7 @@ def reconstruct_background(
         "coordinate_frame": "RT-Pose/radar: x=range, y=lateral, z=vertical",
         "source_lidar": lidar_path.relative_to(dataset_dir).as_posix(),
         "source_camera_images": [
-            camera.image_path.relative_to(dataset_dir).as_posix()
-            for camera in cameras
+            camera.image_path.relative_to(dataset_dir).as_posix() for camera in cameras
         ],
         "pcd": pcd_metadata,
         "visible_camera_points": int(visible.sum()),

@@ -1,0 +1,1504 @@
+<!-- SPDX-License-Identifier: CC-BY-NC-4.0 -->
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>HERMES Simulation Tutorial</title>
+<meta name="description" content="How to run HERMES mmWave radar simulations, specify a scene XML, prepare a self-contained measurement bundle, and compare simulations with measured ADC.">
+<style>
+/* Layout: sticky section index on the left, one reading column on the right; tables and the diagram may run wider than the prose. Dark palette matches docs/api/. */
+:root {
+  --bg: #f4f7fb;
+  --surface: #ffffff;
+  --surface-2: #e9eff7;
+  --code-bg: #edf2f8;
+  --text: #0c1a2b;
+  --muted: #4b5e74;
+  --border: #d0dae6;
+  --accent: #0369a1;
+  --accent-soft: #dff0fa;
+  --rt: #9a5300;
+  --rt-soft: #fbefdb;
+  --po: #00756a;
+  --po-soft: #daf2ee;
+  --warn: #9a3412;
+  --warn-soft: #fcece3;
+  --font-body: Inter, system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", sans-serif;
+  --font-mono: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+  --nav-w: 296px;
+  --prose: 72ch;
+  color-scheme: light;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #07111f; --surface: #101d30; --surface-2: #15253a; --code-bg: #0a1627;
+    --text: #e7eef8; --muted: #9fb0c4; --border: #29415d;
+    --accent: #38bdf8; --accent-soft: #0e2a40;
+    --rt: #fbbf24; --rt-soft: #2c2312; --po: #34d399; --po-soft: #0d2c25;
+    --warn: #fb923c; --warn-soft: #2d1b11;
+    color-scheme: dark;
+  }
+}
+:root[data-theme="dark"] {
+  --bg: #07111f; --surface: #101d30; --surface-2: #15253a; --code-bg: #0a1627;
+  --text: #e7eef8; --muted: #9fb0c4; --border: #29415d;
+  --accent: #38bdf8; --accent-soft: #0e2a40;
+  --rt: #fbbf24; --rt-soft: #2c2312; --po: #34d399; --po-soft: #0d2c25;
+  --warn: #fb923c; --warn-soft: #2d1b11;
+  color-scheme: dark;
+}
+
+*, *::before, *::after { box-sizing: border-box; }
+html { scroll-behavior: smooth; }
+@media (prefers-reduced-motion: reduce) { html { scroll-behavior: auto; } }
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font: 16px/1.6 var(--font-body);
+  -webkit-text-size-adjust: 100%;
+}
+a { color: var(--accent); text-underline-offset: 2px; }
+a:hover { text-decoration-thickness: 2px; }
+:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: 4px; }
+code, pre, kbd { font-family: var(--font-mono); font-size: 0.875em; }
+:not(pre) > code {
+  background: var(--surface-2);
+  border-radius: 4px;
+  padding: 0.08em 0.36em;
+  overflow-wrap: anywhere;
+}
+kbd {
+  border: 1px solid var(--border);
+  border-bottom-width: 2px;
+  border-radius: 4px;
+  padding: 0 0.35em;
+  background: var(--surface);
+}
+
+/* ---------- frame ---------- */
+.layout { display: grid; grid-template-columns: var(--nav-w) minmax(0, 1fr); }
+nav.toc {
+  position: sticky;
+  top: 0;
+  height: 100vh;
+  overflow: auto;
+  padding-block: 28px;
+  padding-inline: 18px;
+  border-right: 1px solid var(--border);
+  background: var(--surface);
+}
+.toc-title {
+  margin: 0 0 4px;
+  font-size: 18px;
+  font-weight: 700;
+  letter-spacing: 0.01em;
+}
+.toc-sub { margin: 0 0 18px; font-size: 14px; color: var(--muted); }
+.toc ol { list-style: none; margin: 0; padding: 0; display: grid; gap: 2px; }
+.toc a {
+  display: block;
+  padding: 5px 10px 5px 18px;
+  border-radius: 6px;
+  color: var(--accent);
+  text-decoration: none;
+  font-size: 16px;
+}
+.toc a:hover { color: var(--text); background: var(--surface-2); }
+.toc a[aria-current="true"] { color: var(--accent); background: var(--accent-soft); font-weight: 600; }
+.toc .group {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin: 22px 0 6px;
+  padding: 0 10px;
+  font-size: 13px;
+  font-weight: 600;
+  letter-spacing: 0.09em;
+  text-transform: uppercase;
+  color: var(--muted);
+  cursor: default;
+}
+.toc .group:first-child { margin-top: 10px; }
+.toc .group::after { content: ""; flex: 1; height: 1px; background: var(--border); }
+.toc .foot { margin-top: 22px; font-size: 14px; }
+
+main { min-width: 0; }
+.wrap {
+  max-width: 1040px;
+  padding-left: max(16px, env(safe-area-inset-left, 0px));
+  padding-right: max(16px, env(safe-area-inset-right, 0px));
+  margin-inline: auto;
+}
+@media (min-width: 700px) {
+  .wrap { padding-left: max(48px, env(safe-area-inset-left, 0px)); padding-right: max(48px, env(safe-area-inset-right, 0px)); }
+}
+
+/* ---------- hero ---------- */
+header.hero { border-bottom: 1px solid var(--border); background: var(--surface); }
+header.hero .wrap { padding-block: 52px 36px; }
+.eyebrow {
+  margin: 0 0 10px;
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--accent);
+}
+h1 {
+  margin: 0 0 14px;
+  font-size: clamp(30px, 4.6vw, 46px);
+  line-height: 1.12;
+  letter-spacing: -0.015em;
+  text-wrap: balance;
+}
+.lede { margin: 0; max-width: var(--prose); font-size: 18px; color: var(--muted); }
+.meta { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 22px; }
+.pill {
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  padding: 3px 11px;
+  font-size: 13px;
+  color: var(--muted);
+  background: var(--bg);
+}
+
+/* ---------- sections ---------- */
+section { padding-block: 44px 8px; scroll-margin-top: 12px; }
+section + section { border-top: 1px solid var(--border); margin-top: 36px; }
+h2 {
+  margin: 0 0 12px;
+  font-size: 28px;
+  line-height: 1.2;
+  letter-spacing: -0.01em;
+  text-wrap: balance;
+}
+h3 { margin: 30px 0 10px; font-size: 19px; line-height: 1.3; text-wrap: balance; }
+h4 { margin: 20px 0 8px; font-size: 16px; }
+p, li { max-width: var(--prose); }
+.section-lede { color: var(--muted); font-size: 17px; margin-top: 0; }
+.small { font-size: 14px; color: var(--muted); }
+ul, ol { padding-left: 1.3em; }
+li + li { margin-top: 4px; }
+
+/* ---------- callouts ---------- */
+.callout {
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--surface);
+  padding: 18px 22px;
+  margin: 22px 0;
+  max-width: 860px;
+}
+.callout h3, .callout h4 { margin-top: 0; }
+.callout > :last-child { margin-bottom: 0; }
+.callout.key { background: var(--accent-soft); border-color: transparent; }
+.callout.warn { background: var(--warn-soft); border-color: transparent; }
+.callout.warn .label { color: var(--warn); }
+.label {
+  display: block;
+  margin-bottom: 6px;
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: 0.09em;
+  text-transform: uppercase;
+  color: var(--accent);
+}
+
+/* ---------- solver tags ---------- */
+.tag {
+  display: inline-block;
+  padding: 1px 8px;
+  border-radius: 999px;
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  vertical-align: 2px;
+  white-space: nowrap;
+}
+.tag.rt { color: var(--rt); background: var(--rt-soft); }
+.tag.po { color: var(--po); background: var(--po-soft); }
+
+/* ---------- tables ---------- */
+.table-scroll {
+  overflow-x: auto;
+  margin: 18px 0 8px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--surface);
+}
+table { border-collapse: collapse; width: 100%; font-size: 14px; }
+th, td { text-align: left; vertical-align: top; padding: 10px 12px; border-bottom: 1px solid var(--border); }
+tbody tr:last-child td { border-bottom: 0; }
+thead th {
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  color: var(--muted);
+  background: var(--surface-2);
+  white-space: nowrap;
+}
+td code { white-space: nowrap; }
+td.wrap-code code { white-space: normal; }
+tr.group-row td {
+  background: var(--bg);
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--muted);
+  padding-block: 7px;
+}
+.num { font-variant-numeric: tabular-nums; }
+td.dot { text-align: center; width: 1%; white-space: nowrap; padding-inline: 8px; }
+th.dot { text-align: center; padding-inline: 8px; }
+.yes { color: var(--accent); font-weight: 700; }
+.no { color: var(--border); }
+.fn { font-size: 13px; color: var(--muted); margin: 6px 0 0; }
+.fn p { margin: 4px 0; }
+.diff { color: var(--warn); font-weight: 600; }
+
+/* ---------- code ---------- */
+.codeblock {
+  margin: 16px 0;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--code-bg);
+  max-width: 860px;
+  min-width: 0;
+}
+.codehead {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 6px 8px 6px 14px;
+  border-bottom: 1px solid var(--border);
+  font-size: 12px;
+  color: var(--muted);
+  font-family: var(--font-mono);
+}
+.codeblock pre { margin: 0; padding: 14px 16px; overflow-x: auto; line-height: 1.55; }
+.codeblock pre code { font-size: 13.5px; }
+.c { color: var(--muted); }
+button.copy {
+  font: 600 12px var(--font-body);
+  color: var(--muted);
+  background: transparent;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 3px 10px;
+  cursor: pointer;
+}
+button.copy:hover { color: var(--text); background: var(--surface); }
+
+/* ---------- diagram ---------- */
+.diagram {
+  margin: 22px 0 10px;
+  overflow-x: auto;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--surface);
+  padding: 14px;
+}
+.diagram svg { display: block; width: 100%; min-width: 760px; height: auto; }
+.d-box { fill: var(--surface-2); stroke: var(--border); stroke-width: 1.2; }
+.d-api { fill: var(--accent-soft); stroke: var(--accent); stroke-width: 1.2; }
+.d-skip { fill: none; stroke: var(--border); stroke-width: 1.2; stroke-dasharray: 5 5; }
+.d-engine { fill: var(--bg); stroke: var(--border); stroke-width: 1.2; }
+.d-chip { fill: var(--surface); stroke: var(--border); stroke-width: 1; }
+.d-title { fill: var(--text); font: 700 15px var(--font-body); }
+.d-mono { fill: var(--text); font: 600 12.5px var(--font-mono); }
+.d-mono-lg { fill: var(--text); font: 700 14px var(--font-mono); }
+.d-note { fill: var(--muted); font: 12px var(--font-body); }
+.d-tier { fill: var(--muted); font: 700 11px var(--font-body); letter-spacing: 0.1em; }
+.d-line { stroke: var(--muted); stroke-width: 1.6; fill: none; }
+.d-line.direct { stroke-dasharray: 5 4; }
+.d-head { fill: var(--muted); }
+
+/* ---------- cards ---------- */
+.solver-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(420px, 100%), 1fr)); gap: 16px; margin: 20px 0; max-width: 980px; }
+.solver {
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--surface);
+  padding: 18px 20px;
+  display: grid;
+  gap: 8px;
+  align-content: start;
+  min-width: 0;
+}
+.solver h3 { margin: 0; display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+.solver p { margin: 0; }
+.solver dl { margin: 4px 0 0; display: grid; grid-template-columns: max-content minmax(0, 1fr); gap: 4px 12px; font-size: 14px; }
+.solver dt { color: var(--muted); }
+.solver dd { margin: 0; min-width: 0; }
+.formula {
+  font-family: var(--font-mono);
+  font-size: 14px;
+  background: var(--code-bg);
+  border-radius: 6px;
+  padding: 8px 12px;
+  overflow-x: auto;
+  white-space: nowrap;
+}
+
+/* ---------- steps ---------- */
+ol.steps { list-style: none; counter-reset: step; padding: 0; margin: 18px 0; display: grid; gap: 14px; max-width: 860px; }
+ol.steps > li { counter-increment: step; position: relative; padding-left: 44px; min-width: 0; max-width: none; margin: 0; }
+ol.steps > li::before {
+  content: counter(step);
+  position: absolute;
+  left: 0;
+  top: 0;
+  width: 28px;
+  height: 28px;
+  border-radius: 50%;
+  display: grid;
+  place-items: center;
+  font: 700 13px var(--font-body);
+  color: var(--accent);
+  background: var(--accent-soft);
+}
+ol.steps > li > strong:first-child { display: block; }
+ol.steps .codeblock { margin: 10px 0 0; }
+
+/* ---------- tabs ---------- */
+.tabs { margin: 18px 0; max-width: 860px; }
+.tablist { display: none; flex-wrap: wrap; gap: 6px; margin-bottom: 10px; }
+.tabs.js .tablist { display: flex; }
+.tablist button {
+  font: 600 14px var(--font-body);
+  color: var(--muted);
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  padding: 6px 14px;
+  cursor: pointer;
+}
+.tablist button:hover { color: var(--text); }
+.tablist button[aria-selected="true"] { color: var(--accent); background: var(--accent-soft); border-color: transparent; }
+.tabpanel {
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--surface);
+  padding: 16px 18px;
+  margin-bottom: 12px;
+}
+.tabpanel .codeblock { margin: 10px 0; }
+.tabpanel > :first-child { margin-top: 0; }
+.tabpanel > :last-child { margin-bottom: 0; }
+.tabs.js .panel-label { display: none; }
+.panel-label { margin: 0 0 8px; font-size: 13px; font-weight: 700; color: var(--accent); text-transform: uppercase; letter-spacing: 0.08em; }
+
+/* ---------- checklist ---------- */
+.pitfalls { display: grid; gap: 12px; padding: 0; list-style: none; counter-reset: pit; max-width: 900px; }
+.pitfalls > li {
+  max-width: none;
+  margin: 0;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--surface);
+  padding: 14px 18px;
+}
+.pitfalls strong { display: block; margin-bottom: 2px; }
+.pitfalls p { margin: 4px 0 0; }
+
+footer { border-top: 1px solid var(--border); margin-top: 48px; }
+footer .wrap { padding-block: 24px 40px; font-size: 13px; color: var(--muted); }
+
+@media (max-width: 960px) {
+  .layout { grid-template-columns: 1fr; }
+  nav.toc {
+    position: relative;
+    height: auto;
+    border-right: 0;
+    border-bottom: 1px solid var(--border);
+    padding-block: 16px;
+    padding-left: max(16px, env(safe-area-inset-left, 0px));
+    padding-right: max(16px, env(safe-area-inset-right, 0px));
+  }
+  .toc ol { display: flex; flex-wrap: wrap; gap: 6px; }
+  .toc a { border: 1px solid var(--border); border-radius: 999px; padding: 3px 11px; font-size: 15px; }
+  .toc .group, .toc .foot, .toc-sub { display: none; }
+}
+@media (max-width: 760px) {
+  .solver-grid { grid-template-columns: 1fr; }
+  .solver dl { grid-template-columns: minmax(0, 1fr); }
+  .solver dd { margin-bottom: 8px; }
+  .lede { font-size: 17px; }
+  h2 { font-size: 24px; }
+}
+</style>
+</head>
+<body>
+<div class="layout">
+
+<nav class="toc" aria-label="Sections">
+  <p class="toc-title">HERMES tutorial</p>
+  <p class="toc-sub">Simulation and measurement workflows</p>
+  <ol>
+    <li class="group">Overview</li>
+    <li><a href="#overview">System architecture</a></li>
+    <li><a href="#choose">Interface selection</a></li>
+    <li><a href="#solvers">Simulation solvers</a></li>
+    <li><a href="#names">Solver and parameter terminology</a></li>
+    <li><a href="#install">Installation and prerequisites</a></li>
+    <li class="group">Workflows</li>
+    <li><a href="#gui">Browser GUI</a></li>
+    <li><a href="#scene">Scene configuration</a></li>
+    <li><a href="#cli">Headless CLI</a></li>
+    <li><a href="#python">Python and notebooks</a></li>
+    <li><a href="#prepare-bundle">Measurement bundle preparation</a></li>
+    <li><a href="#validation">Validation CLI</a></li>
+    <li><a href="#scientific-validation">Scientific verification</a></li>
+    <li class="group">Reference</li>
+    <li><a href="#settings">Configuration reference</a></li>
+    <li><a href="#defaults">Default settings by interface</a></li>
+    <li><a href="#moving">Reproducing runs</a></li>
+    <li><a href="#pitfalls">Configuration considerations</a></li>
+  </ol>
+  <p class="foot"><a href="../api/index.html">Developer API reference</a></p>
+</nav>
+
+<main>
+<header class="hero">
+  <div class="wrap">
+    <p class="eyebrow">HERMES · mmWave FMCW radar simulator</p>
+    <h1>HERMES simulation tutorial</h1>
+    <p class="lede">This tutorial covers scene configuration, radar and solver settings, simulation execution, and measurement bundle preparation. It provides workflows for the browser GUI, command-line tools and Python APIs, with guidance on reproducing runs and comparing simulations with measured ADC data.</p>
+    <div class="meta">
+      <span class="pill">hermes-radar-sim 0.2.0</span>
+      <span class="pill">import name <code>mmWaveRadar</code></span>
+      <span class="pill">Commands run from the checkout root</span>
+    </div>
+  </div>
+</header>
+
+<div class="wrap">
+
+<div class="callout key">
+  <span class="label">Workflow summary</span>
+  <ul>
+    <li>The GUI's <strong>Dynamic Scenes</strong> page and the <strong>headless CLI</strong> use the same experiment layer. New Python integrations should use <code>simulate_human_room(HumanRoomSettings(...))</code>. Save CLI run settings in a JSON configuration file.</li>
+    <li>Each interface uses <a href="#names">common solver identifiers and parameter names</a>: solvers <code>rt</code>, <code>po</code> and <code>hybrid_po</code>, and settings prefixed <code>rt_</code>, <code>po_</code> or <code>hybrid_</code> by the solver that reads them. Update cadences are counted in radar frames.</li>
+    <li><strong>Notebook examples</strong> and the <strong>validation CLI</strong> call the solver engine directly and can use different defaults from the GUI. Align their configurations before comparing results (<a href="#defaults">comparison table</a>).</li>
+    <li>For GUI-equivalent experiments in Python, match the motion, scene, radar and solver settings with <code>HumanRoomSettings</code> (<a href="#python">Python example</a>).</li>
+  </ul>
+</div>
+
+<!-- ======================================================= -->
+<section id="overview">
+  <h2>System architecture</h2>
+  <p class="section-lede">All interfaces use the same solver engine. The GUI and headless runner use an experiment layer that manages scene placement, radar construction, solver configuration, processed results and bundle export. Direct solver calls configure these inputs explicitly.</p>
+
+  <div class="diagram" role="img" aria-label="Diagram. The browser GUI and the headless CLI both call run_human_room_experiment, which calls the solver engine. Notebooks and the validation CLI call the solver engine directly. The solver engine contains MmWaveRadarSimulator and run_calibrated_hybrid_po.">
+    <svg viewBox="0 0 900 372" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
+      <defs>
+        <marker id="ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+          <path d="M0,0 L10,5 L0,10 z" class="d-head"/>
+        </marker>
+      </defs>
+
+      <text class="d-tier" x="10" y="26">ENTRY POINTS</text>
+      <rect class="d-box" x="10" y="38" width="202" height="80" rx="8"/>
+      <text class="d-title" x="111" y="64" text-anchor="middle">Browser GUI</text>
+      <text class="d-mono" x="111" y="85" text-anchor="middle">hermes-gui</text>
+      <text class="d-note" x="111" y="104" text-anchor="middle">Dynamic Scenes page</text>
+
+      <rect class="d-box" x="236" y="38" width="202" height="80" rx="8"/>
+      <text class="d-title" x="337" y="64" text-anchor="middle">Headless CLI</text>
+      <text class="d-mono" x="337" y="85" text-anchor="middle">hermes-human-room</text>
+      <text class="d-note" x="337" y="104" text-anchor="middle">JSON configuration + flags</text>
+
+      <rect class="d-box" x="462" y="38" width="202" height="80" rx="8"/>
+      <text class="d-title" x="563" y="64" text-anchor="middle">Notebooks</text>
+      <text class="d-mono" x="563" y="85" text-anchor="middle">demo/*.ipynb</text>
+      <text class="d-note" x="563" y="104" text-anchor="middle">Python solver API</text>
+
+      <rect class="d-box" x="688" y="38" width="202" height="80" rx="8"/>
+      <text class="d-title" x="789" y="64" text-anchor="middle">Validation CLI</text>
+      <text class="d-mono" x="789" y="85" text-anchor="middle">python -m validation.cli</text>
+      <text class="d-note" x="789" y="104" text-anchor="middle">measured-data bundles</text>
+
+      <text class="d-tier" x="10" y="156">EXPERIMENT API</text>
+      <rect class="d-api" x="10" y="166" width="428" height="70" rx="8"/>
+      <text class="d-mono-lg" x="224" y="196" text-anchor="middle">run_human_room_experiment()</text>
+      <text class="d-note" x="224" y="219" text-anchor="middle">shared experiment implementation</text>
+
+      <rect class="d-skip" x="462" y="166" width="428" height="70" rx="8"/>
+      <text class="d-note" x="676" y="192" text-anchor="middle">Notebooks and validation</text>
+      <text class="d-note" x="676" y="208" text-anchor="middle">skip this layer and set</text>
+      <text class="d-note" x="676" y="224" text-anchor="middle">solver options themselves</text>
+
+      <text class="d-tier" x="10" y="284">SOLVER ENGINE</text>
+      <rect class="d-engine" x="10" y="294" width="880" height="64" rx="8"/>
+      <rect class="d-chip" x="30" y="310" width="410" height="32" rx="6"/>
+      <text class="d-mono" x="235" y="331" text-anchor="middle">MmWaveRadarSimulator(solver=…)</text>
+      <rect class="d-chip" x="460" y="310" width="410" height="32" rx="6"/>
+      <text class="d-mono" x="665" y="331" text-anchor="middle">run_calibrated_hybrid_po(…)</text>
+
+      <path class="d-line" d="M170 118 V163" marker-end="url(#ah)"/>
+      <path class="d-line" d="M337 118 V163" marker-end="url(#ah)"/>
+      <path class="d-line" d="M224 236 V306" marker-end="url(#ah)"/>
+      <path class="d-line direct" d="M563 118 V306" marker-end="url(#ah)"/>
+      <path class="d-line direct" d="M789 118 V306" marker-end="url(#ah)"/>
+    </svg>
+  </div>
+  <p class="small">The GUI has two more pages. <strong>Static Target</strong> uses the same experiment implementation as <code>simulate_static_target(settings)</code> to compare RT and PO on a plate, a trihedral corner or an uploaded mesh; it has no CLI. <strong>Bundle Comparison</strong> opens exported runs and measured bundles and runs no solver of its own unless you ask for a fresh simulation.</p>
+
+  <h3>Example configuration across interfaces</h3>
+  <p>These examples configure Hybrid PO and RT for the bundled walking motion from 3.00 s to 3.15 s, with 64 chirps per radar frame. The window contains three radar frames. Match the scene, human placement, radar configuration and solver settings across interfaces before comparing outputs; their defaults can differ (<a href="#defaults">default settings</a>).</p>
+
+  <div class="tabs" data-tabs>
+    <div class="tablist" role="tablist" aria-label="Entry point">
+      <button type="button" role="tab" id="tab-gui" aria-controls="panel-gui">GUI</button>
+      <button type="button" role="tab" id="tab-flags" aria-controls="panel-flags">CLI flags</button>
+      <button type="button" role="tab" id="tab-json" aria-controls="panel-json">JSON configuration</button>
+      <button type="button" role="tab" id="tab-py" aria-controls="panel-py">Python</button>
+    </div>
+    <div class="tabpanel" role="tabpanel" id="panel-gui" aria-labelledby="tab-gui">
+      <p class="panel-label">GUI</p>
+      <ol>
+        <li>Run <code>hermes-gui</code> and open <strong>Dynamic Scenes</strong>.</li>
+        <li>Open <strong>Settings › Radar configuration</strong>, set chirps per frame to 64, then <strong>Apply</strong>.</li>
+        <li>On <strong>Motion and scene</strong>, click <strong>Load default motion</strong>, then set <strong>Start [s]</strong> to 3.0 and <strong>End [s]</strong> to 3.15. The page reports 3 radar frames.</li>
+        <li>Select <strong>Hybrid PO</strong> and <strong>RT</strong>, then click <strong>Start</strong>.</li>
+        <li>When the run finishes, export the bundle ZIP.</li>
+      </ol>
+    </div>
+    <div class="tabpanel" role="tabpanel" id="panel-flags" aria-labelledby="tab-flags">
+      <p class="panel-label">CLI flags</p>
+      <div class="codeblock"><div class="codehead"><span>shell</span></div><pre><code>python tools/run_human_room.py \
+  --solvers hybrid_po rt \
+  --start-s 3.0 --end-s 3.15 --chirps 64 \
+  --output results/walk-3f.zip</code></pre></div>
+      <p class="small">Flags use GUI units. Antenna indices are zero-based, as in JSON. Paths are relative to your working directory.</p>
+    </div>
+    <div class="tabpanel" role="tabpanel" id="panel-json" aria-labelledby="tab-json">
+      <p class="panel-label">JSON configuration</p>
+      <div class="codeblock"><div class="codehead"><span>walk.json</span></div><pre><code>{
+  "schema_version": 3,
+  "solvers": ["hybrid_po", "rt"],
+  "motion_start_s": 3.0,
+  "motion_end_s": 3.15,
+  "num_chirps_per_frame": 64,
+  "output": "results/walk-3f.zip"
+}</code></pre></div>
+      <div class="codeblock"><div class="codehead"><span>shell</span></div><pre><code>python tools/run_human_room.py --config walk.json</code></pre></div>
+      <p class="small">Keys left out of a partial configuration take the GUI factory defaults. JSON uses SI units and zero-based antenna indices, and its paths are relative to the JSON file.</p>
+    </div>
+    <div class="tabpanel" role="tabpanel" id="panel-py" aria-labelledby="tab-py">
+      <p class="panel-label">Python</p>
+      <div class="codeblock"><div class="codehead"><span>python</span></div><pre><code>from dataclasses import replace
+from mmWaveRadar.experiments import (
+    HumanMotionSettings, HumanRoomSettings, HumanRoomSolverSettings,
+    RadarSettings, simulate_human_room,
+)
+
+settings = HumanRoomSettings(
+    motion=HumanMotionSettings(
+        human_motion="data/AMASS/walking_poses_cmu_105_02.npz",
+        smpl_model_dir="models/smpl_models",
+        motion_start_s=3.0,
+        motion_end_s=3.15,
+    ),
+    radar=RadarSettings(num_chirps_per_frame=64),
+)
+results = {
+    solver: simulate_human_room(replace(settings, solver=HumanRoomSolverSettings(solver=solver)))
+    for solver in ("hybrid_po", "rt")
+}</code></pre></div>
+      <p class="small">Grouped settings run one solver per call; use <code>replace</code> to change a group.</p>
+    </div>
+  </div>
+</section>
+
+<!-- ======================================================= -->
+<section id="choose">
+  <h2>Interface selection</h2>
+  <p class="section-lede">Choose an interface according to the task: interactive scene inspection, repeatable simulation, programmatic analysis or measurement validation.</p>
+  <div class="table-scroll">
+    <table>
+      <thead><tr><th>Task</th><th>Recommended interface</th><th>Command or API</th></tr></thead>
+      <tbody>
+        <tr><td>Inspect a scene, configure a simulation and view range and Doppler results</td><td>GUI · Dynamic Scenes</td><td><code>hermes-gui</code></td></tr>
+        <tr><td>Compare RT and PO on a plate, corner reflector or single mesh, with path and facet overlays</td><td>GUI · Static Target</td><td><code>hermes-gui</code></td></tr>
+        <tr><td>Run multi-frame simulations or parameter sweeps with saved configurations</td><td>Headless CLI</td><td><code>python tools/run_human_room.py --dry-run</code></td></tr>
+        <tr><td>Run scene-level experiments and analyse results in Python</td><td>Experiment API</td><td><code>simulate_human_room(settings)</code></td></tr>
+        <tr><td>Customize radar placement, materials, targets and hybrid components</td><td>Solver API, as in the notebooks</td><td><a href="../../demo/Hybrid-PO.ipynb"><code>demo/*.ipynb</code></a></td></tr>
+        <tr><td>Evaluate FMCW synthesis, DSP and virtual-array geometry without a scene</td><td>Point-target notebook</td><td><a href="../../demo/Point-Targets.ipynb"><code>demo/Point-Targets.ipynb</code></a></td></tr>
+        <tr><td>Compare simulated with measured ADC from a real radar</td><td>Validation CLI</td><td><code>python -m validation.cli</code></td></tr>
+        <tr><td>Reopen a saved run or measured bundle</td><td>GUI · Bundle Comparison</td><td><code>hermes-gui --bundle run.zip</code></td></tr>
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<!-- ======================================================= -->
+<section id="solvers">
+  <h2>Simulation solvers</h2>
+  <p class="section-lede">HERMES provides ray tracing (<code>rt</code>), physical optics (<code>po</code>) and hybrid physical optics (<code>hybrid_po</code>). The solvers use a common ADC cube layout, <code>[frames, chirps, ADC samples, virtual channels]</code>, and support the same downstream DSP operations.</p>
+
+  <div class="solver-grid">
+    <article class="solver">
+      <h3>RT <span class="tag rt">rt</span></h3>
+      <p>Ray tracing (Sionna RT) of the whole scene with the human mesh in it. The scene is retraced at the start of every <code>rt_refresh_frames</code> radar frames; in between, each traced path follows the moving mesh and its geometry and phase are updated chirp by chirp. <code>rt_refresh_frames=0</code> retraces every chirp.</p>
+      <dl>
+        <dt>Models</dt><dd>Room, human, every multipath up to the depth limit</dd>
+        <dt>Cost</dt><dd>One trace per refresh; with <code>0</code>, one per chirp</dd>
+        <dt>Use for</dt><dd>Full-scene references; <code>0</code> for short windows</dd>
+        <dt>Settings</dt><dd><code>rt_*</code>: rays, path cap, max depth, human bounces, refresh and visibility cadence, human diffuse coefficient</dd>
+      </dl>
+    </article>
+    <article class="solver">
+      <h3>PO <span class="tag po">po</span></h3>
+      <p>Physical optics on the human mesh alone. Walls, furniture, multipath and human–room coupling are left out. Exact integration runs every <code>po_refresh_frames</code> frames; in between, phase, delay and spreading follow the motion.</p>
+      <dl>
+        <dt>Models</dt><dd>Direct radar–body–radar return, facet by facet, with self-shadowing</dd>
+        <dt>Cost</dt><dd>Lowest of the human models</dd>
+        <dt>Use for</dt><dd>Isolating the body signature, micro-Doppler studies</dd>
+        <dt>Settings</dt><dd><code>po_*</code>: integration mode, phase span, curvature tolerance, subdivision limits, refresh and visibility cadence</dd>
+      </dl>
+    </article>
+    <article class="solver">
+      <h3>Hybrid PO <span class="tag rt">rt</span><span class="tag po">po</span></h3>
+      <p>RT for the static room and PO for the moving human. Room paths are always blocked by the body, and up to four image-source reflectors couple the human with the room.</p>
+      <div class="formula">total = H_direct + E_static + H_env + E_human</div>
+      <dl>
+        <dt>Components</dt><dd><code>human_po</code>, <code>static_environment_blocked</code>, <code>human_env</code>, <code>env_human</code></dd>
+        <dt>Use for</dt><dd>Indoor scenes requiring both body returns and environment coupling</dd>
+        <dt>Settings</dt><dd>The <code>rt_*</code> settings for the room and blocking, the <code>po_*</code> settings for the body and coupling, and <code>hybrid_*</code>: coupling on/off, reflector cutoff and count, calibration</dd>
+      </dl>
+    </article>
+    <article class="solver">
+      <h3>Common solver settings</h3>
+      <p>Unprefixed settings apply to every solver.</p>
+      <dl>
+        <dt><code>tx_schedule</code></dt><dd><code>simultaneous</code> (simultaneous transmission) or <code>tdm</code> (time-division transmission)</dd>
+        <dt><code>array_model</code></dt><dd><code>phase_center</code>: solve once at the Tx and Rx array centers and add per-channel phase. <code>subarray</code>: solve once per pair of a Tx group and an Rx group, at the centers of the two groups.</dd>
+        <dt><code>array_tx_groups</code>, <code>array_rx_groups</code></dt><dd>Groups of zero-based antenna indices for <code>subarray</code>, numbered like <code>selected_tx_indices</code>; every active antenna in exactly one group. Empty means one group. One antenna per group is element-wise. Group antennas by spatial proximity; antenna index order does not always correspond to physical position.</dd>
+        <dt>Warning</dt><dd><code>PhaseCenterApproximationWarning</code> when the aperture or a group is too large for the target range. The warning provides a suggested group count.</dd>
+      </dl>
+    </article>
+  </div>
+  <p class="small">Hybrid PO calibrates by averaging single-human-only RT and human-only PO ADC powers over every chirp, virtual channel and ADC sample of the first simulated radar frame (<code>hybrid_calibration="rt_first_pose"</code>) in each interface. It fits one amplitude gain, <code>sqrt(P_rt_human / P_po_human)</code>, and reuses it for all frames and chirps of direct-human PO and both coupling orders; static-environment RT is unchanged. Set it to <code>none</code> for absolute PO amplitudes, which then do not depend on the ray budget, or to <code>rt_sequence</code> to fit over the whole window.</p>
+
+  <h3>Solver update intervals</h3>
+  <p>Cadences are counted in whole radar frames, because range–Doppler maps are formed per frame, and every update happens at a frame start. <code>0</code> means every chirp.</p>
+  <div class="table-scroll">
+    <table>
+      <thead><tr><th>Setting</th><th>What happens at the cadence</th><th>Between updates</th><th>Default</th></tr></thead>
+      <tbody>
+        <tr><td><code>rt_refresh_frames</code></td><td>Full ray trace</td><td>Traced paths follow the moving mesh with coherent phase and delay updates</td><td class="num">1</td></tr>
+        <tr><td><code>rt_visibility_refresh_frames</code>, <code>rt_visibility_fade_frames</code></td><td>Known paths are re-tested for blocking by the body; blocked paths fade out over the fade length. Hybrid PO room blocking uses the same cadence.</td><td>Blocking state is held</td><td class="num">1, 0</td></tr>
+        <tr><td><code>po_refresh_frames</code></td><td>Exact PO integration of every facet. Hybrid PO coupling uses the same cadence.</td><td>Phase, delay and spreading follow the motion</td><td class="num">1</td></tr>
+        <tr><td><code>po_visibility_refresh_frames</code>, <code>po_visibility_fade_frames</code></td><td>Facet self-occlusion is recomputed and faded</td><td>Facet visibility is held</td><td class="num">1, 0</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p>Motion-dependent thresholds can trigger additional updates between scheduled refreshes. These updates supplement the frame schedule without replacing or resetting it.</p>
+  <div class="table-scroll">
+    <table>
+      <thead><tr><th>Trigger</th><th>Fires when</th><th>Default</th><th>Where to set it</th></tr></thead>
+      <tbody>
+        <tr><td><code>po_refresh_on_phase_error_rad</code></td><td>A facet's neglected phase change since its last exact solve, <code>k × max|ΔL(vertex) − ΔL(centre)|</code>, exceeds the threshold; that facet alone is re-integrated. <code>L</code> is the Tx–point–Rx path length; coupling uses its image-source Tx/Rx positions.</td><td class="num">0.1 rad</td><td>GUI, CLI, JSON, validation, Python</td></tr>
+        <tr><td><code>po_refresh_on_area_fraction</code></td><td>A facet's relative area change since its last exact solve exceeds the threshold.</td><td class="num">0.30</td><td>GUI, CLI, JSON, Python</td></tr>
+        <tr><td><code>po_refresh_on_normal_deg</code></td><td>A facet's normal changes by more than the threshold angle since its last exact solve.</td><td class="num">20°</td><td>GUI, CLI, JSON, Python</td></tr>
+        <tr><td><code>rt_refresh_on_displacement</code></td><td>Any vertex has moved more than this many <strong>metres</strong> since the last trace; the whole scene is retraced.</td><td>off</td><td>Python only</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p>Measured on the tutorial walk (4 radar frames from 3.0 s, compared with an exact solve or retrace at every chirp):</p>
+  <ul>
+    <li><strong>PO accuracy in the evaluated window.</strong> The one-frame default is within 0.3% of exact PO at every chirp. Refreshing only every 4 frames is within 0.4% with the default 0.1 rad trigger, 0.2% at 0.03 rad, and 5% at 0.5 rad. It saves little time, because the trigger re-integrates about as many facets as the frame refresh would. The trigger does not cover visibility changes, which follow <code>po_visibility_refresh_frames</code>, so check long cadences on scenes where the body turns away from or towards the radar.</li>
+    <li><strong>RT path coverage between retraces.</strong> Between retraces the path bank only updates the paths it has; a path that appears in between is missed until the next retrace. With specular paths only, retracing once per frame differs from retracing every chirp by 12–26% per frame, and retracing every 4 frames by up to 100% in one frame. A 5 mm displacement trigger fires at every frame start in this walk, so it recovers the once-per-frame result at the same cost. Keep <code>rt_refresh_frames=1</code> unless you check longer cadences against retracing at every chirp.</li>
+    <li><strong>Diffuse RT sampling variability.</strong> With diffuse scattering on (the GUI and CLI default), changing only the RT seed changes the RT ADC by about 100% at 100 000 rays per source, so compare RT cadences, or RT runs in general, with specular paths only or with far more rays.</li>
+  </ul>
+</section>
+
+<!-- ======================================================= -->
+<section id="names">
+  <h2>Solver and parameter terminology</h2>
+  <p class="section-lede">Solver identifiers and parameter names are consistent across the GUI, CLI, JSON configurations, Python APIs, validation tools and exported bundles. Prefixes indicate the solver components to which a parameter applies.</p>
+  <div class="table-scroll">
+    <table>
+      <thead><tr><th>Prefix</th><th>Read by</th><th>Examples</th></tr></thead>
+      <tbody>
+        <tr><td>none</td><td>Every solver</td><td><code>array_model</code>, <code>tx_schedule</code></td></tr>
+        <tr><td><code>rt_</code></td><td>Wherever RT runs: the RT solver and the Hybrid PO room</td><td><code>rt_max_depth</code>, <code>rt_refresh_frames</code>, <code>rt_human_bounces</code></td></tr>
+        <tr><td><code>po_</code></td><td>Wherever PO runs: the PO solver and the Hybrid PO body and coupling</td><td><code>po_integration_mode</code>, <code>po_refresh_frames</code></td></tr>
+        <tr><td><code>hybrid_</code></td><td>Hybrid PO only</td><td><code>hybrid_coupling</code>, <code>hybrid_calibration</code></td></tr>
+      </tbody>
+    </table>
+  </div>
+  <div class="table-scroll">
+    <table>
+      <thead><tr><th>Solver</th><th>GUI checkbox</th><th>CLI and JSON</th><th>Python</th><th>Validation</th><th>Manifest</th></tr></thead>
+      <tbody>
+        <tr><td><span class="tag rt">rt</span> RT</td><td>RT</td><td rowspan="3"><code>--solvers</code><br><code>"solvers": [...]</code></td><td rowspan="3" class="wrap-code"><code>MmWaveRadarSimulator(solver=…)</code><br><code>run_human_room_experiment(solver=…)</code></td><td rowspan="3"><code>--solvers</code></td><td rowspan="3"><code>solver.solvers</code></td></tr>
+        <tr><td><span class="tag po">po</span> PO</td><td>PO</td></tr>
+        <tr><td><span class="tag rt">rt</span><span class="tag po">po</span> Hybrid PO</td><td>Hybrid PO</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p>CLI flags are the setting name with dashes: <code>rt_refresh_frames</code> is <code>--rt-refresh-frames</code>, and a boolean such as <code>hybrid_coupling</code> has <code>--hybrid-coupling</code> and <code>--no-hybrid-coupling</code>. Flags that carry GUI units, such as <code>--carrier-ghz</code>, keep their unit names.</p>
+
+  <h3>Deprecated names and migration</h3>
+  <p>Deprecated solver names and options are rejected with messages identifying their replacements. Use the following mappings to update existing scripts and configuration files.</p>
+  <div class="table-scroll">
+    <table>
+      <thead><tr><th>Deprecated name</th><th>Current setting</th></tr></thead>
+      <tbody>
+        <tr><td><code>full_rt</code>, <code>rt_retrace</code></td><td><code>rt</code> with <code>rt_refresh_frames=0</code></td></tr>
+        <tr><td><code>coherent_rt</code>, <code>rt_coherent_bank</code></td><td><code>rt</code> with <code>rt_refresh_frames=1</code></td></tr>
+        <tr><td><code>human_only_po</code>, <code>target_po</code></td><td><code>po</code></td></tr>
+        <tr><td><code>hybrid_static_env_po</code>, <code>hybrid_rt_po</code></td><td><code>hybrid_po</code></td></tr>
+        <tr><td><code>mobility_mode</code>, <code>simulation_mode(s)</code>, <code>--modes</code>, <code>--mobility-mode</code></td><td><code>solver</code>, <code>solvers</code>, <code>--solvers</code></td></tr>
+        <tr><td><code>array_model="element"</code></td><td><code>array_model="subarray"</code> with one antenna per group</td></tr>
+        <tr><td><code>tdm_enabled</code>, <code>--tdm</code></td><td><code>tx_schedule</code>, <code>--tx-schedule</code> (bundles with <code>tdm_enabled</code> still load)</td></tr>
+        <tr><td>One-based <code>--tx</code>, <code>--rx</code>, <code>--subarray-tx</code>, <code>--subarray-rx</code>, <code>subarray_tx_indices</code></td><td>Zero-based <code>--tx-indices</code>, <code>--rx-indices</code>, <code>selected_tx_indices</code>: subtract 1</td></tr>
+        <tr><td><code>coupling_mode</code></td><td><code>rt_human_bounces</code> (<code>single</code> or <code>any</code>)</td></tr>
+        <tr><td><code>coupling_enabled</code>, <code>coupling_power_threshold_db</code>, <code>coupling_max_reflectors</code></td><td><code>hybrid_coupling</code>, <code>hybrid_reflector_cutoff_db</code>, <code>hybrid_max_reflectors</code></td></tr>
+        <tr><td><code>periodic_retrace…</code>, <code>retrace_once_per_frame</code></td><td><code>rt_refresh_frames</code></td></tr>
+        <tr><td><code>incremental_update</code>, <code>incremental_…_chirps</code>, <code>visibility_fade_chirps</code></td><td><code>po_refresh_frames</code>, <code>po_visibility_refresh_frames</code>, <code>po_visibility_fade_frames</code></td></tr>
+        <tr><td><code>po_refresh_on_centroid_m</code>, <code>incremental_centroid_displacement_threshold_m</code></td><td><code>po_refresh_on_phase_error_rad</code></td></tr>
+        <tr><td><code>incremental_normal_threshold_deg</code></td><td><code>po_refresh_on_normal_deg</code> (default 20°)</td></tr>
+        <tr><td><code>incremental_area_relative_threshold</code></td><td><code>po_refresh_on_area_fraction</code> (default 0.30)</td></tr>
+        <tr><td><code>retrace_displacement_fraction</code> (wavelengths)</td><td><code>rt_refresh_on_displacement</code> (<strong>metres</strong>)</td></tr>
+        <tr><td><code>diffuse_reflection_coefficient</code>, <code>--human-diffuse</code></td><td><code>rt_human_diffuse_coefficient</code></td></tr>
+        <tr><td><code>HumanPOMobilityConfig</code>, <code>HybridStaticEnvPOConfig</code></td><td><code>POConfig</code>, <code>HybridPOConfig</code></td></tr>
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<!-- ======================================================= -->
+<section id="install">
+  <h2>Installation and prerequisites</h2>
+  <p class="section-lede">The examples below use a source checkout with the GUI, notebook, SMPL and test dependencies installed in one Python environment.</p>
+  <div class="codeblock"><div class="codehead"><span>shell</span></div><pre><code>git clone https://github.com/wisermaclab/hermes.git
+cd hermes
+python -m venv .venv &amp;&amp; source .venv/bin/activate
+python -m pip install -U pip
+python -m pip install -e ".[gui,notebook,smpl,test]"
+hermes-gui --self-check   <span class="c"># reports optional packages and source fixtures</span></code></pre></div>
+
+  <div class="table-scroll">
+    <table>
+      <thead><tr><th>Entry point</th><th>Package extras</th><th>Also needs</th></tr></thead>
+      <tbody>
+        <tr><td>Browser GUI</td><td><code>[gui]</code>, plus <code>[smpl]</code> for pose archives</td><td>A licensed SMPL model for AMASS-like motion</td></tr>
+        <tr><td>Headless CLI</td><td>core, plus <code>[smpl]</code> for pose archives</td><td>As the GUI</td></tr>
+        <tr><td>Notebooks</td><td><code>[notebook,smpl]</code></td><td>A source checkout and a licensed SMPL model. Point-Targets needs neither.</td></tr>
+        <tr><td>Validation CLI</td><td>core, plus <code>[smpl]</code> for bundle motion</td><td>A prepared bundle; see the <a href="../../validation/README.md">validation guide</a></td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>SMPL model and data paths</h3>
+  <p>HERMES ships no body model. Download SMPL files from the <a href="https://smpl.is.tue.mpg.de/">official provider</a> and place them in <code>models/smpl_models/smpl/SMPL_{FEMALE,MALE,NEUTRAL}.pkl</code>, or point an environment variable at them. Evaluated mesh archives, with <code>vertices</code>, <code>faces</code> and <code>times</code> arrays, need no body model in the GUI or CLI.</p>
+  <div class="table-scroll">
+    <table>
+      <thead><tr><th>Variable</th><th>Meaning</th><th>Read by</th></tr></thead>
+      <tbody>
+        <tr><td><code>MMWAVE_SMPL_MODEL_DIR</code></td><td>Licensed SMPL-family model directory</td><td>GUI, CLI defaults, notebooks</td></tr>
+        <tr><td><code>MMWAVE_AMASS_NPZ</code></td><td>One motion archive</td><td>Notebooks</td></tr>
+        <tr><td><code>MMWAVE_DATASET_ROOT</code></td><td>Root holding <code>AMASS/…</code></td><td>Notebooks</td></tr>
+        <tr><td><code>MMWAVE_TI_PATTERN_NPZ</code></td><td>Optional digitized TI antenna patterns</td><td>Any run that selects the <code>digitized</code> pattern</td></tr>
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<!-- ======================================================= -->
+<section id="gui">
+  <h2>GUI simulation workflow</h2>
+  <p class="section-lede">The browser GUI supports scene preview, radar and solver configuration, simulation, and result inspection. Settings are stored in the browser; export a bundle to preserve the inputs and outputs of a completed run.</p>
+
+  <ol class="steps">
+    <li><strong>Launch the GUI.</strong>
+      The launcher binds to <code>127.0.0.1:5006</code>, opens a browser tab and prints a per-launch password in the terminal.
+      <div class="codeblock"><div class="codehead"><span>shell</span></div><pre><code>hermes-gui                 <span class="c"># --port 5007, --no-browser, --bundle run.zip</span></code></pre></div>
+    </li>
+    <li><strong>Configure the radar and solvers in Settings.</strong>
+      Settings has three tabs. <em>Radar configuration</em> covers the TI board, active Tx/Rx, the Tx schedule, FMCW waveform and antenna pattern. <em>Solver settings</em> has six groups: MIMO array, Physical optics, PO temporal cadence, Ray tracing, RT temporal cadence, and Hybrid PO (coupling, calibration and image-source reflectors). <em>Motion coordinates</em> maps the source file's axes and units. Edits are staged until <strong>Apply</strong>; <strong>Apply &amp; rerun this page</strong> also starts the run.
+    </li>
+    <li><strong>Set up the scene on Dynamic Scenes › Motion and scene.</strong>
+      Click <strong>Load default motion</strong> for the bundled walk, or upload a motion NPZ. The default environment is <strong>Empty room</strong>; upload your own XML through <strong>Static environment scene (.xml, optional)</strong> (<a href="#scene">scene-file examples</a>). Set human position, yaw, radar orientation and <em>Diffuse (RT)</em>. Then choose the motion window with <strong>Start [s]</strong> and <strong>End [s]</strong>, in seconds after the motion's first pose. The page shows how many radar frames fit in the window.
+    </li>
+    <li><strong>Select solvers and start the simulation.</strong>
+      Select any combination of RT, PO and Hybrid PO, then click <strong>Start</strong>. <strong>Stop</strong> cancels at the next safe point between solver steps.
+    </li>
+    <li><strong>Inspect the results.</strong>
+      Range profile, range–time and range–Doppler pages show all selected solvers together. Hybrid PO adds a shared-scale plot of its four components. Run metadata lists runtime, path and facet counts, and the slowest stages. Per-frame RT path and PO facet overlays are available on request.
+    </li>
+    <li><strong>Export the simulation bundle.</strong>
+      The export is a HERMES bundle ZIP with each solver's ADC as <code>simulated_adc_&lt;solver&gt;.npz</code>, sensor and frame metadata, scene inputs and an <code>experiment_manifest_&lt;solver&gt;.json</code> for each solver. Reopen it with <code>hermes-gui --bundle run.zip</code>.
+    </li>
+  </ol>
+
+  <div class="callout">
+    <h4>GUI parameter coverage</h4>
+    <p>PO visibility sampling and refresh thresholds are configurable under Settings → Solver settings. The GUI selects the compute backend automatically; use CLI <code>--backend</code> or Python <code>compute_backend</code> to select it explicitly. The optional RT displacement trigger is available through the Python solver API.</p>
+  </div>
+  <p class="small">If you change a setting after a run, the plots stay up with a banner naming the change, and a dot marks the tab as stale. Exports are disabled until you rerun or revert.</p>
+</section>
+
+<!-- ======================================================= -->
+<section id="scene">
+  <h2>Scene configuration</h2>
+  <p class="section-lede">The scene XML describes the static environment: floor, walls, other fixed geometry and their radio materials. Supply the human motion or target mesh separately.</p>
+
+  <h3>GUI scene selection</h3>
+  <p>Open <strong>Dynamic Scenes → Motion and scene</strong> in the left controls, then choose an XML file with <strong>Static environment scene (.xml, optional)</strong>. An uploaded XML takes precedence over <strong>Prepared scene fallback</strong>. Clear the upload to use that preset again. Scene uploads are available for locally bound GUI sessions.</p>
+  <p>Without an upload, the GUI starts with <strong>Empty room</strong>: no furniture, a metal floor and plasterboard walls. The radar is at <code>(0, 0, 0)</code> m and the floor surface is at <code>z = −1.035</code> m, so the radar is 1035 mm above it. The standalone version is <a href="../../data/scenes/empty_room.xml"><code>data/scenes/empty_room.xml</code></a> (under <code>public/</code> in the full workspace). Upload an edited copy to use your changes. Editing the standalone XML does not change the built-in preset, which is generated from <code>tutorial_support.py</code>; changes to that Python module require restarting the GUI.</p>
+  <p>For motion that already contains the subject's measured position, choose <strong>Human placement → Use motion-file coordinates</strong>. Coordinates are converted according to Settings → Motion coordinates. Choose <strong>Place manually</strong> to position the first pose's bounding-box centre yourself.</p>
+
+  <h3>CLI and JSON scene configuration</h3>
+  <p>Use <code>--scene</code> on the headless runner, or <code>scene_xml</code> in its JSON. For example, simulate an evaluated human mesh in the standalone empty room from the package checkout root:</p>
+  <div class="codeblock"><div class="codehead"><span>shell</span></div><pre><code>hermes-human-room \
+  --motion /path/to/human_motion.npz \
+  --scene data/scenes/empty_room.xml \
+  --position 2.0 0.0 0.0 \
+  --solvers po hybrid_po \
+  --output /path/to/results/human-room.zip</code></pre></div>
+  <p>A partial run config can specify the same scene and place the first pose's bounding-box centre at <code>(2, 0, 0)</code> m:</p>
+  <div class="codeblock"><div class="codehead"><span>run.json · simulation configuration</span></div><pre><code>{
+  "schema_version": 3,
+  "human_motion": "/path/to/human_motion.npz",
+  "scene_xml": "/path/to/empty_room.xml",
+  "human_position_m": [2.0, 0.0, 0.0],
+  "solvers": ["po", "hybrid_po"],
+  "output": "/path/to/results/human-room.zip"
+}</code></pre></div>
+  <div class="codeblock"><div class="codehead"><span>shell</span></div><pre><code>hermes-human-room --config /path/to/run.json</code></pre></div>
+  <p>To select the built-in empty room instead of an XML, set <code>"room_preset": "empty_room"</code> and <code>"scene_xml": null</code>, or use <code>--room-preset empty_room</code> with no scene override. Keep scene and motion in the same world frame: metres, +X forward, +Y left and +Z up for an unrotated radar.</p>
+
+  <div class="callout key">
+    <h4>Scene keys by configuration type</h4>
+    <p>A simulation <code>run.json</code> uses <code>scene_xml</code>. A measurement <code>prepare.json</code> uses <code>scene</code>. Both command-line tools accept <code>--scene</code>. Paths in JSON are relative to the JSON file; paths passed as flags are relative to the working directory.</p>
+  </div>
+</section>
+
+<!-- ======================================================= -->
+<section id="cli">
+  <h2>Command-line simulation</h2>
+  <p class="section-lede">The headless runner executes the Dynamic Scenes experiment workflow and exports a bundle ZIP. Use JSON configuration files and command-line overrides for repeatable runs and parameter sweeps.</p>
+
+  <h3>Command entry points</h3>
+  <div class="table-scroll">
+    <table>
+      <thead><tr><th>Command</th><th>Default configuration without <code>--config</code></th></tr></thead>
+      <tbody>
+        <tr><td><code>python tools/run_human_room.py</code></td><td>Reads the checked-in <a href="../../configs/human_room.json"><code>configs/human_room.json</code></a>. Source checkout only.</td></tr>
+        <tr><td><code>hermes-human-room</code></td><td>Uses GUI factory defaults. Installed entry point.</td></tr>
+        <tr><td><code>python -m mmWaveRadar.gui.scene_cli</code></td><td>Same as <code>hermes-human-room</code></td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p>These commands use the same runner. Their initial configurations differ, which affects board-dependent waveform values and antenna selection. Inspect the resolved configuration before execution (<a href="#pitfalls">configuration considerations</a>).</p>
+
+  <h3>Configuration and execution</h3>
+  <ol class="steps">
+    <li><strong>Inspect the resolved configuration.</strong>
+      <div class="codeblock"><div class="codehead"><span>shell</span></div><pre><code>python tools/run_human_room.py --dry-run</code></pre></div>
+    </li>
+    <li><strong>Save the resolved configuration.</strong>
+      <div class="codeblock"><div class="codehead"><span>shell</span></div><pre><code>python tools/run_human_room.py --dry-run --write-config my-run.json</code></pre></div>
+      The saved configuration contains absolute paths. Review these paths before sharing the file or adding it to version control.
+    </li>
+    <li><strong>Edit the configuration and execute the simulation.</strong>
+      <div class="codeblock"><div class="codehead"><span>shell</span></div><pre><code>python tools/run_human_room.py --config my-run.json</code></pre></div>
+    </li>
+    <li><strong>Apply command-line overrides</strong> for parameter sweeps.
+      <div class="codeblock"><div class="codehead"><span>shell</span></div><pre><code>for depth in 1 2 3 4; do
+  python tools/run_human_room.py --config my-run.json \
+    --solvers rt --rt-max-depth "$depth" \
+    --output "results/depth-$depth.zip"
+done</code></pre></div>
+    </li>
+  </ol>
+
+  <div class="callout key">
+    <span class="label">Precedence</span>
+    <p>GUI factory defaults → the selected JSON file → command-line flags. Each layer overrides values from the preceding layer. Run <code>--dry-run</code> to see the result.</p>
+  </div>
+
+  <h3>JSON and command-line conventions</h3>
+  <div class="table-scroll">
+    <table>
+      <thead><tr><th></th><th>JSON configuration</th><th>Command-line flags</th></tr></thead>
+      <tbody>
+        <tr><td>Units</td><td>SI: Hz, Hz/s, s</td><td>GUI units: GHz, MHz/µs, µs, MS/s, MHz, ms</td></tr>
+        <tr><td>Tx/Rx antennas</td><td><code>"selected_tx_indices": [0, 2]</code></td><td><code>--tx-indices 0 2</code> (both zero-based)</td></tr>
+        <tr><td>Relative paths</td><td>Relative to the JSON file</td><td>Relative to the working directory</td></tr>
+        <tr><td>Motion window</td><td><code>motion_start_s</code>, plus <code>motion_end_s</code> or <code>num_frames</code></td><td><code>--start-s</code>, plus <code>--end-s</code> or <code>--num-frames</code></td></tr>
+        <tr><td>Solver settings</td><td><code>"rt_refresh_frames": 0</code></td><td>The key with dashes: <code>--rt-refresh-frames 0</code></td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>Command examples</h3>
+  <div class="codeblock"><div class="codehead"><span>shell</span></div><pre><code><span class="c"># All three solvers on five frames, one bundle</span>
+python tools/run_human_room.py --solvers rt po hybrid_po \
+  --num-frames 5 --output results/all-solvers.zip
+
+<span class="c"># Reference cadence: retrace RT and integrate PO exactly at every chirp</span>
+python tools/run_human_room.py --solvers rt po --rt-refresh-frames 0 --po-refresh-frames 0 \
+  --num-frames 2 --output results/every-chirp.zip
+
+<span class="c"># Hybrid PO without human–room coupling and with absolute PO amplitudes</span>
+python tools/run_human_room.py --solvers hybrid_po --no-hybrid-coupling \
+  --hybrid-calibration none --output results/no-coupling.zip
+
+<span class="c"># Midpoint-quadrature PO; the phase span follows the mode (1 rad) unless you set it</span>
+python tools/run_human_room.py --solvers po \
+  --po-integration-mode parent_face_quadrature --output results/quadrature.zip
+
+<span class="c"># Transmitters taking turns (TDM-MIMO)</span>
+python tools/run_human_room.py --tx-schedule tdm --output results/tdm.zip
+
+<span class="c"># Your own room, human 2 m ahead and 0.5 m to the left, facing the radar</span>
+python tools/run_human_room.py --scene rooms/office.xml \
+  --position 2.0 0.5 0.0 --yaw 180 --output results/office.zip
+
+<span class="c"># Another board: start from GUI defaults so carrier and antennas follow the board</span>
+hermes-human-room --board MMWCAS_RF_EVM --output results/cascade.zip</code></pre></div>
+  <p class="small">The radar phase center is fixed at <code>(0, 0, 0)</code> with +X forward, +Y left and +Z up. The GUI's empty-room preset places the floor 1.035 m below the radar; the furnished tutorial bedroom uses 1.0 m. <code>--position</code> places the centre of the first frame's mesh bounding box. <code>--help</code> lists every override.</p>
+</section>
+
+<!-- ======================================================= -->
+<section id="python">
+  <h2>Python APIs and notebooks</h2>
+  <p class="section-lede">The experiment API provides grouped settings and processed results for scene-level simulations. The direct solver API provides control over scene construction, radar placement, targets and numerical settings, as demonstrated in the notebooks.</p>
+
+  <h3>Experiment API with grouped settings</h3>
+  <p>Use <code>simulate_human_room(settings)</code> or <code>simulate_static_target(settings)</code> for new Python code. Their settings declare motion or geometry, scene, radar and solver options separately. Matching those settings gives the same experiment results as the GUI or CLI.</p>
+  <div class="codeblock"><div class="codehead"><span>python · human motion in the empty room</span></div><pre><code>from dataclasses import replace
+from mmWaveRadar.experiments import (
+    HumanMotionSettings, HumanRoomSettings, HumanRoomSolverSettings,
+    RadarSettings, RoomSceneSettings, simulate_human_room,
+)
+
+settings = HumanRoomSettings(
+    motion=HumanMotionSettings(
+        human_motion="/path/to/human_motion.npz",
+        human_position_m=None,  <span class="c"># preserve motion-file coordinates</span>
+        motion_start_s=0.0,
+        num_frames=2,
+    ),
+    scene=RoomSceneSettings(room_preset="empty_room"),
+    radar=RadarSettings(num_chirps_per_frame=16),
+    solver=HumanRoomSolverSettings(solver="po"),
+)
+result = simulate_human_room(settings)
+next_settings = replace(settings, radar=replace(settings.radar, num_adc_samples=128))</code></pre></div>
+  <p>To load a custom room, use <code>RoomSceneSettings(scene_xml="/path/to/room.xml")</code>. Settings are frozen containers; <code>replace</code> creates a changed setup while retaining arrays and scene objects by reference.</p>
+  <div class="codeblock"><div class="codehead"><span>python · static metal plate</span></div><pre><code>from mmWaveRadar.experiments import (
+    StaticTargetGeometrySettings, StaticTargetSettings, simulate_static_target,
+)
+
+plate = StaticTargetSettings(
+    target=StaticTargetGeometrySettings(
+        target_type="plate", range_m=0.668, width_m=0.152, height_m=0.152,
+        material_name="pec",
+    ),
+)
+result = simulate_static_target(plate)</code></pre></div>
+  <p>This uses the perfect-conductor plate preset. A measurement bundle can supply numeric copper material parameters, as described in <a href="#prepare-bundle">bundle preparation</a>.</p>
+  <p>The flat keyword functions remain supported for compatibility. Their JSON keys and flags are listed in the <a href="#settings">settings reference</a>; grouped settings map to those keys through <code>settings.as_keywords()</code>.</p>
+  <details>
+  <summary>Compatibility example: load an existing CLI configuration in Python</summary>
+  <p>This handles paths and keys as the CLI does and calls its flat compatibility entry point.</p>
+  <div class="codeblock"><div class="codehead"><span>python · run a CLI config in a notebook</span></div><pre><code>import json
+from pathlib import Path
+
+from mmWaveRadar.experiments import run_human_room_experiment
+
+config_path = Path("configs/human_room.json").resolve()
+config = json.loads(config_path.read_text())
+
+<span class="c"># Paths in the JSON are relative to the JSON file, exactly as in the CLI.</span>
+for key in ("human_motion", "smpl_model_dir", "scene_xml"):
+    if config[key] is not None:
+        config[key] = str((config_path.parent / config[key]).resolve())
+
+<span class="c"># Run-control keys belong to the CLI, not to the experiment API.</span>
+solvers = config.pop("solvers")
+for key in ("schema_version", "output", "quiet", "force"):
+    config.pop(key)
+
+results = {
+    solver: run_human_room_experiment(**config, solver=solver)
+    for solver in solvers
+}</code></pre></div>
+  </details>
+  <p>Each result is a <code>HumanRoomResult</code>. The fields you will use most:</p>
+  <div class="table-scroll">
+    <table>
+      <thead><tr><th>Field</th><th>Contents</th></tr></thead>
+      <tbody>
+        <tr><td><code>adc</code></td><td>Complex ADC <code>[frames, chirps, samples, virtual channels]</code>. The default IWR6843AOPEVM gives <code>(1, 16, 225, 12)</code>.</td></tr>
+        <tr><td><code>components</code></td><td>Hybrid PO only: <code>human_po</code>, <code>static_environment_blocked</code>, <code>human_env</code>, <code>env_human</code></td></tr>
+        <tr><td><code>range_profiles</code>, <code>ranges_m</code></td><td>Mean range profile of the total and of each component</td></tr>
+        <tr><td><code>range_time_power</code>, <code>range_doppler_power</code>, <code>velocities_mps</code></td><td>The GUI's range–time and per-frame range–Doppler products</td></tr>
+        <tr><td><code>manifest</code></td><td>Reproducible record of scene, radar and solver parameters (<code>manifest.to_dict()</code>)</td></tr>
+        <tr><td><code>metadata</code>, <code>runtime_s</code></td><td>Solver events, path and facet counts, wall time</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>Direct solver API</h3>
+  <p>Direct solver calls accept an explicitly constructed scene, <code>RadarSensor</code> and <code>MeshTarget</code>. The notebooks demonstrate this workflow. The following example lists the solver settings used by the GUI experiment layer.</p>
+  <div class="codeblock"><div class="codehead"><span>python · direct solver configuration</span></div><pre><code>from mmWaveRadar.simulation import (
+    MmWaveRadarSimulator,
+    POConfig,
+    run_calibrated_hybrid_po,
+)
+
+<span class="c"># PO settings (GUI factory defaults); used by po and hybrid_po</span>
+po_config = POConfig(
+    po_refresh_frames=1,
+    po_visibility_refresh_frames=1,
+    po_visibility_fade_frames=0,
+    po_visibility_samples_per_face=1,
+    po_adaptive_visibility_sampling=True,
+    po_integration_mode="parent_face_adaptive_analytic",
+    po_quadrature_phase_span_scale_rad=6.0,
+    po_curvature_error_rad=0.005,
+    po_quadrature_max_refinement_depth=3,
+    po_quadrature_max_subfaces_per_parent=64,
+    compute_backend="auto",
+    compute_precision="float32",
+)
+
+<span class="c"># RT and compute settings (GUI factory defaults); used by rt and hybrid_po</span>
+rt_settings = dict(
+    rt_max_depth=3,
+    rt_samples_per_source=100_000,
+    rt_max_paths_per_source=5_000,
+    rt_human_bounces="single",
+    rt_visibility_refresh_frames=1,
+    rt_visibility_fade_frames=0,
+    rt_diffuse_reflection=True,
+    array_model="phase_center",
+    compute_backend="auto",
+    compute_precision="float32",
+    adc_compute_precision="float32",
+)
+
+<span class="c"># rt (rt_refresh_frames=0 retraces every chirp)</span>
+rt = MmWaveRadarSimulator(
+    solver="rt", rt_refresh_frames=1, rt_human_specular_reflection=True,
+    **rt_settings,
+)
+cube = rt.run(scene, radar, [target], num_frames=num_frames)
+
+<span class="c"># po</span>
+po = MmWaveRadarSimulator(solver="po", po_config=po_config, **rt_settings)
+
+<span class="c"># hybrid_po (a function, not a simulator object)</span>
+hybrid = run_calibrated_hybrid_po(
+    scene=scene, radar=radar, target=target, num_frames=num_frames,
+    calibration_frame_range=(0, 1),  <span class="c"># rt_first_pose fits the first frame</span>
+    hybrid_coupling=True,
+    hybrid_reflector_cutoff_db=-20.0,
+    hybrid_max_reflectors=4,
+    hybrid_calibration="rt_first_pose",
+    po_config=po_config,
+    progress=False, print_reflector_summary=False,
+    **rt_settings,
+)
+cube = hybrid.cube   <span class="c"># cube.adc, cube.components, cube.metadata</span></code></pre></div>
+
+  <h3>Notebook examples</h3>
+  <div class="table-scroll">
+    <table>
+      <thead><tr><th>Notebook</th><th>Solver calls</th><th>Settings it uses</th><th>SMPL model</th></tr></thead>
+      <tbody>
+        <tr><td><a href="../../demo/Point-Targets.ipynb">Point-Targets</a></td><td><code>synthesize_virtual_center_point_targets()</code></td><td>Analytic point targets, TI board virtual arrays, no scene</td><td>No</td></tr>
+        <tr><td><a href="../../demo/PO.ipynb">PO</a></td><td><code>solver="po"</code>, optional <code>solver="rt"</code> reference</td><td><code>po_refresh_frames</code> 0 vs 1, <code>face_centroid</code> vs <code>parent_face_far_field_analytic</code>; 1 virtual channel, 64 chirps</td><td>Yes</td></tr>
+        <tr><td><a href="../../demo/RT.ipynb">RT</a></td><td><code>solver="rt"</code> with <code>rt_refresh_frames</code> 0 (every chirp) and 1 at depth 1, 2, 4</td><td>Bedroom, 1 virtual channel, 80 000 rays and paths per source, <code>rt_human_bounces="any"</code></td><td>Yes</td></tr>
+        <tr><td><a href="../../demo/Hybrid-PO.ipynb">Hybrid-PO</a></td><td><code>run_calibrated_hybrid_po()</code></td><td>IWR6843AOPEVM, depth 2, 80 000 rays and paths, 4 visibility samples, ≤ 4 reflectors at −20 dB, <code>rt_first_pose</code> calibration</td><td>Yes</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p>Launch notebooks from the checkout root with <code>jupyter lab demo/Point-Targets.ipynb</code>. Each notebook finds <code>src/</code> by itself and keeps results in memory. Strip outputs before committing.</p>
+</section>
+
+<!-- ======================================================= -->
+<section id="prepare-bundle">
+  <h2>Measurement bundle preparation</h2>
+  <p class="section-lede">Bundle preparation packages decoded measurement data and its simulation inputs into a checked, self-contained ZIP. It does not run a simulation.</p>
+
+  <h3>Required inputs</h3>
+  <ul>
+    <li><strong>ADC:</strong> a pickle-free NPZ containing numeric <code>adc [F, M, N, C]</code>: frames, chirps per TX, samples and virtual channels. Optional <code>times [F, M]</code> stores chirp timestamps. Decode recorder formats such as KVNL before this step.</li>
+    <li><strong>Sensor:</strong> a <code>sensor.json</code> describing the actual board or array, channel order, active TX/RX, TX schedule and capture waveform. Use the <a href="examples/metal_plate_sensor.json">TI IWR6843AOP metal-plate sensor example</a> described below and the <a href="../../validation/BUNDLE_SPEC.md">bundle specification</a> for the fields. There is no universal default for measurement data; match the settings to your acquisition.</li>
+    <li><strong>Environment:</strong> your room XML. For the GUI's empty room, copy <a href="../../data/scenes/empty_room.xml"><code>data/scenes/empty_room.xml</code></a> beside the measurement inputs. Keep the human or plate out of this XML, since simulation inserts the separately supplied target.</li>
+    <li><strong>Human or target:</strong> an evaluated human motion NPZ with <code>vertices [T, V, 3]</code>, integer <code>faces [P, 3]</code> and <code>times [T]</code>, or a static target mesh with <code>vertices [V, 3]</code> and <code>faces [P, 3]</code>. Geometry must already be positioned in the scene's world coordinates, in metres.</li>
+  </ul>
+  <p>Instead of <code>--sensor sensor.json</code>, you can supply <code>--ti-config /path/to/radar.cfg --board-model IWR6843AOP</code> when your TI configuration uses the supported waveform commands. Inspect the imported waveform and channel mapping against the capture.</p>
+
+  <h3>TI IWR6843AOP sensor example: copper-plate experiment</h3>
+  <p>Save <a href="examples/metal_plate_sensor.json"><code>examples/metal_plate_sensor.json</code></a> as <code>sensor.json</code> beside your ADC. Its waveform values come from the copper-plate capture metadata, using the IWR6843AOP's three TX and four RX. The experiment used a 152 × 152 mm copper plate approximately 0.668 m from the radar; the plate geometry belongs in the target mesh, not in <code>sensor.json</code>.</p>
+  <div class="table-scroll">
+    <table>
+      <thead><tr><th>Setting</th><th>Value in the plate example</th></tr></thead>
+      <tbody>
+        <tr><td>Start frequency / ADC start delay</td><td>60 GHz / 7 µs</td></tr>
+        <tr><td>Carrier at first ADC sample</td><td>60.476 GHz; <code>carrier_reference = "first_adc_sample"</code></td></tr>
+        <tr><td>Chirp slope</td><td>68 MHz/µs (<code>68e12</code> Hz/s)</td></tr>
+        <tr><td>Sampling / ADC samples</td><td>4.5 MS/s / 225 complex I/Q samples</td></tr>
+        <tr><td>Ramp / idle / TX-slot interval</td><td>58 µs / 7 µs / 65 µs</td></tr>
+        <tr><td>Stored ADC shape</td><td><code>[1, 1, 225, 12]</code>: one observation, one chirp per TX, 12 TX/RX pairs</td></tr>
+        <tr><td>Channel order</td><td>TX-major: TX0/RX0–3, TX1/RX0–3, TX2/RX0–3 (zero-based)</td></tr>
+        <tr><td>TDM order / frame period</td><td><code>[0, 1, 2]</code> / 50 ms; acquisition assumptions retained in metadata</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p>The carrier is <code>60e9 + 68e12 × 7e−6 = 60.476e9</code> Hz. Use this first-sample frequency, rather than the sampled-sweep centre. The example retains source waveform fields such as ADC delay, receiver gain and TX settings. The converter preserves raw ADC and introduces no averaging.</p>
+  <p>The TX firing order, 50 ms frame period and I/Q/board-phase conventions remain assumptions for this capture, recorded in the example's <code>metadata</code>. Verify them for your acquisition. With that TDM order, the full TX cycle is <code>3 × 65 µs = 195 µs</code>. For a human capture or a different waveform, update the sample/chirp counts and timing to match its ADC; do not reuse the plate's singleton chirp count for a multi-chirp recording.</p>
+
+  <h3>Human motion in the empty room: direct arguments</h3>
+  <p>This example assumes regular 50 ms radar frames starting at <code>t = 0</code> on the motion archive's timeline. Replace those times with your capture's timing:</p>
+  <div class="codeblock"><div class="codehead"><span>shell</span></div><pre><code>mmwave-prepare-bundle \
+  --adc /path/to/capture/radar_adc.npz \
+  --sensor /path/to/capture/sensor.json \
+  --scene /path/to/capture/empty_room.xml \
+  --evaluated-mesh /path/to/capture/human_motion.npz \
+  --motion-coordinate-frame world \
+  --start-time-s 0 --frame-period-s 0.05 \
+  --output /path/to/capture/human-bundle.zip</code></pre></div>
+  <p>Preparation preserves the supplied human positions; it does not apply the GUI's manual placement or coordinate conversion. Explicit timing and <code>--motion-coordinate-frame world</code> are required whenever motion is supplied. For irregular frame starts, use <code>--frames /path/to/frames.json</code> or <code>--frame-times-s 0 0.05</code> instead of the start/period pair, with one time per ADC frame. Frame times must share the motion timeline, including epoch times when applicable. Motion must cover the last physical chirp, not just the last frame start.</p>
+
+  <h3>Preparation configuration: prepare.json</h3>
+  <p>Save this beside <code>radar_adc.npz</code>, <code>sensor.json</code>, <code>empty_room.xml</code> and <code>human_motion.npz</code>. All paths, including <code>output</code>, are relative to this configuration file. This is a preparation config, separate from the simulation <code>run.json</code> above:</p>
+  <div class="codeblock"><div class="codehead"><span>prepare.json · measurement packaging</span></div><pre><code>{
+  "schema_version": 1,
+  "origin": "measurement",
+  "adc": "radar_adc.npz",
+  "sensor": "sensor.json",
+  "scene": "empty_room.xml",
+  "evaluated_mesh": "human_motion.npz",
+  "motion_coordinate_frame": "world",
+  "start_time_s": 0.0,
+  "frame_period_s": 0.05,
+  "output": "human-bundle.zip"
+}</code></pre></div>
+  <div class="codeblock"><div class="codehead"><span>shell</span></div><pre><code>mmwave-prepare-bundle --config /path/to/capture/prepare.json</code></pre></div>
+  <p>For a metal plate, replace <code>evaluated_mesh</code> with <code>target_mesh</code>, remove <code>motion_coordinate_frame</code>, and optionally add <code>target_material</code> pointing to a RadioMaterial parameters JSON. The direct command is:</p>
+  <div class="codeblock"><div class="codehead"><span>shell</span></div><pre><code>mmwave-prepare-bundle \
+  --adc /path/to/capture/radar_adc.npz \
+  --sensor /path/to/capture/sensor.json \
+  --scene /path/to/capture/empty_room.xml \
+  --target-mesh /path/to/capture/plate.npz \
+  --target-material /path/to/capture/material.json \
+  --output /path/to/capture/plate-bundle.zip</code></pre></div>
+
+  <h3>Source-checkout launcher</h3>
+  <p>Without installing the package, run the source launcher from the repository root, using a Python environment that contains the HERMES dependencies:</p>
+  <div class="codeblock"><div class="codehead"><span>shell</span></div><pre><code>python tools/prepare_bundle.py \
+  --config /path/to/capture/prepare.json</code></pre></div>
+  <p>The launcher accepts the same direct arguments as <code>mmwave-prepare-bundle</code>, including <code>--scene</code>.</p>
+
+  <h3>Bundle validation and measurement comparison</h3>
+  <div class="codeblock"><div class="codehead"><span>shell</span></div><pre><code>mmwave-check-bundle /path/to/capture/human-bundle.zip --all-errors --json
+
+mmwave-validation-benchmark \
+  --clip /path/to/capture/human-bundle.zip \
+  --solvers po rt hybrid_po \
+  --out /path/to/capture/comparison --progress</code></pre></div>
+  <p>The ZIP contains ADC, sensor and frame metadata, the imported environment and its local assets, and the supplied target or motion. No original input paths are needed after preparation. Evaluated meshes need no licensed body model; parameterized motion supplied with <code>--motion-parameters</code> still requires an external SMPL model for re-simulation.</p>
+  <p>Existing output is retained unless you pass <code>--force</code>; an output path without <code>.zip</code> creates a bundle directory. See the <a href="../../tools/bundle_prepare/BRING_YOUR_OWN.md">measurement preparation guide</a> for timestamp tolerances, I/Q conventions, material inputs and source-checkout validation commands.</p>
+</section>
+
+<!-- ======================================================= -->
+<section id="validation">
+  <h2>Simulation validation</h2>
+  <p class="section-lede">Validation runs simulation against a bundle of measured ADC, radar configuration, frame timing and target geometry or body motion, and writes metrics and plots. <a href="#prepare-bundle">Prepare your measurement bundle</a> first; both ZIP files and bundle directories are accepted.</p>
+  <div class="codeblock"><div class="codehead"><span>shell</span></div><pre><code>mmwave-check-bundle /path/to/clip_bundle    <span class="c"># structure check, no simulation</span>
+
+python -m validation.cli \
+  --clip /path/to/clip_bundle \
+  --out /tmp/hermes_validation \
+  --suite dsp_maps \
+  --solvers po hybrid_po \
+  --progress</code></pre></div>
+  <ul>
+    <li><code>--solvers</code> takes the same names as everywhere else. The default is <code>po rt</code>.</li>
+    <li>Radar, waveform and timing come from the bundle. <code>--rt-refresh-frames</code>, <code>--po-refresh-on-phase-error-rad</code>, <code>--hybrid-calibration</code>, <code>--no-rt-diffuse-reflection</code>, <code>--rt-refraction</code> and <code>--rt-human-specular-reflection</code> set the solvers; other budgets stay at the simulator class defaults (see <a href="#defaults">defaults</a>).</li>
+    <li><code>--tx-indices</code> and <code>--rx-indices</code> take zero-based indices, with ranges such as <code>0-2,9</code>. Dataset and TI documents count antennas from 1, so their TX1 is index 0.</li>
+    <li>TDM bundles are simulated per Tx slot. <code>--ignore-tdm-timing</code> evaluates all selected Tx at the start of each cycle.</li>
+    <li>Pass <code>--simulated-adc file.npz</code> to score ADC you produced elsewhere, such as from a notebook, instead of simulating.</li>
+  </ul>
+  <p>The bundle format is specified in <a href="../../validation/BUNDLE_SPEC.md">BUNDLE_SPEC.md</a>. Dataset adapters live in <a href="../../tools/bundle_prepare/README.md"><code>tools/bundle_prepare/</code></a>.</p>
+</section>
+
+<!-- ======================================================= -->
+<section id="scientific-validation">
+  <h2>Scientific verification and release evidence</h2>
+  <p>Use separate evidence for numerical correctness, changes between releases and agreement with measurements. The <a href="../scientific_validation.md">scientific validation guide</a> provides commands for frozen-output regressions, PEC plate and sphere mesh convergence, plate/corner RT ray-density diagnostics, and copper-plate angular-response reports. RT and Hybrid PO reports average linear power over seeds and include confidence intervals.</p>
+  <p>The <a href="../../demo/mobicom/README.md">MobiCom PEC-plate demo</a> needs no measurement files or body model. Review <a href="../limitations.md">solver limitations</a> and the <a href="../stability.md">API/schema stability and citation policy</a> before interpreting results. Generated reference arrays are not stored in Git; each release distributes them in its evidence archive.</p>
+</section>
+
+<section id="settings">
+  <h2>Configuration reference</h2>
+  <p class="section-lede">The table maps parameters to GUI controls, flat JSON/Python names and CLI flags. Filled circles identify the solvers affected by each parameter. Grouped Python settings expose these parameters through their corresponding settings objects.</p>
+  <div class="table-scroll">
+    <table>
+      <thead>
+        <tr><th>Setting</th><th>GUI location</th><th>JSON key and Python keyword</th><th>CLI flag</th><th class="dot">RT</th><th class="dot">PO</th><th class="dot">Hybrid<br>PO</th></tr>
+      </thead>
+      <tbody>
+        <tr class="group-row"><td colspan="7">Radar and waveform</td></tr>
+        <tr><td>TI board</td><td>Settings › Radar</td><td><code>board_model</code></td><td><code>--board</code></td><td class="dot yes">●</td><td class="dot yes">●</td><td class="dot yes">●</td></tr>
+        <tr><td>Active Tx / Rx</td><td>Settings › Radar</td><td><code>selected_tx_indices</code>, <code>selected_rx_indices</code></td><td><code>--tx-indices</code>, <code>--rx-indices</code></td><td class="dot yes">●</td><td class="dot yes">●</td><td class="dot yes">●</td></tr>
+        <tr><td>Tx schedule</td><td>Settings › Radar</td><td><code>tx_schedule</code>: <code>simultaneous</code> or <code>tdm</code></td><td><code>--tx-schedule</code></td><td class="dot yes">●</td><td class="dot yes">●</td><td class="dot yes">●</td></tr>
+        <tr><td>Carrier frequency</td><td>Settings › Radar (GHz)</td><td><code>carrier_frequency_hz</code></td><td><code>--carrier-ghz</code></td><td class="dot yes">●</td><td class="dot yes">●</td><td class="dot yes">●</td></tr>
+        <tr><td>Chirp slope</td><td>Settings › Radar (MHz/µs)</td><td><code>slope_hz_per_s</code></td><td><code>--slope-mhz-us</code></td><td class="dot yes">●</td><td class="dot yes">●</td><td class="dot yes">●</td></tr>
+        <tr><td>Chirp duration / repetition</td><td>Settings › Radar (µs)</td><td><code>chirp_duration_s</code>, <code>chirp_repetition_time_s</code></td><td><code>--chirp-duration-us</code>, <code>--chirp-repetition-us</code></td><td class="dot yes">●</td><td class="dot yes">●</td><td class="dot yes">●</td></tr>
+        <tr><td>ADC rate, samples, mode</td><td>Settings › Radar</td><td><code>sampling_frequency_hz</code>, <code>num_adc_samples</code>, <code>adc_mode</code></td><td><code>--sampling-msps</code>, <code>--adc-samples</code>, <code>--adc-mode</code></td><td class="dot yes">●</td><td class="dot yes">●</td><td class="dot yes">●</td></tr>
+        <tr><td>IF bandwidth cap</td><td>Settings › Radar</td><td><code>if_bandwidth_hz</code> (<code>null</code> = board)</td><td><code>--if-bandwidth-mhz</code> (0 = board)</td><td class="dot yes">●</td><td class="dot yes">●</td><td class="dot yes">●</td></tr>
+        <tr><td>Chirps per frame, frame period</td><td>Settings › Radar</td><td><code>num_chirps_per_frame</code>, <code>frame_period_s</code></td><td><code>--chirps</code>, <code>--frame-period-ms</code></td><td class="dot yes">●</td><td class="dot yes">●</td><td class="dot yes">●</td></tr>
+        <tr><td>Antenna pattern</td><td>Settings › Radar</td><td><code>antenna_pattern_mode</code>, <code>cosine_3db_beamwidth_deg</code> (full width)</td><td><code>--antenna-pattern</code>, <code>--beamwidth-deg</code></td><td class="dot yes">●</td><td class="dot yes">●</td><td class="dot yes">●</td></tr>
+        <tr><td>Radar orientation</td><td>Dynamic Scenes page (degrees)</td><td><code>radar_orientation_deg</code> [yaw, pitch, roll]</td><td><code>--radar-orientation</code></td><td class="dot yes">●</td><td class="dot yes">●</td><td class="dot yes">●</td></tr>
+        <tr><td>MIMO array model</td><td>Settings › Solver › MIMO array</td><td><code>array_model</code>: <code>phase_center</code> or <code>subarray</code></td><td><code>--array-model</code></td><td class="dot yes">●</td><td class="dot yes">●</td><td class="dot yes">●</td></tr>
+        <tr><td>Subarray groups</td><td>Settings › Solver › MIMO array: <em>Tx groups</em>, <em>Rx groups</em> (<code>0-1; 2</code>)</td><td><code>array_tx_groups</code>, <code>array_rx_groups</code>: <code>[[0, 1], [2]]</code> or <code>null</code></td><td><code>--array-tx-groups 0-1 2</code>, <code>--array-rx-groups</code></td><td class="dot yes">●</td><td class="dot yes">●</td><td class="dot yes">●</td></tr>
+
+        <tr class="group-row"><td colspan="7">Scene and motion</td></tr>
+        <tr><td>Motion file</td><td>Scene and motion</td><td><code>human_motion</code></td><td><code>--motion</code></td><td class="dot yes">●</td><td class="dot yes">●</td><td class="dot yes">●</td></tr>
+        <tr><td>SMPL model directory</td><td>Scene and motion</td><td><code>smpl_model_dir</code></td><td><code>--smpl-model-dir</code></td><td class="dot yes">●</td><td class="dot yes">●</td><td class="dot yes">●</td></tr>
+        <tr><td>Room</td><td>Scene and motion</td><td><code>room_preset</code>, <code>scene_xml</code></td><td><code>--room-preset</code>, <code>--scene</code></td><td class="dot yes">●</td><td class="dot no">○</td><td class="dot yes">●</td></tr>
+        <tr><td>Human position, yaw</td><td>Scene and motion</td><td><code>human_position_m</code>, <code>human_yaw_deg</code></td><td><code>--position</code>, <code>--yaw</code></td><td class="dot yes">●</td><td class="dot yes">●</td><td class="dot yes">●</td></tr>
+        <tr><td>Motion window</td><td>Scene and motion: Start [s], End [s]</td><td><code>motion_start_s</code>, <code>motion_end_s</code> or <code>num_frames</code></td><td><code>--start-s</code>, <code>--end-s</code> or <code>--num-frames</code></td><td class="dot yes">●</td><td class="dot yes">●</td><td class="dot yes">●</td></tr>
+        <tr><td>Source axes and units</td><td>Settings › Motion coordinates</td><td><code>motion_source_up_axis</code>, <code>…_forward_axis</code>, <code>…_handedness</code>, <code>…_length_unit</code></td><td><code>--source-up</code>, <code>--source-forward</code>, <code>--source-handedness</code>, <code>--source-units</code></td><td class="dot yes">●</td><td class="dot yes">●</td><td class="dot yes">●</td></tr>
+
+        <tr class="group-row"><td colspan="7">Ray tracing (<code>rt_*</code>)</td></tr>
+        <tr><td>Rays per source</td><td>Settings › Solver › Ray tracing</td><td><code>rt_samples_per_source</code></td><td><code>--rt-samples-per-source</code></td><td class="dot yes">●</td><td class="dot no">○</td><td class="dot yes">●</td></tr>
+        <tr><td>Paths kept per source</td><td>Settings › Solver › Ray tracing</td><td><code>rt_max_paths_per_source</code></td><td><code>--rt-max-paths-per-source</code></td><td class="dot yes">●</td><td class="dot no">○</td><td class="dot yes">●</td></tr>
+        <tr><td>Max interaction depth</td><td>Settings › Solver › Ray tracing</td><td><code>rt_max_depth</code></td><td><code>--rt-max-depth</code></td><td class="dot yes">●</td><td class="dot no">○</td><td class="dot yes">●</td></tr>
+        <tr><td>Human bounces per path</td><td>Settings › Solver › Ray tracing</td><td><code>rt_human_bounces</code>: <code>single</code> or <code>any</code></td><td><code>--rt-human-bounces</code></td><td class="dot yes">●</td><td class="dot no">○</td><td class="dot yes">●</td></tr>
+        <tr><td>Human diffuse coefficient</td><td>Scene and motion: Diffuse (RT)</td><td><code>rt_human_diffuse_coefficient</code></td><td><code>--rt-human-diffuse-coefficient</code></td><td class="dot yes">●</td><td class="dot no">○</td><td class="dot no">○</td></tr>
+        <tr><td>Retrace cadence</td><td>Settings › Solver › RT temporal cadence</td><td><code>rt_refresh_frames</code></td><td><code>--rt-refresh-frames</code></td><td class="dot yes">●</td><td class="dot no">○</td><td class="dot no">○</td></tr>
+        <tr><td>Path visibility cadence and fade</td><td>Settings › Solver › RT temporal cadence</td><td><code>rt_visibility_refresh_frames</code>, <code>rt_visibility_fade_frames</code></td><td><code>--rt-visibility-refresh-frames</code>, <code>--rt-visibility-fade-frames</code></td><td class="dot yes">●</td><td class="dot no">○</td><td class="dot yes">●</td></tr>
+        <tr><td>Early retrace on body drift (m)</td><td>not exposed</td><td>Python only: <code>MmWaveRadarSimulator(rt_refresh_on_displacement=…)</code></td><td>—</td><td class="dot yes">●</td><td class="dot no">○</td><td class="dot no">○</td></tr>
+
+        <tr class="group-row"><td colspan="7">Physical optics (<code>po_*</code>)</td></tr>
+        <tr><td>Facet integration mode</td><td>Settings › Solver › Physical optics</td><td><code>po_integration_mode</code></td><td><code>--po-integration-mode</code></td><td class="dot no">○</td><td class="dot yes">●</td><td class="dot yes">●</td></tr>
+        <tr><td>Phase span</td><td>Settings › Solver › Physical optics</td><td><code>po_quadrature_phase_span_scale_rad</code></td><td><code>--po-quadrature-phase-span-scale-rad</code></td><td class="dot no">○</td><td class="dot yes">●</td><td class="dot yes">●</td></tr>
+        <tr><td>Curvature tolerance</td><td>Settings › Solver › Physical optics</td><td><code>po_curvature_error_rad</code></td><td><code>--po-curvature-error-rad</code></td><td class="dot no">○</td><td class="dot yes">●</td><td class="dot yes">●</td></tr>
+        <tr><td>Subdivision depth, children per facet</td><td>Settings › Solver › Physical optics</td><td><code>po_quadrature_max_refinement_depth</code>, <code>po_quadrature_max_subfaces_per_parent</code></td><td><code>--po-quadrature-max-refinement-depth</code>, <code>--po-quadrature-max-subfaces-per-parent</code></td><td class="dot no">○</td><td class="dot yes">●</td><td class="dot yes">●</td></tr>
+        <tr><td>Visibility samples per facet</td><td>Settings › Solver › PO temporal cadence</td><td><code>po_visibility_samples_per_face</code></td><td><code>--po-visibility-samples-per-face</code></td><td class="dot no">○</td><td class="dot yes">●</td><td class="dot yes">●</td></tr>
+        <tr><td>Exact-integration cadence</td><td>Settings › Solver › PO temporal cadence</td><td><code>po_refresh_frames</code></td><td><code>--po-refresh-frames</code></td><td class="dot no">○</td><td class="dot yes">●</td><td class="dot yes">●</td></tr>
+        <tr><td>Facet visibility cadence and fade</td><td>Settings › Solver › PO temporal cadence</td><td><code>po_visibility_refresh_frames</code>, <code>po_visibility_fade_frames</code></td><td><code>--po-visibility-refresh-frames</code>, <code>--po-visibility-fade-frames</code></td><td class="dot no">○</td><td class="dot yes">●</td><td class="dot yes">●</td></tr>
+        <tr><td>Early facet re-integration (rad)</td><td>Settings › Solver › PO temporal cadence: PO refresh phase error</td><td><code>po_refresh_on_phase_error_rad</code></td><td><code>--po-refresh-on-phase-error-rad</code></td><td class="dot no">○</td><td class="dot yes">●</td><td class="dot yes">●</td></tr>
+        <tr><td>Area-change trigger (fraction)</td><td>Settings › Solver › PO temporal cadence</td><td><code>po_refresh_on_area_fraction</code></td><td><code>--po-refresh-on-area-fraction</code></td><td class="dot no">○</td><td class="dot yes">●</td><td class="dot yes">●</td></tr>
+        <tr><td>Normal-change trigger (degrees)</td><td>Settings › Solver › PO temporal cadence</td><td><code>po_refresh_on_normal_deg</code></td><td><code>--po-refresh-on-normal-deg</code></td><td class="dot no">○</td><td class="dot yes">●</td><td class="dot yes">●</td></tr>
+        <tr><td>Adaptive visibility sampling</td><td>Settings › Solver › PO temporal cadence</td><td><code>po_adaptive_visibility_sampling</code></td><td><code>--po-adaptive-visibility-sampling</code></td><td class="dot no">○</td><td class="dot yes">●</td><td class="dot yes">●</td></tr>
+        <tr><td>Grazing cosine margin</td><td>Settings › Solver › PO temporal cadence</td><td><code>po_adaptive_visibility_edge_margin</code></td><td><code>--po-adaptive-visibility-edge-margin</code></td><td class="dot no">○</td><td class="dot yes">●</td><td class="dot yes">●</td></tr>
+
+        <tr class="group-row"><td colspan="7">Hybrid PO (<code>hybrid_*</code>)</td></tr>
+        <tr><td>Human–room coupling</td><td>Settings › Solver › Hybrid PO</td><td><code>hybrid_coupling</code></td><td><code>--hybrid-coupling</code> / <code>--no-hybrid-coupling</code></td><td class="dot no">○</td><td class="dot no">○</td><td class="dot yes">●</td></tr>
+        <tr><td>Calibration</td><td>Settings › Solver › Hybrid PO</td><td><code>hybrid_calibration</code>: <code>rt_first_pose</code>, <code>rt_sequence</code> or <code>none</code></td><td><code>--hybrid-calibration</code></td><td class="dot no">○</td><td class="dot no">○</td><td class="dot yes">●</td></tr>
+        <tr><td>Reflector power cutoff</td><td>Settings › Solver › Hybrid PO</td><td><code>hybrid_reflector_cutoff_db</code></td><td><code>--hybrid-reflector-cutoff-db</code></td><td class="dot no">○</td><td class="dot no">○</td><td class="dot yes">●</td></tr>
+        <tr><td>Max reflectors (1–4)</td><td>Settings › Solver › Hybrid PO</td><td><code>hybrid_max_reflectors</code></td><td><code>--hybrid-max-reflectors</code></td><td class="dot no">○</td><td class="dot no">○</td><td class="dot yes">●</td></tr>
+
+        <tr class="group-row"><td colspan="7">Compute</td></tr>
+        <tr><td>Backend</td><td>not exposed (<code>auto</code>)</td><td><code>compute_backend</code></td><td><code>--backend</code></td><td class="dot yes">●</td><td class="dot yes">●</td><td class="dot yes">●</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p class="small">The PO integration modes are <code>parent_face_adaptive_analytic</code> (GUI default), <code>parent_face_quadrature</code>, <code>parent_face_far_field_analytic</code> and <code>face_centroid</code>. The adaptive mode splits a facet when its phase span exceeds the span setting or its curvature error exceeds the tolerance, up to the depth and child limits. In the solver API, the <code>po_*</code> settings live in <code>POConfig</code> and the <code>hybrid_*</code> settings in <code>HybridPOConfig</code>; the <code>rt_*</code> settings are <code>MmWaveRadarSimulator</code> keywords.</p>
+</section>
+
+<!-- ======================================================= -->
+<section id="defaults">
+  <h2>Default settings by interface</h2>
+  <p class="section-lede">Interfaces use common parameter names but may select different default values. Highlighted cells identify differences from the GUI configuration. Match these settings before comparing simulation outputs.</p>
+  <div class="table-scroll">
+    <table>
+      <thead><tr><th>Setting</th><th>GUI and CLI</th><th>Notebooks</th><th>Solver API class defaults</th><th>Validation CLI</th></tr></thead>
+      <tbody>
+        <tr><td>Radar</td><td>IWR6843AOPEVM, Tx 0–2, Rx 0–3, cosine 60°</td><td class="diff">1 co-located Tx/Rx (PO, RT notebooks); IWR6843AOPEVM, cosine30 (Hybrid-PO notebook)</td><td>user-defined</td><td class="diff">from the bundle</td></tr>
+        <tr><td>Chirps per frame</td><td class="num">16</td><td class="diff num">64</td><td>required argument</td><td class="diff">from the bundle</td></tr>
+        <tr><td>Radar placement</td><td>Radar at the origin. GUI: empty-room floor at z = −1.035 m, with motion-file positions. Checked-in CLI configuration: furnished room, floor at z = −1.0 m, human centre at (1.6, 0, 0) m.</td><td class="diff">Positioned 0.5 m in front of the first-frame chest and oriented towards it</td><td><code>RadarSensor(position=…)</code></td><td class="diff">from the bundle</td></tr>
+        <tr><td>Motion timing</td><td>Real time from Start [s], interpolated at every chirp; one radar frame by default</td><td>Real time, window starting at 3.0 s</td><td>The mesh sequence's own times</td><td class="diff">Each radar frame starts at its bundle timestamp, then real time</td></tr>
+        <tr><td><code>rt_max_depth</code></td><td class="num">3</td><td class="diff num">2 (RT notebook also 1 and 4)</td><td class="diff num">2</td><td class="diff num">2</td></tr>
+        <tr><td><code>rt_samples_per_source</code></td><td class="num">100 000</td><td class="diff num">80 000</td><td class="num">100 000</td><td class="num">100 000</td></tr>
+        <tr><td><code>rt_max_paths_per_source</code></td><td class="num">5 000</td><td class="diff num">80 000</td><td class="diff num">100 000</td><td class="diff num">100 000</td></tr>
+        <tr><td><code>rt_human_bounces</code></td><td><code>single</code></td><td class="diff"><code>any</code> (RT notebook); <code>single</code> (others)</td><td><code>single</code></td><td><code>single</code></td></tr>
+        <tr><td><code>rt_refresh_frames</code></td><td class="num">1</td><td class="diff num">0 and 1 compared (RT notebook)</td><td class="num">1</td><td class="num">1 (<code>--rt-refresh-frames</code>)</td></tr>
+        <tr><td><code>po_integration_mode</code></td><td><code>parent_face_adaptive_analytic</code></td><td class="diff"><code>face_centroid</code> and <code>parent_face_far_field_analytic</code> (PO notebook); <code>face_centroid</code> (Hybrid-PO notebook)</td><td class="diff"><code>face_centroid</code></td><td class="diff"><code>face_centroid</code></td></tr>
+        <tr><td><code>po_visibility_samples_per_face</code></td><td class="num">1</td><td class="diff num">4</td><td class="diff num">4</td><td class="diff num">4</td></tr>
+        <tr><td><code>po_refresh_frames</code></td><td class="num">1</td><td class="diff">0 and 1 compared (PO notebook); 1 (Hybrid-PO notebook)</td><td class="num">1</td><td class="num">1</td></tr>
+        <tr><td><code>po_refresh_on_phase_error_rad</code></td><td class="num">0.1</td><td class="num">0.1</td><td class="num">0.1</td><td class="num">0.1</td></tr>
+        <tr><td><code>rt_refresh_on_displacement</code></td><td>off</td><td>off</td><td>off</td><td>off</td></tr>
+        <tr><td><code>hybrid_calibration</code></td><td><code>rt_first_pose</code></td><td><code>rt_first_pose</code></td><td><code>rt_first_pose</code></td><td><code>rt_first_pose</code> (<code>--hybrid-calibration</code>)</td></tr>
+        <tr><td><code>hybrid_coupling</code></td><td>On, ≤ 4 reflectors, −20 dB</td><td>On, ≤ 4, −20 dB</td><td>On, ≤ 4, −20 dB</td><td>On, ≤ 4, −20 dB</td></tr>
+        <tr><td>Backend / precision</td><td><code>auto</code> / float32</td><td><code>auto</code> / float32</td><td class="diff"><code>numpy</code> / float64</td><td class="diff"><code>numpy</code> / float64</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p class="small">All interfaces use <code>rt_seed</code> 42. <code>run_human_room_experiment()</code> uses <code>compute_backend="auto"</code>, as the GUI and the CLI do.</p>
+</section>
+
+<!-- ======================================================= -->
+<section id="moving">
+  <h2>Reproducing runs across interfaces</h2>
+
+  <h3>GUI → CLI</h3>
+  <p>GUI settings are saved in the browser, not in <code>configs/human_room.json</code>, which holds the factory defaults. To capture a GUI run, export its bundle and open <code>experiment_manifest.json</code> in the ZIP. Most entries under <code>scene.parameters</code>, <code>radar.parameters</code> and <code>solver.parameters</code> have the same names as the JSON keys. Rename these:</p>
+  <div class="table-scroll">
+    <table>
+      <thead><tr><th>Manifest field</th><th>JSON key</th></tr></thead>
+      <tbody>
+        <tr><td><code>radar.board_model</code></td><td><code>board_model</code></td></tr>
+        <tr><td><code>radar.parameters.orientation_deg</code></td><td><code>radar_orientation_deg</code></td></tr>
+        <tr><td><code>radar.parameters.tx_indices_zero_based</code>, <code>rx_indices_zero_based</code></td><td><code>selected_tx_indices</code>, <code>selected_rx_indices</code></td></tr>
+        <tr><td><code>solver.solvers</code> in each <code>experiment_manifest_&lt;solver&gt;.json</code></td><td>one entry of <code>solvers</code></td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p class="small">The manifest records the motion file name. Supply local paths for <code>human_motion</code> and, when required, <code>smpl_model_dir</code>.</p>
+
+  <h3>CLI → GUI</h3>
+  <div class="codeblock"><div class="codehead"><span>shell</span></div><pre><code>hermes-gui --bundle results/walk-3f.zip</code></pre></div>
+  <p>The bundle opens in Bundle Comparison with every solver it contains.</p>
+
+  <h3>CLI ↔ Python</h3>
+  <p>The JSON keys are the keyword arguments of <code>run_human_room_experiment()</code>. Load a configuration with the <a href="#python">Python compatibility example</a>. To go the other way, write your keyword arguments to a JSON file, add <code>"schema_version": 3</code>, <code>"solvers"</code> and <code>"output"</code>, and run <code>--dry-run</code> to check it.</p>
+
+  <h3>Notebook → GUI or CLI</h3>
+  <p>Notebook configurations require explicit alignment with GUI or CLI settings because radar placement and numerical budgets may differ. Use the <a href="#defaults">defaults table</a> to align the settings, or adapt the notebook cell with <code>simulate_human_room(settings)</code>.</p>
+</section>
+
+<!-- ======================================================= -->
+<section id="pitfalls">
+  <h2>Configuration considerations</h2>
+  <p class="section-lede">Review these conventions when configuring a run or comparing results across interfaces.</p>
+  <ul class="pitfalls">
+    <li><strong>Motion time and radar-frame indexing</strong>
+      <p>The GUI, CLI and JSON configuration select the motion window in seconds after the first pose. Radar frame 0 starts at the start time and the motion plays in real time, so Doppler follows the recorded speed for any frame period. Configuration files with <code>schema_version</code> 1 used pose-index <code>begin_frame_index</code>/<code>end_frame_index</code> windows, which stretched one pose interval over each radar frame. They are now rejected with conversion instructions. For pose index <em>i</em> in a motion recorded at <em>R</em> fps, use <code>motion_start_s</code> = <em>i</em>/<em>R</em>.</p></li>
+    <li><strong>Frame-based update intervals</strong>
+      <p><code>rt_refresh_frames</code>, <code>po_refresh_frames</code> and the visibility cadences update at frame starts. There is no sub-frame cadence: use <code>0</code> for every chirp. A one-frame run with a cadence of 1 therefore solves exactly once.</p></li>
+    <li><strong>Configuration schemas and deprecated options</strong>
+      <p>Unsupported configuration schema versions, deprecated solver names such as <code>coherent_rt</code>, and flags such as <code>--modes</code> are rejected with migration instructions. Update existing files using the <a href="#names">deprecated-name mappings</a>.</p></li>
+    <li><strong>Human placement and motion windows</strong>
+      <p><code>human_position_m</code> places the bounding-box centre of the first pose in the file. If you start 3.0 s into a walk, the body begins wherever it has walked to by then. Move the position to compensate, or check the preview at the start time before running.</p></li>
+    <li><strong>Board changes and explicit configuration values</strong>
+      <p>The checked-in JSON pins a 60 GHz carrier, Tx 0–2 and Rx 0–3. <code>--board MMWCAS_RF_EVM</code> then simulates the 76.8 GHz cascade layout at 60 GHz without an error. Use <code>hermes-human-room --board …</code>, which starts from defaults for that board, or also set <code>--carrier-ghz</code>, <code>--tx-indices</code> and <code>--rx-indices</code>. Check with <code>--dry-run</code>.</p></li>
+    <li><strong>RT repeatability</strong>
+      <p>With diffuse scattering on, the default, the RT ADC at 100 000 rays per source changes by about 100% when only the seed changes. Even with the same seed, multithreaded runs differ by about 0.1%, because Dr.Jit's floating-point accumulation order varies. Compare RT results with specular paths only or many more rays. For bitwise checks, call <code>drjit.set_thread_count(1)</code> before running.</p></li>
+    <li><strong>Antenna numbering</strong>
+      <p>HERMES uses zero-based antenna indices in the GUI, CLI, JSON, validation and Python APIs. TI's TX1 corresponds to index 0, and RX5 in one-based dataset notation corresponds to index 4. Deprecated one-based flags such as <code>--tx</code>, <code>--rx</code>, <code>--subarray-tx</code> and <code>--subarray-rx</code> are rejected.</p></li>
+    <li><strong>Units and orientation conventions</strong>
+      <p>JSON uses SI units and flags use GUI units. Orientation is in degrees in the GUI, JSON and flags, and in radians in <code>RadarSensor(orientation=…)</code>.</p></li>
+    <li><strong>Relative path resolution</strong>
+      <p>Paths in JSON, including <code>output</code>, are relative to the JSON file. Paths in flags are relative to the working directory. The checked-in config writes to <code>../../results/</code>, which is outside a standalone checkout, so pass <code>--output</code>.</p></li>
+    <li><strong>Hybrid PO calibration</strong>
+      <p>Each interface fits one gain from human RT and human-only PO ADC powers averaged over the first simulated radar frame (<code>hybrid_calibration="rt_first_pose"</code>). This gain is reused for the whole run, so the human terms then depend on the ray budget. Set <code>none</code> for absolute PO amplitudes.</p></li>
+    <li><strong>Phase-center approximation limits</strong>
+      <p>A wide array close to the target triggers <code>PhaseCenterApproximationWarning</code>, and the run records a <code>phase_center_approximation</code> event. Split the array with <code>array_model="subarray"</code> and the group counts the warning suggests, move the target farther away, or use fewer active elements. Each Tx-group/Rx-group pair is a separate solve, so run time grows with the number of pairs. Calibrated PO parts share one gain: <code>rt_first_pose</code> is refitted from all pairs' reference powers, and <code>rt_sequence</code> uses the first pair's fit.</p></li>
+    <li><strong>Integration-dependent phase span</strong>
+      <p>Analytic modes default to 6 rad and quadrature to 1 rad. The CLI resets the span when you change the mode without setting it. In Python, pass <code>po_quadrature_phase_span_scale_rad=None</code> to get the mode's default.</p></li>
+    <li><strong>Solver-specific parameters</strong>
+      <p>Parameter prefixes identify their scope: <code>rt_*</code> settings do not affect the PO solver, <code>po_*</code> settings do not affect the RT solver, and <code>hybrid_*</code> settings affect only Hybrid PO. The human diffuse coefficient affects only the RT solver. See the <a href="#settings">settings reference</a>.</p></li>
+    <li><strong>GUI parameter coverage</strong>
+      <p>The GUI exposes PO visibility sampling and refresh thresholds. Compute backend selection uses <code>auto</code>; select an explicit backend through the CLI or Python API.</p></li>
+  </ul>
+</section>
+
+</div>
+
+<footer>
+  <div class="wrap">
+    HERMES simulation tutorial for hermes-radar-sim 0.2.0 · documentation licensed under CC BY-NC 4.0 · see also the <a href="../../README.md">README</a>, <a href="../../demo/README.md">demo guide</a> and <a href="../api/index.html">API reference</a>.
+  </div>
+</footer>
+</main>
+</div>
+
+<script>
+(function () {
+  // Tabs: without script, every panel stays visible with its own label.
+  document.querySelectorAll("[data-tabs]").forEach(function (group) {
+    var tabs = Array.prototype.slice.call(group.querySelectorAll('[role="tab"]'));
+    var panels = tabs.map(function (tab) { return document.getElementById(tab.getAttribute("aria-controls")); });
+    group.classList.add("js");
+    function select(index, focus) {
+      tabs.forEach(function (tab, i) {
+        var on = i === index;
+        tab.setAttribute("aria-selected", on ? "true" : "false");
+        tab.tabIndex = on ? 0 : -1;
+        panels[i].hidden = !on;
+      });
+      if (focus) tabs[index].focus();
+    }
+    tabs.forEach(function (tab, i) {
+      tab.addEventListener("click", function () { select(i, false); });
+      tab.addEventListener("keydown", function (event) {
+        var next = null;
+        if (event.key === "ArrowRight") next = (i + 1) % tabs.length;
+        if (event.key === "ArrowLeft") next = (i - 1 + tabs.length) % tabs.length;
+        if (event.key === "Home") next = 0;
+        if (event.key === "End") next = tabs.length - 1;
+        if (next !== null) { event.preventDefault(); select(next, true); }
+      });
+    });
+    select(0, false);
+  });
+
+  // Copy buttons on code blocks.
+  document.querySelectorAll(".codeblock").forEach(function (block) {
+    var head = block.querySelector(".codehead");
+    var code = block.querySelector("pre code");
+    if (!head || !code) return;
+    var button = document.createElement("button");
+    button.type = "button";
+    button.className = "copy";
+    button.textContent = "Copy";
+    button.addEventListener("click", function () {
+      var text = code.innerText;
+      function done(label) {
+        button.textContent = label;
+        setTimeout(function () { button.textContent = "Copy"; }, 1600);
+      }
+      function selectText() {
+        var range = document.createRange();
+        range.selectNodeContents(code);
+        var selection = window.getSelection();
+        selection.removeAllRanges();
+        selection.addRange(range);
+        done("Selected");
+      }
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(text).then(function () { done("Copied"); }, selectText);
+      } else {
+        selectText();
+      }
+    });
+    head.appendChild(button);
+  });
+
+  // Highlight the section in view.
+  var links = Array.prototype.slice.call(document.querySelectorAll('.toc a[href^="#"]'));
+  if (!("IntersectionObserver" in window)) return;
+  var byId = {};
+  links.forEach(function (link) { byId[link.getAttribute("href").slice(1)] = link; });
+  var observer = new IntersectionObserver(function (entries) {
+    entries.forEach(function (entry) {
+      if (!entry.isIntersecting) return;
+      links.forEach(function (link) { link.removeAttribute("aria-current"); });
+      var link = byId[entry.target.id];
+      if (link) link.setAttribute("aria-current", "true");
+    });
+  }, { rootMargin: "-20% 0px -70% 0px" });
+  document.querySelectorAll("main section[id]").forEach(function (section) { observer.observe(section); });
+})();
+</script>
+</body>
+</html>

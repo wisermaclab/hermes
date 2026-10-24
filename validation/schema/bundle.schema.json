@@ -1,43 +1,138 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://github.com/wisermaclab/hermes/validation/schema/bundle.schema.json",
-  "title": "Unified HERMES Bundle v1 descriptor",
+  "title": "HERMES bundle descriptor (v1 read compatibility, v2 feature gates)",
   "type": "object",
-  "required": ["schema_version", "profile", "primary_adc", "adcs"],
+  "required": [
+    "schema_version",
+    "profile",
+    "primary_adc",
+    "adcs"
+  ],
   "properties": {
-    "schema_version": {"const": 1},
-    "profile": {"const": "hermes"},
-    "primary_adc": {"type": "string", "minLength": 1},
+    "schema_version": {
+      "enum": [
+        1,
+        2
+      ]
+    },
+    "profile": {
+      "const": "hermes"
+    },
+    "primary_adc": {
+      "type": "string",
+      "minLength": 1
+    },
     "adcs": {
       "type": "object",
       "minProperties": 1,
-      "propertyNames": {"type": "string", "minLength": 1},
-      "additionalProperties": {"$ref": "#/$defs/adcArtifact"}
+      "propertyNames": {
+        "type": "string",
+        "minLength": 1
+      },
+      "additionalProperties": {
+        "$ref": "#/$defs/adcArtifact"
+      }
     },
-    "environment": {"$ref": "#/$defs/relativePath"},
+    "environment": {
+      "$ref": "#/$defs/relativePath"
+    },
     "motion": {
       "type": "object",
       "properties": {
-        "parameters": {"$ref": "#/$defs/relativePath"},
-        "evaluated_mesh": {"$ref": "#/$defs/relativePath"},
+        "parameters": {
+          "$ref": "#/$defs/relativePath"
+        },
+        "evaluated_mesh": {
+          "$ref": "#/$defs/relativePath"
+        },
         "frame_window": {
           "type": "object",
-          "required": ["begin_frame_index", "end_frame_index"],
+          "required": [
+            "begin_frame_index",
+            "end_frame_index"
+          ],
           "properties": {
-            "begin_frame_index": {"type": "integer", "minimum": 0},
-            "end_frame_index": {"type": "integer", "minimum": 0}
+            "begin_frame_index": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "end_frame_index": {
+              "type": "integer",
+              "minimum": 0
+            }
           },
           "additionalProperties": false
+        },
+        "time_window": {
+          "type": "object",
+          "required": [
+            "start_s",
+            "end_s"
+          ],
+          "properties": {
+            "start_s": {
+              "type": "number",
+              "minimum": 0
+            },
+            "end_s": {
+              "type": "number",
+              "minimum": 0
+            }
+          },
+          "additionalProperties": false
+        },
+        "coordinate_frame": {
+          "const": "world"
         }
       },
       "minProperties": 1,
       "additionalProperties": true
     },
     "target": {
-      "type": "object",
+      "type": [
+        "object",
+        "null"
+      ],
       "properties": {
-        "mesh": {"$ref": "#/$defs/relativePath"},
-        "obj": {"$ref": "#/$defs/relativePath"}
+        "mesh": {
+          "$ref": "#/$defs/relativePath"
+        },
+        "obj": {
+          "$ref": "#/$defs/relativePath"
+        },
+        "material_parameters": {
+          "type": "object",
+          "properties": {
+            "relative_permittivity": {
+              "type": "number",
+              "minimum": 1
+            },
+            "conductivity": {
+              "type": "number",
+              "minimum": 0
+            },
+            "thickness": {
+              "type": "number",
+              "minimum": 0
+            },
+            "scattering_coefficient": {
+              "type": "number",
+              "minimum": 0,
+              "maximum": 1
+            },
+            "xpd_coefficient": {
+              "type": "number",
+              "minimum": 0,
+              "maximum": 1
+            }
+          },
+          "additionalProperties": false
+        },
+        "material": {
+          "type": "string",
+          "description": "Optional display label; numeric radio parameters belong to material_parameters."
+        }
       },
       "minProperties": 1,
       "additionalProperties": true
@@ -45,47 +140,97 @@
     "scene": {
       "type": "object",
       "properties": {
-        "file": {"$ref": "#/$defs/relativePath"},
+        "file": {
+          "$ref": "#/$defs/relativePath"
+        },
         "assets": {
           "type": "array",
-          "items": {"$ref": "#/$defs/relativePath"},
+          "items": {
+            "$ref": "#/$defs/relativePath"
+          },
           "uniqueItems": true
         }
       },
       "minProperties": 1,
       "additionalProperties": true
     },
-    "manifests": {"$ref": "#/$defs/pathMap"},
-    "diagnostics": {"$ref": "#/$defs/pathMap"}
+    "manifests": {
+      "$ref": "#/$defs/pathMap"
+    },
+    "diagnostics": {
+      "$ref": "#/$defs/pathMap"
+    },
+    "required_features": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "enum": [
+          "custom_array",
+          "explicit_tdm_slots",
+          "channel_map",
+          "target_material"
+        ]
+      },
+      "uniqueItems": true
+    }
   },
   "$defs": {
     "adcArtifact": {
       "type": "object",
-      "required": ["path", "origin"],
+      "required": [
+        "path",
+        "origin"
+      ],
       "properties": {
-        "path": {"$ref": "#/$defs/relativePath"},
-        "origin": {
-          "enum": ["measurement", "simulation", "background", "processed"]
+        "path": {
+          "$ref": "#/$defs/relativePath"
         },
-        "solver": {"type": "string", "minLength": 1},
-        "simulation_mode": {"type": "string", "minLength": 1},
-        "manifest": {"$ref": "#/$defs/relativePath"}
+        "origin": {
+          "enum": [
+            "measurement",
+            "simulation",
+            "background",
+            "processed"
+          ]
+        },
+        "solver": {
+          "type": "string",
+          "minLength": 1
+        },
+        "simulation_mode": {
+          "type": "string",
+          "minLength": 1
+        },
+        "manifest": {
+          "$ref": "#/$defs/relativePath"
+        }
       },
       "additionalProperties": true
     },
     "pathMap": {
       "type": "object",
-      "propertyNames": {"type": "string", "minLength": 1},
-      "additionalProperties": {"$ref": "#/$defs/relativePath"}
+      "propertyNames": {
+        "type": "string",
+        "minLength": 1
+      },
+      "additionalProperties": {
+        "$ref": "#/$defs/relativePath"
+      }
     },
     "relativePath": {
       "type": "string",
       "minLength": 1,
       "not": {
         "anyOf": [
-          {"pattern": "^/"},
-          {"pattern": "^[A-Za-z]:[\\\\/]"},
-          {"pattern": "(^|[\\\\/])\\.\\.([\\\\/]|$)"}
+          {
+            "pattern": "^/"
+          },
+          {
+            "pattern": "^[A-Za-z]:[\\\\/]"
+          },
+          {
+            "pattern": "(^|[\\\\/])\\.\\.([\\\\/]|$)"
+          }
         ]
       }
     }

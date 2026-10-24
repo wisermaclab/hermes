@@ -10,12 +10,13 @@ from typing import Iterable
 
 import numpy as np
 
+from ..arrays import as_numpy
+
 from ..visualization import (
     path_lengths_m,
     top_path_indices,
     top_path_segments,
 )
-
 
 _INVALID_INDEX = np.uint32(0xFFFFFFFF)
 
@@ -55,14 +56,6 @@ class SolverDiagnostics:
     po: POSurfaceDiagnostics
 
 
-def _numpy(value) -> np.ndarray:
-    """Convert NumPy, Dr.Jit, or tensor-like diagnostic fields to NumPy."""
-
-    if hasattr(value, "numpy"):
-        value = value.numpy()
-    return np.asarray(value)
-
-
 def summarize_rt_paths(
     paths,
     *,
@@ -79,12 +72,15 @@ def summarize_rt_paths(
         excluded_object_ids=excluded_object_ids,
     )
     starts, ends, colors = top_path_segments(paths, selection)
-    valid = _numpy(paths.valid).astype(bool, copy=False)
+    valid = as_numpy(paths.valid).astype(bool, copy=False)
     valid_link_path_count = int(np.count_nonzero(valid))
 
-    objects = _numpy(paths.objects)
-    if objects.ndim < 2 or valid.ndim < 1:
-        depth_histogram = np.zeros((1,), dtype=np.int64)
+    objects = as_numpy(paths.objects)
+    if objects.ndim < 2 or valid.ndim < 1 or valid.size == 0:
+        depth_histogram = np.zeros(
+            (objects.shape[0] + 1 if objects.ndim >= 2 else 1,),
+            dtype=np.int64,
+        )
     else:
         path_axis_size = valid.shape[-1]
         flat_valid = valid.reshape((-1, path_axis_size))

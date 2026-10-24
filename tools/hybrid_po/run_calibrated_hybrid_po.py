@@ -14,26 +14,19 @@ import time
 
 import numpy as np
 
-
-def _repo_root() -> Path:
-    """Finds the simulator repository root from this script location."""
-
-    root = Path(__file__).resolve()
-    for parent in (root, *root.parents):
-        if (parent / "src" / "mmWaveRadar").exists():
-            return parent
-    raise RuntimeError("could not locate repository root containing src/mmWaveRadar")
-
-
-REPO_ROOT = _repo_root()
+REPO_ROOT = Path(__file__).resolve().parents[2]
 SRC_PATH = str(REPO_ROOT / "src")
 if SRC_PATH not in sys.path:
     sys.path.insert(0, SRC_PATH)
 
+from mmWaveRadar.defaults import default_amass_npz as _default_amass_npz
+from mmWaveRadar.defaults import default_smpl_model_dir as _default_smpl_model_dir
 from mmWaveRadar import amass_to_smpl_motion_sequence, load_amass_npz  # noqa: E402
 from mmWaveRadar.materials import human_skin_material  # noqa: E402
+from mmWaveRadar.naming import HYBRID_CALIBRATIONS, add_removed_options  # noqa: E402
 from mmWaveRadar.radar import FMCWConfig, RadarSensor  # noqa: E402
 from mmWaveRadar.simulation import (  # noqa: E402
+    POConfig,
     run_calibrated_hybrid_po,
     runtime_summary,
     save_radar_cube_npz,
@@ -48,35 +41,11 @@ from mmWaveRadar.tutorial_support import (  # noqa: E402
 )
 
 
-def _default_amass_npz(dataset_root: Path) -> Path:
-    """Resolves the motion override or the selected dataset-root fallback."""
-
-    value = os.environ.get("MMWAVE_AMASS_NPZ")
-    if value:
-        return Path(value).expanduser()
-    return (
-        dataset_root.expanduser()
-        / "AMASS"
-        / "walking_poses_cmu_105_02.npz"
-    )
-
-
-def _default_smpl_model_dir() -> Path:
-    """Resolves the model override or the repository-local model directory."""
-
-    value = os.environ.get("MMWAVE_SMPL_MODEL_DIR")
-    if value:
-        return Path(value).expanduser()
-    return REPO_ROOT / "models" / "smpl_models"
-
-
 def _parse_args() -> argparse.Namespace:
     """Parses command-line controls for the calibrated Hybrid PO run."""
 
     parser = argparse.ArgumentParser(
-        description=(
-            "Run the same calibrated Hybrid PO flow used by demo/Hybrid-PO.ipynb."
-        )
+        description=("Run the same calibrated Hybrid PO flow used by demo/Hybrid-PO.ipynb.")
     )
     parser.add_argument(
         "--dataset-root",
@@ -114,19 +83,37 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--ti-pattern-mode", default="cosine30")
     parser.add_argument("--po-visibility-samples-per-face", type=int, default=4)
     parser.add_argument(
-        "--coupling-enabled",
+        "--hybrid-coupling",
         action=argparse.BooleanOptionalAction,
         default=True,
     )
     parser.add_argument(
-        "--coupling-max-reflectors",
-        type=int,
-        default=0,
-        help="0 means all RT single-specular reflector candidates.",
+        "--hybrid-reflector-cutoff-db",
+        type=float,
+        default=-20.0,
+        help="Minimum image-source power relative to the strongest candidate, in dB (<= 0).",
     )
-    parser.add_argument("--coupling-reflection-scale", type=float, default=1.0)
-    parser.add_argument("--rt-samples-per-src", type=int, default=80_000)
-    parser.add_argument("--rt-max-num-paths-per-src", type=int, default=80_000)
+    parser.add_argument(
+        "--hybrid-max-reflectors",
+        type=int,
+        choices=range(1, 5),
+        default=4,
+        help="Maximum retained image-source reflectors after power filtering (1-4).",
+    )
+    parser.add_argument("--hybrid-reflection-scale", type=float, default=1.0)
+    parser.add_argument(
+        "--hybrid-calibration",
+        choices=HYBRID_CALIBRATIONS,
+        default="rt_first_pose",
+    )
+    parser.add_argument(
+        "--po-refresh-on-phase-error-rad",
+        type=float,
+        default=POConfig().po_refresh_on_phase_error_rad,
+        help="PO and coupling neglected vertex phase-change trigger [rad].",
+    )
+    parser.add_argument("--rt-samples-per-source", type=int, default=80_000)
+    parser.add_argument("--rt-max-paths-per-source", type=int, default=80_000)
     parser.add_argument("--calibration-frame-start", type=int, default=0)
     parser.add_argument("--calibration-frame-stop", type=int, default=1)
     parser.add_argument(
@@ -148,6 +135,18 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--quiet", action="store_true")
     parser.add_argument("--no-reflector-summary", action="store_true")
     parser.add_argument("--output", type=Path, default=None)
+    add_removed_options(
+        parser,
+        {
+            "--coupling-enabled": "--hybrid-coupling",
+            "--no-coupling-enabled": "--no-hybrid-coupling",
+            "--coupling-power-threshold-db": "--hybrid-reflector-cutoff-db",
+            "--coupling-max-reflectors": "--hybrid-max-reflectors",
+            "--coupling-reflection-scale": "--hybrid-reflection-scale",
+            "--rt-samples-per-src": "--rt-samples-per-source",
+            "--rt-max-num-paths-per-src": "--rt-max-paths-per-source",
+        },
+    )
     return parser.parse_args()
 
 
@@ -358,11 +357,18 @@ def main() -> int:
             int(args.calibration_frame_stop),
         ),
         po_visibility_samples_per_face=int(args.po_visibility_samples_per_face),
-        coupling_enabled=bool(args.coupling_enabled),
-        coupling_max_reflectors=int(args.coupling_max_reflectors),
-        coupling_reflection_scale=float(args.coupling_reflection_scale),
-        rt_samples_per_src=int(args.rt_samples_per_src),
-        rt_max_num_paths_per_src=int(args.rt_max_num_paths_per_src),
+        po_config=POConfig(
+            po_visibility_samples_per_face=int(args.po_visibility_samples_per_face),
+            po_adaptive_visibility_sampling=True,
+            po_refresh_on_phase_error_rad=float(args.po_refresh_on_phase_error_rad),
+        ),
+        hybrid_coupling=bool(args.hybrid_coupling),
+        hybrid_reflector_cutoff_db=float(args.hybrid_reflector_cutoff_db),
+        hybrid_max_reflectors=int(args.hybrid_max_reflectors),
+        hybrid_reflection_scale=float(args.hybrid_reflection_scale),
+        hybrid_calibration=args.hybrid_calibration,
+        rt_samples_per_source=int(args.rt_samples_per_source),
+        rt_max_paths_per_source=int(args.rt_max_paths_per_source),
         compute_backend=args.compute_backend,
         compute_precision=args.compute_precision,
         adc_compute_precision=args.adc_compute_precision,

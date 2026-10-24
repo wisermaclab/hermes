@@ -4,9 +4,9 @@
 """Radar hardware descriptions."""
 
 from __future__ import annotations
+from ..values import positive_integer
 
 from dataclasses import dataclass
-import operator
 from typing import Mapping
 
 import numpy as np
@@ -55,9 +55,7 @@ def _broadcast_channel_angles(
         if not np.all(np.isfinite(arr)):
             raise ValueError("azimuth_deg and elevation_deg must be finite")
         arrays.append(arr)
-        channel_first.append(
-            arr.ndim >= 2 and arr.shape[0] == int(num_channels)
-        )
+        channel_first.append(arr.ndim >= 2 and arr.shape[0] == int(num_channels))
 
     active = [index for index, arr in enumerate(arrays) if arr is not None]
     if not active:
@@ -76,16 +74,12 @@ def _broadcast_channel_angles(
         else:
             common = np.broadcast_arrays(*(arrays[index] for index in active))
             path_shape = common[0].shape
-            output_shape = ((int(num_channels),) if path_shape == () else
-                            (int(num_channels), *path_shape))
-            broadcast = [
-                np.broadcast_to(arr, output_shape)
-                for arr in common
-            ]
+            output_shape = (
+                (int(num_channels),) if path_shape == () else (int(num_channels), *path_shape)
+            )
+            broadcast = [np.broadcast_to(arr, output_shape) for arr in common]
     except ValueError as exc:
-        raise ValueError(
-            "azimuth_deg and elevation_deg must be broadcast-compatible"
-        ) from exc
+        raise ValueError("azimuth_deg and elevation_deg must be broadcast-compatible") from exc
 
     normalized: list[np.ndarray | None] = [None, None]
     for index, arr in zip(active, broadcast):
@@ -93,8 +87,7 @@ def _broadcast_channel_angles(
     return normalized[0], normalized[1], output_shape
 
 
-def _virtual_channel_pairs(num_tx: int, num_rx: int,
-                           order: str) -> tuple[np.ndarray, np.ndarray]:
+def _virtual_channel_pairs(num_tx: int, num_rx: int, order: str) -> tuple[np.ndarray, np.ndarray]:
     """Returns Tx/Rx index arrays for the requested virtual-channel ordering."""
 
     if order == "tx_major":
@@ -126,13 +119,9 @@ def resolve_virtual_channel_pairs(
     tx_count = _positive_count("num_tx", num_tx)
     rx_count = _positive_count("num_rx", num_rx)
     if order not in ("tx_major", "rx_major"):
-        raise ValueError(
-            "virtual_channel_order must be 'tx_major' or 'rx_major'"
-        )
+        raise ValueError("virtual_channel_order must be 'tx_major' or 'rx_major'")
     if (tx_indices is None) != (rx_indices is None):
-        raise ValueError(
-            "virtual-channel Tx and Rx indices must be supplied together"
-        )
+        raise ValueError("virtual-channel Tx and Rx indices must be supplied together")
     if tx_indices is None:
         return _virtual_channel_pairs(tx_count, rx_count, order)
 
@@ -146,18 +135,11 @@ def resolve_virtual_channel_pairs(
     vc_rx = np.asarray(raw_rx, dtype=np.int64).reshape(-1)
     num_vc = tx_count * rx_count
     if vc_tx.shape != (num_vc,) or vc_rx.shape != (num_vc,):
-        raise ValueError(
-            "virtual-channel Tx/Rx indices must have one entry per "
-            "Tx/Rx pair"
-        )
+        raise ValueError("virtual-channel Tx/Rx indices must have one entry per Tx/Rx pair")
     if np.any((vc_tx < 0) | (vc_tx >= tx_count)):
-        raise ValueError(
-            "virtual-channel Tx indices contain an out-of-range index"
-        )
+        raise ValueError("virtual-channel Tx indices contain an out-of-range index")
     if np.any((vc_rx < 0) | (vc_rx >= rx_count)):
-        raise ValueError(
-            "virtual-channel Rx indices contain an out-of-range index"
-        )
+        raise ValueError("virtual-channel Rx indices contain an out-of-range index")
 
     linear_pairs = vc_tx * rx_count + vc_rx
     if not np.array_equal(np.sort(linear_pairs), np.arange(num_vc)):
@@ -184,18 +166,7 @@ def _selection_indices(name: str, value, *, upper_bound: int) -> np.ndarray:
     return indices
 
 
-def _positive_count(name: str, value) -> int:
-    """Validates a positive integer array dimension."""
-
-    if isinstance(value, (bool, np.bool_)):
-        raise ValueError(f"{name} must be a positive integer")
-    try:
-        count = operator.index(value)
-    except TypeError as exc:
-        raise ValueError(f"{name} must be a positive integer") from exc
-    if count <= 0:
-        raise ValueError(f"{name} must be a positive integer")
-    return int(count)
+_positive_count = positive_integer
 
 
 @dataclass(frozen=True)
@@ -234,16 +205,14 @@ class RadarHardware:
         if not np.all(np.isfinite(tx)) or not np.all(np.isfinite(rx)):
             raise ValueError("tx_positions and rx_positions must be finite")
         if self.virtual_channel_order not in ("tx_major", "rx_major"):
-            raise ValueError("virtual_channel_order must be 'tx_major' or"
-                             " 'rx_major'")
+            raise ValueError("virtual_channel_order must be 'tx_major' or 'rx_major'")
         num_vc = tx.shape[0] * rx.shape[0]
 
         labels = None
         if self.virtual_channel_labels is not None:
             labels = tuple(str(label) for label in self.virtual_channel_labels)
             if len(labels) != num_vc:
-                raise ValueError("virtual_channel_labels must have one entry"
-                                 " per virtual channel")
+                raise ValueError("virtual_channel_labels must have one entry per virtual channel")
             if any(not label.strip() for label in labels):
                 raise ValueError("virtual_channel_labels must be non-empty")
             if len(set(labels)) != len(labels):
@@ -257,45 +226,42 @@ class RadarHardware:
                 copy=True,
             )
             if positions_lambda.shape != (num_vc, 2):
-                raise ValueError("virtual_channel_positions_lambda must have"
-                                 " shape (num_virtual_channels, 2)")
-            if not np.all(np.isfinite(positions_lambda)):
                 raise ValueError(
-                    "virtual_channel_positions_lambda must be finite"
+                    "virtual_channel_positions_lambda must have shape (num_virtual_channels, 2)"
                 )
+            if not np.all(np.isfinite(positions_lambda)):
+                raise ValueError("virtual_channel_positions_lambda must be finite")
 
         tx_indices = None
         rx_indices = None
         if self.virtual_channel_tx_indices is not None:
             raw_tx_indices = np.asarray(self.virtual_channel_tx_indices)
             if not np.issubdtype(raw_tx_indices.dtype, np.integer):
-                raise ValueError(
-                    "virtual_channel_tx_indices must contain integers"
-                )
+                raise ValueError("virtual_channel_tx_indices must contain integers")
             tx_indices = np.asarray(raw_tx_indices, dtype=np.int64)
             if tx_indices.shape != (num_vc,):
-                raise ValueError("virtual_channel_tx_indices must have shape"
-                                 " (num_virtual_channels,)")
+                raise ValueError(
+                    "virtual_channel_tx_indices must have shape (num_virtual_channels,)"
+                )
             if np.any((tx_indices < 0) | (tx_indices >= tx.shape[0])):
-                raise ValueError("virtual_channel_tx_indices contains an"
-                                 " out-of-range Tx index")
+                raise ValueError("virtual_channel_tx_indices contains an out-of-range Tx index")
         if self.virtual_channel_rx_indices is not None:
             raw_rx_indices = np.asarray(self.virtual_channel_rx_indices)
             if not np.issubdtype(raw_rx_indices.dtype, np.integer):
-                raise ValueError(
-                    "virtual_channel_rx_indices must contain integers"
-                )
+                raise ValueError("virtual_channel_rx_indices must contain integers")
             rx_indices = np.asarray(raw_rx_indices, dtype=np.int64)
             if rx_indices.shape != (num_vc,):
-                raise ValueError("virtual_channel_rx_indices must have shape"
-                                 " (num_virtual_channels,)")
+                raise ValueError(
+                    "virtual_channel_rx_indices must have shape (num_virtual_channels,)"
+                )
             if np.any((rx_indices < 0) | (rx_indices >= rx.shape[0])):
-                raise ValueError("virtual_channel_rx_indices contains an"
-                                 " out-of-range Rx index")
+                raise ValueError("virtual_channel_rx_indices contains an out-of-range Rx index")
         if (tx_indices is None) != (rx_indices is None):
-            raise ValueError("virtual_channel_tx_indices and"
-                             " virtual_channel_rx_indices must be supplied"
-                             " together")
+            raise ValueError(
+                "virtual_channel_tx_indices and"
+                " virtual_channel_rx_indices must be supplied"
+                " together"
+            )
         if tx_indices is not None:
             resolve_virtual_channel_pairs(
                 tx.shape[0],
@@ -307,14 +273,12 @@ class RadarHardware:
 
         phase_signs = None
         if self.virtual_channel_phase_signs is not None:
-            phase_signs = np.asarray(self.virtual_channel_phase_signs,
-                                     dtype=np.complex128)
+            phase_signs = np.asarray(self.virtual_channel_phase_signs, dtype=np.complex128)
             if phase_signs.shape != (num_vc,):
-                raise ValueError("virtual_channel_phase_signs must have shape"
-                                 " (num_virtual_channels,)")
-            if not np.all(
-                np.isfinite(phase_signs.real) & np.isfinite(phase_signs.imag)
-            ):
+                raise ValueError(
+                    "virtual_channel_phase_signs must have shape (num_virtual_channels,)"
+                )
+            if not np.all(np.isfinite(phase_signs.real) & np.isfinite(phase_signs.imag)):
                 raise ValueError("virtual_channel_phase_signs must be finite")
 
         scalar_gain = self.scalar_antenna_gain_dbi
@@ -326,9 +290,7 @@ class RadarHardware:
                     "scalar_antenna_gain_dbi must be a finite scalar or None"
                 ) from exc
             if not np.isfinite(scalar_gain):
-                raise ValueError(
-                    "scalar_antenna_gain_dbi must be a finite scalar or None"
-                )
+                raise ValueError("scalar_antenna_gain_dbi must be a finite scalar or None")
 
         pattern_channels = getattr(
             self.antenna_pattern,
@@ -340,9 +302,7 @@ class RadarHardware:
             pattern_channels,
         )
         if pattern_channel_count != num_vc:
-            raise ValueError(
-                "antenna_pattern num_virtual_channels does not match hardware"
-            )
+            raise ValueError("antenna_pattern num_virtual_channels does not match hardware")
         if self.board_metadata is not None and not isinstance(
             self.board_metadata,
             Mapping,
@@ -352,8 +312,7 @@ class RadarHardware:
         object.__setattr__(self, "tx_positions", tx)
         object.__setattr__(self, "rx_positions", rx)
         object.__setattr__(self, "virtual_channel_labels", labels)
-        object.__setattr__(self, "virtual_channel_positions_lambda",
-                           positions_lambda)
+        object.__setattr__(self, "virtual_channel_positions_lambda", positions_lambda)
         object.__setattr__(self, "virtual_channel_tx_indices", tx_indices)
         object.__setattr__(self, "virtual_channel_rx_indices", rx_indices)
         object.__setattr__(self, "virtual_channel_phase_signs", phase_signs)
@@ -400,11 +359,16 @@ class RadarHardware:
         )
         return rx_indices.copy()
 
-    def channel_gain(self, *, azimuth_deg=None, elevation_deg=None,
-                     frequency_hz: float | None = None,
-                     include_phase: bool = True,
-                     include_antenna_gain: bool = True,
-                     include_pattern: bool = True) -> np.ndarray:
+    def channel_gain(
+        self,
+        *,
+        azimuth_deg=None,
+        elevation_deg=None,
+        frequency_hz: float | None = None,
+        include_phase: bool = True,
+        include_antenna_gain: bool = True,
+        include_pattern: bool = True,
+    ) -> np.ndarray:
         """
         Returns complex voltage multipliers for virtual channels.
 
@@ -428,31 +392,32 @@ class RadarHardware:
         gain = np.power(10.0, gain_db / 20.0).astype(np.complex128)
         if include_phase and self.virtual_channel_phase_signs is not None:
             signs = self.virtual_channel_phase_signs.astype(np.complex128)
-            signs = signs.reshape((self.num_virtual_channels,)
-                                  + (1,) * (gain.ndim - 1))
+            signs = signs.reshape((self.num_virtual_channels,) + (1,) * (gain.ndim - 1))
             gain *= signs
         return gain
 
-    def apply_channel_gain(self, coefficients: np.ndarray, *,
-                           azimuth_deg=None,
-                           elevation_deg=None,
-                           frequency_hz: float | None = None) -> np.ndarray:
+    def apply_channel_gain(
+        self,
+        coefficients: np.ndarray,
+        *,
+        azimuth_deg=None,
+        elevation_deg=None,
+        frequency_hz: float | None = None,
+    ) -> np.ndarray:
         """Applies :meth:`channel_gain` to a coefficient matrix."""
 
         coeffs = np.asarray(coefficients)
         if coeffs.ndim == 0:
             raise ValueError("coefficients must include a virtual-channel axis")
         if coeffs.shape[0] != self.num_virtual_channels:
-            raise ValueError("coefficients first axis must match the number of"
-                             " virtual channels")
+            raise ValueError("coefficients first axis must match the number of virtual channels")
         gains = self.channel_gain(
             azimuth_deg=azimuth_deg,
             elevation_deg=elevation_deg,
             frequency_hz=frequency_hz,
         )
         if gains.shape == (self.num_virtual_channels,) and coeffs.ndim > 1:
-            gains = gains.reshape((self.num_virtual_channels,)
-                                  + (1,) * (coeffs.ndim - 1))
+            gains = gains.reshape((self.num_virtual_channels,) + (1,) * (coeffs.ndim - 1))
         return coeffs * gains
 
     def subset_tx(self, tx_indices) -> "RadarHardware":
@@ -479,8 +444,7 @@ class RadarHardware:
 
         labels = None
         if self.virtual_channel_labels is not None:
-            labels = tuple(self.virtual_channel_labels[int(i)]
-                           for i in selected)
+            labels = tuple(self.virtual_channel_labels[int(i)] for i in selected)
 
         return RadarHardware(
             name=self.name,
@@ -488,15 +452,13 @@ class RadarHardware:
             rx_positions=self.rx_positions,
             virtual_channel_order=self.virtual_channel_order,
             virtual_channel_labels=labels,
-            virtual_channel_positions_lambda=_subset_array(
-                self.virtual_channel_positions_lambda),
+            virtual_channel_positions_lambda=_subset_array(self.virtual_channel_positions_lambda),
             virtual_channel_tx_indices=np.asarray(
                 [tx_remap[int(old_vc_tx[i])] for i in selected],
                 dtype=np.int64,
             ),
             virtual_channel_rx_indices=old_vc_rx[selected],
-            virtual_channel_phase_signs=_subset_array(
-                self.virtual_channel_phase_signs),
+            virtual_channel_phase_signs=_subset_array(self.virtual_channel_phase_signs),
             scalar_antenna_gain_dbi=self.scalar_antenna_gain_dbi,
             antenna_pattern=pattern,
             board_metadata=self.board_metadata,
@@ -526,8 +488,7 @@ class RadarHardware:
 
         labels = None
         if self.virtual_channel_labels is not None:
-            labels = tuple(self.virtual_channel_labels[int(i)]
-                           for i in selected)
+            labels = tuple(self.virtual_channel_labels[int(i)] for i in selected)
 
         return RadarHardware(
             name=self.name,
@@ -535,15 +496,13 @@ class RadarHardware:
             rx_positions=self.rx_positions[indices],
             virtual_channel_order=self.virtual_channel_order,
             virtual_channel_labels=labels,
-            virtual_channel_positions_lambda=_subset_array(
-                self.virtual_channel_positions_lambda),
+            virtual_channel_positions_lambda=_subset_array(self.virtual_channel_positions_lambda),
             virtual_channel_tx_indices=old_vc_tx[selected],
             virtual_channel_rx_indices=np.asarray(
                 [rx_remap[int(old_vc_rx[i])] for i in selected],
                 dtype=np.int64,
             ),
-            virtual_channel_phase_signs=_subset_array(
-                self.virtual_channel_phase_signs),
+            virtual_channel_phase_signs=_subset_array(self.virtual_channel_phase_signs),
             scalar_antenna_gain_dbi=self.scalar_antenna_gain_dbi,
             antenna_pattern=pattern,
             board_metadata=self.board_metadata,
@@ -560,8 +519,9 @@ class RadarHardware:
         return shape
 
     @classmethod
-    def from_xwr68xx(cls, model: str = "IWR6843AOP",
-                     spacing: float | None = None) -> "RadarHardware":
+    def from_xwr68xx(
+        cls, model: str = "IWR6843AOP", spacing: float | None = None
+    ) -> "RadarHardware":
         r"""
         Approximate xWR68xx/IWR6843-family element layout.
 
@@ -576,39 +536,50 @@ class RadarHardware:
         if key in ("IWR6843AOP", "AWR6843AOP", "XWR68XX_AOP"):
             lam = 2.0 * d
             # Sionna's planar array lives in the local y-z plane.
-            rx = np.array([
-                [0.0, 0.0, 0.0],
-                [0.0, -lam / 2.0, 0.0],
-                [0.0, 0.0, -lam / 2.0],
-                [0.0, -lam / 2.0, -lam / 2.0],
-            ], dtype=float)
-            tx = np.array([
-                [0.0, 0.0, -lam],
-                [0.0, lam, 0.0],
-                [0.0, lam, -lam],
-            ], dtype=float)
+            rx = np.array(
+                [
+                    [0.0, 0.0, 0.0],
+                    [0.0, -lam / 2.0, 0.0],
+                    [0.0, 0.0, -lam / 2.0],
+                    [0.0, -lam / 2.0, -lam / 2.0],
+                ],
+                dtype=float,
+            )
+            tx = np.array(
+                [
+                    [0.0, 0.0, -lam],
+                    [0.0, lam, 0.0],
+                    [0.0, lam, -lam],
+                ],
+                dtype=float,
+            )
         elif key in ("IWR6843ISK", "XWR68XX", "XWR68XX_ISK"):
-            rx = np.array([
-                [0.0, 0.0 * d, 0.0],
-                [0.0, 1.0 * d, 0.0],
-                [0.0, 2.0 * d, 0.0],
-                [0.0, 3.0 * d, 0.0],
-            ], dtype=float)
-            tx = np.array([
-                [0.0, 0.0 * d, 0.0],
-                [0.0, 1.0 * d, 1.0 * d],
-                [0.0, 2.0 * d, 0.0],
-            ], dtype=float)
+            rx = np.array(
+                [
+                    [0.0, 0.0 * d, 0.0],
+                    [0.0, 1.0 * d, 0.0],
+                    [0.0, 2.0 * d, 0.0],
+                    [0.0, 3.0 * d, 0.0],
+                ],
+                dtype=float,
+            )
+            tx = np.array(
+                [
+                    [0.0, 0.0 * d, 0.0],
+                    [0.0, 1.0 * d, 1.0 * d],
+                    [0.0, 2.0 * d, 0.0],
+                ],
+                dtype=float,
+            )
         else:
             tx = _ula(3, d, axis=1)
             rx = _ula(4, d, axis=2)
         return cls(name=key, tx_positions=tx, rx_positions=rx)
 
     @classmethod
-    def from_ti_board(cls, model: str,
-                      pattern_mode: str = "cosine30",
-                      cosine_half_power_angle_deg: float = 30.0
-                      ) -> "RadarHardware":
+    def from_ti_board(
+        cls, model: str, pattern_mode: str = "cosine30", cosine_half_power_angle_deg: float = 30.0
+    ) -> "RadarHardware":
         """Builds hardware from the local TI board digital-twin catalog."""
 
         from .ti import get_ti_board_spec  # pylint: disable=import-outside-toplevel
@@ -620,8 +591,7 @@ class RadarHardware:
             rx_positions=spec.rx_positions_m(),
             virtual_channel_order="tx_major",
             virtual_channel_labels=spec.virtual_channel_labels(),
-            virtual_channel_positions_lambda=(
-                spec.virtual_channel_positions_lambda()),
+            virtual_channel_positions_lambda=(spec.virtual_channel_positions_lambda()),
             virtual_channel_tx_indices=spec.virtual_channel_tx_indices(),
             virtual_channel_rx_indices=spec.virtual_channel_rx_indices(),
             virtual_channel_phase_signs=spec.channel_phase_signs(),
@@ -662,33 +632,19 @@ class RadarHardware:
         """
 
         row_count = _positive_count("rows", rows)
-        col_count = (
-            row_count if cols is None else _positive_count("cols", cols)
-        )
+        col_count = row_count if cols is None else _positive_count("cols", cols)
         wavelength_m = float(wavelength)
         spacing = float(spacing_lambda)
         if not np.isfinite(wavelength_m) or wavelength_m <= 0.0:
             raise ValueError("wavelength must be finite and positive")
         if not np.isfinite(spacing) or spacing <= 0.0:
             raise ValueError("spacing_lambda must be finite and positive")
-        spacing_y = (
-            spacing
-            if spacing_y_lambda is None
-            else float(spacing_y_lambda)
-        )
-        spacing_z = (
-            spacing
-            if spacing_z_lambda is None
-            else float(spacing_z_lambda)
-        )
+        spacing_y = spacing if spacing_y_lambda is None else float(spacing_y_lambda)
+        spacing_z = spacing if spacing_z_lambda is None else float(spacing_z_lambda)
         if not np.isfinite(spacing_y) or spacing_y <= 0.0:
-            raise ValueError(
-                "spacing_y_lambda must be finite and positive"
-            )
+            raise ValueError("spacing_y_lambda must be finite and positive")
         if not np.isfinite(spacing_z) or spacing_z <= 0.0:
-            raise ValueError(
-                "spacing_z_lambda must be finite and positive"
-            )
+            raise ValueError("spacing_z_lambda must be finite and positive")
         if not isinstance(centered, (bool, np.bool_)):
             raise ValueError("centered must be a boolean")
 
@@ -700,45 +656,34 @@ class RadarHardware:
         y_lambda = y_index * spacing_y
         z_lambda = z_index * spacing_z
         yy_lambda, zz_lambda = np.meshgrid(y_lambda, z_lambda, indexing="xy")
-        virtual_positions_lambda = np.column_stack([
-            yy_lambda.reshape(-1),
-            zz_lambda.reshape(-1),
-        ])
+        virtual_positions_lambda = np.column_stack(
+            [
+                yy_lambda.reshape(-1),
+                zz_lambda.reshape(-1),
+            ]
+        )
 
         tx_positions = np.zeros((1, 3), dtype=float)
-        rx_positions = np.zeros((virtual_positions_lambda.shape[0], 3),
-                                dtype=float)
+        rx_positions = np.zeros((virtual_positions_lambda.shape[0], 3), dtype=float)
         rx_positions[:, 1:] = virtual_positions_lambda * wavelength_m
 
         labels = tuple(
-            f"VURA r{row + 1} c{col + 1}"
-            for row in range(row_count)
-            for col in range(col_count)
+            f"VURA r{row + 1} c{col + 1}" for row in range(row_count) for col in range(col_count)
         )
         metadata = {
             "kind": "virtual_ura",
             "rows": row_count,
             "cols": col_count,
-            "spacing_lambda": (
-                spacing_y if np.isclose(spacing_y, spacing_z) else None
-            ),
+            "spacing_lambda": (spacing_y if np.isclose(spacing_y, spacing_z) else None),
             "spacing_y_lambda": spacing_y,
             "spacing_z_lambda": spacing_z,
             "centered": bool(centered),
-            "aperture_m_y": (
-                max(col_count - 1, 0) * spacing_y * wavelength_m
-            ),
-            "aperture_m_z": (
-                max(row_count - 1, 0) * spacing_z * wavelength_m
-            ),
+            "aperture_m_y": (max(col_count - 1, 0) * spacing_y * wavelength_m),
+            "aperture_m_z": (max(row_count - 1, 0) * spacing_z * wavelength_m),
             "wavelength_m": wavelength_m,
             "transmission": "concurrent",
         }
-        hardware_name = (
-            f"VIRTUAL_URA{row_count}X{col_count}"
-            if name is None
-            else str(name)
-        )
+        hardware_name = f"VIRTUAL_URA{row_count}X{col_count}" if name is None else str(name)
         return cls(
             name=hardware_name,
             tx_positions=tx_positions,
@@ -752,11 +697,19 @@ class RadarHardware:
         )
 
     @classmethod
-    def from_positions(cls, tx_positions, rx_positions,
-                       name: str = "custom",
-                       virtual_channel_order: str = "tx_major"):
+    def from_positions(
+        cls,
+        tx_positions,
+        rx_positions,
+        name: str = "custom",
+        virtual_channel_order: str = "tx_major",
+    ):
         """Builds hardware from explicit Tx/Rx element positions."""
         tx = np.asarray(tx_positions, dtype=float)
         rx = np.asarray(rx_positions, dtype=float)
-        return cls(name=name, tx_positions=tx, rx_positions=rx,
-                   virtual_channel_order=virtual_channel_order)
+        return cls(
+            name=name,
+            tx_positions=tx,
+            rx_positions=rx,
+            virtual_channel_order=virtual_channel_order,
+        )

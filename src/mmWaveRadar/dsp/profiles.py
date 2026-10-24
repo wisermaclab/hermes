@@ -10,11 +10,19 @@ from typing import Literal, Optional
 import numpy as np
 
 
+def mean_range_profile(power: np.ndarray) -> np.ndarray:
+    """Average a power map over all axes preceding its final range axis."""
+    values = np.asarray(power, dtype=float)
+    if values.ndim == 1:
+        return values
+    return np.mean(values, axis=tuple(range(values.ndim - 1)))
+
+
 def range_profile_from_cube(
     range_cube: np.ndarray,
     *,
     combine_antennas: Literal[
-        "sum_power", "mean_power", "sum_mag", "mean_mag"
+        "sum_power", "mean_power", "sum_mag", "mean_mag", "none"
     ] = "sum_power",
     combine_chirps: Optional[Literal["mean", "sum"]] = None,
 ) -> np.ndarray:
@@ -23,14 +31,17 @@ def range_profile_from_cube(
 
     :param range_cube: Complex range FFT cube with shape
         ``[num_chirps, num_range_bins, num_channels]``.
-    :param combine_antennas: Channel-combination method.
+    :param combine_antennas: Channel-combination method; ``none`` keeps each
+        channel's power as a separate last-axis entry.
     :param combine_chirps: Optional slow-time reduction.
     """
     y = np.asarray(range_cube)
     if y.ndim != 3:
         raise ValueError("range_cube must have shape [M, R, P]")
 
-    if combine_antennas in ("sum_power", "mean_power"):
+    if combine_antennas == "none":
+        rp = np.abs(y) ** 2
+    elif combine_antennas in ("sum_power", "mean_power"):
         rp = np.sum(np.abs(y) ** 2, axis=-1)
         if combine_antennas == "mean_power":
             rp = rp / y.shape[-1]

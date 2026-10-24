@@ -1,34 +1,21 @@
 # SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
 # Copyright (c) 2026 Wireless System Research Group, McMaster University
 
-"""Benchmark human-only PO on a mesh-sequence NPZ."""
+"""Benchmark the PO solver on a human mesh-sequence NPZ."""
 
 from __future__ import annotations
 
 import argparse
-import csv
-import json
 import os
 import sys
 import tempfile
 import time
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from pathlib import Path
 
 import numpy as np
 
-
-def _repo_root() -> Path:
-    """Finds the simulator repository root from this benchmark script."""
-
-    path = Path(__file__).resolve()
-    for parent in path.parents:
-        if (parent / "src" / "mmWaveRadar").exists():
-            return parent
-    raise RuntimeError("Could not locate mmWave simulator repository root")
-
-
-REPO_ROOT = _repo_root()
+REPO_ROOT = Path(__file__).resolve().parents[2]
 SRC_PATH = str(REPO_ROOT / "src")
 if SRC_PATH not in sys.path:
     sys.path.insert(0, SRC_PATH)
@@ -44,15 +31,18 @@ os.environ.setdefault(
 
 from sionna.rt import load_scene  # noqa: E402
 
+from mmWaveRadar.tutorial_support import orientation_toward as _orientation_toward
 from mmWaveRadar.dsp import (  # noqa: E402
     doppler_time_spectrum,
     range_doppler_map,
     range_time_map,
 )
+from mmWaveRadar.diagnostics.reports import write_summary as _write_summary
 from mmWaveRadar.materials import human_skin_material  # noqa: E402
+from mmWaveRadar.naming import add_removed_options  # noqa: E402
 from mmWaveRadar.radar import FMCWConfig, RadarHardware, RadarSensor  # noqa: E402
 from mmWaveRadar.simulation import (  # noqa: E402
-    HumanPOMobilityConfig,
+    POConfig,
     MmWaveRadarSimulator,
     POIncrementalSweepSetting,
     cube_matches_run,
@@ -65,30 +55,16 @@ from mmWaveRadar.simulation import (  # noqa: E402
 )
 from mmWaveRadar.targets import MeshSequence, MeshTarget  # noqa: E402
 
-
+# Visibility cadence in radar frames (0 = every chirp), then the per-facet
+# re-integration triggers.
 DEFAULT_SETTINGS = [
-    POIncrementalSweepSetting("k8 nominal n5 d2mm a5pct", 8, 5.0, 0.002, 0.05),
-    POIncrementalSweepSetting("k16 nominal n5 d2mm a5pct", 16, 5.0, 0.002, 0.05),
-    POIncrementalSweepSetting("k32 nominal n5 d2mm a5pct", 32, 5.0, 0.002, 0.05),
-    POIncrementalSweepSetting("k64 nominal n5 d2mm a5pct", 64, 5.0, 0.002, 0.05),
-    POIncrementalSweepSetting("k32 loose n15 d10mm a20pct", 32, 15.0, 0.010, 0.20),
-    POIncrementalSweepSetting("k64 loose n20 d20mm a30pct", 64, 20.0, 0.020, 0.30),
-    POIncrementalSweepSetting("k128 aggressive n30 d50mm a50pct", 128, 30.0, 0.050, 0.50),
+    POIncrementalSweepSetting("v0 phase 0.1 rad", 0, 0.1),
+    POIncrementalSweepSetting("v1 phase 0.1 rad", 1, 0.1),
+    POIncrementalSweepSetting("v2 phase 0.1 rad", 2, 0.1),
+    POIncrementalSweepSetting("v0 phase 0.3 rad", 0, 0.3),
+    POIncrementalSweepSetting("v1 phase 0.5 rad", 1, 0.5),
+    POIncrementalSweepSetting("v2 phase 1.0 rad", 2, 1.0),
 ]
-
-
-def _orientation_toward(target_point, radar_position):
-    """Matches Sionna RadioDevice.look_at: local +x points toward target_point."""
-
-    direction = np.asarray(target_point, dtype=float) - np.asarray(
-        radar_position, dtype=float)
-    norm = np.linalg.norm(direction)
-    if norm < 1e-12:
-        raise ValueError("radar position and look-at target are identical")
-    direction /= norm
-    theta = np.arccos(np.clip(direction[2], -1.0, 1.0))
-    phi = np.arctan2(direction[1], direction[0])
-    return (float(phi), float(theta - 0.5 * np.pi), 0.0)
 
 
 def _count_radar_frames_in_mesh_sequence(mesh_sequence, fmcw):
@@ -96,14 +72,12 @@ def _count_radar_frames_in_mesh_sequence(mesh_sequence, fmcw):
     if times.size == 0:
         raise ValueError("mesh sequence must contain at least one time sample")
     sequence_span_s = float(times[-1] - times[0])
-    last_chirp_offset_s = (fmcw.num_chirps_per_frame - 1) * (
-        fmcw.chirp_repetition_time)
+    last_chirp_offset_s = (fmcw.num_chirps_per_frame - 1) * (fmcw.chirp_repetition_time)
     if sequence_span_s <= last_chirp_offset_s:
         return 1
     return max(
         1,
-        int(np.floor((sequence_span_s - last_chirp_offset_s)
-                     / fmcw.frame_period)) + 1,
+        int(np.floor((sequence_span_s - last_chirp_offset_s) / fmcw.frame_period)) + 1,
     )
 
 
@@ -112,32 +86,32 @@ def _parse_vec3(value: str, *, name: str) -> tuple[float, float, float]:
         parts = [float(part.strip()) for part in value.split(",")]
     except ValueError as exc:
         raise argparse.ArgumentTypeError(
-            f"{name} must be comma-separated floats, e.g. 0,0,1") from exc
+            f"{name} must be comma-separated floats, e.g. 0,0,1"
+        ) from exc
     if len(parts) != 3:
-        raise argparse.ArgumentTypeError(
-            f"{name} must have exactly three comma-separated values")
+        raise argparse.ArgumentTypeError(f"{name} must have exactly three comma-separated values")
     return (parts[0], parts[1], parts[2])
 
 
 def _parse_setting(value: str) -> POIncrementalSweepSetting:
     parts = value.split(":")
-    if len(parts) != 5:
+    if len(parts) != 3:
         raise argparse.ArgumentTypeError(
-            "--setting must be label:K:normal_deg:centroid_m:area_rel")
+            "--setting must be label:visibility_frames:phase_error_rad"
+        )
     label = parts[0].strip()
     if not label:
         raise argparse.ArgumentTypeError("setting label must not be empty")
     try:
         return POIncrementalSweepSetting(
             label=label,
-            visibility_refresh_chirps=int(parts[1]),
-            normal_threshold_deg=float(parts[2]),
-            centroid_displacement_threshold_m=float(parts[3]),
-            area_relative_threshold=float(parts[4]),
+            po_visibility_refresh_frames=int(parts[1]),
+            po_refresh_on_phase_error_rad=float(parts[2]),
         )
     except ValueError as exc:
         raise argparse.ArgumentTypeError(
-            "--setting must be label:K:normal_deg:centroid_m:area_rel") from exc
+            "--setting must be label:visibility_frames:phase_error_rad"
+        ) from exc
 
 
 def _load_mesh_sequence(path: Path) -> MeshSequence:
@@ -177,7 +151,8 @@ def _build_radar(args, mesh_sequence: MeshSequence):
     )
     if args.radar_position is None:
         radar_position, radar_orientation, look_at = _default_radar_pose(
-            mesh_sequence, args.radar_clearance_m)
+            mesh_sequence, args.radar_clearance_m
+        )
     else:
         radar_position = np.asarray(args.radar_position, dtype=float)
         if args.radar_look_at is not None:
@@ -185,12 +160,11 @@ def _build_radar(args, mesh_sequence: MeshSequence):
             radar_orientation = _orientation_toward(look_at, radar_position)
         elif args.radar_orientation is not None:
             radar_orientation = tuple(args.radar_orientation)
-            look_at = np.asarray(mesh_sequence.vertices_at(
-                float(mesh_sequence.times[0])).mean(axis=0), dtype=float)
+            look_at = np.asarray(
+                mesh_sequence.vertices_at(float(mesh_sequence.times[0])).mean(axis=0), dtype=float
+            )
         else:
-            raise ValueError(
-                "--radar-position requires --radar-look-at or "
-                "--radar-orientation")
+            raise ValueError("--radar-position requires --radar-look-at or --radar-orientation")
     radar = RadarSensor(
         name="radar",
         position=tuple(float(v) for v in radar_position),
@@ -201,10 +175,10 @@ def _build_radar(args, mesh_sequence: MeshSequence):
     return radar, np.asarray(look_at, dtype=float)
 
 
-def _run_human_only_po(
+def _run_po(
     *,
     label: str,
-    config: HumanPOMobilityConfig,
+    config: POConfig,
     radar: RadarSensor,
     target: MeshTarget,
     num_frames: int,
@@ -212,9 +186,9 @@ def _run_human_only_po(
 ):
     scene = load_scene()
     sim_kwargs = {
-        "mobility_mode": "human_only_po",
+        "solver": "po",
         "progress": args.progress,
-        "human_po_config": config,
+        "po_config": config,
     }
     if args.compute_backend is not None:
         sim_kwargs["compute_backend"] = args.compute_backend
@@ -235,8 +209,7 @@ def _run_human_only_po(
     elapsed = time.perf_counter() - start
     num_chirps = int(np.prod(cube.adc.shape[:2]))
     print(
-        f"{label}: {elapsed:.2f} s "
-        f"({elapsed / num_chirps:.4f} s/chirp)",
+        f"{label}: {elapsed:.2f} s " f"({elapsed / num_chirps:.4f} s/chirp)",
         flush=True,
     )
     return cube, elapsed, num_chirps
@@ -269,23 +242,9 @@ def _unique_results(results):
     return unique
 
 
-def _write_summary(output_dir: Path, metadata: dict, rows: list[dict]):
-    summary = dict(metadata)
-    summary["results"] = rows
-    json_path = output_dir / "summary.json"
-    csv_path = output_dir / "summary.csv"
-    json_path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
-    if rows:
-        with csv_path.open("w", newline="", encoding="utf-8") as f:
-            writer = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
-            writer.writeheader()
-            writer.writerows(rows)
-    print(f"Wrote summary JSON: {json_path}", flush=True)
-    print(f"Wrote summary CSV: {csv_path}", flush=True)
-
-
-def _plot_results(args, output_dir, fmcw, baseline, baseline_wall_time_s,
-                  baseline_num_chirps, results):
+def _plot_results(
+    args, output_dir, fmcw, baseline, baseline_wall_time_s, baseline_num_chirps, results
+):
     import matplotlib
 
     matplotlib.use(args.matplotlib_backend)
@@ -328,26 +287,25 @@ def _plot_results(args, output_dir, fmcw, baseline, baseline_wall_time_s,
     fig.savefig(output_dir / "po_sweep_tradeoff.png", dpi=args.plot_dpi)
     plt.close(fig)
 
-    selected = _unique_results([
-        {
-            "label": "Full PO",
-            "cube": baseline,
-            "wall_time_s": baseline_wall_time_s,
-            "num_chirps": baseline_num_chirps,
-        },
-        min(rows, key=lambda row: abs(row["setting_K"] - 64)),
-        max(rows, key=lambda row: row["speedup"]),
-        min(rows, key=lambda row: row["range_profile_relative_error"]),
-    ])
+    selected = _unique_results(
+        [
+            {
+                "label": "Full PO",
+                "cube": baseline,
+                "wall_time_s": baseline_wall_time_s,
+                "num_chirps": baseline_num_chirps,
+            },
+            min(rows, key=lambda row: abs(row["po_visibility_refresh_frames"] - 1)),
+            max(rows, key=lambda row: row["speedup"]),
+            min(rows, key=lambda row: row["range_profile_relative_error"]),
+        ]
+    )
 
-    range_time_plot_duration_s = min(
-        args.plot_duration_s, float(baseline.times[-1, -1]))
+    range_time_plot_duration_s = min(args.plot_duration_s, float(baseline.times[-1, -1]))
     comparison = []
     for row in selected:
-        frame_count = _frames_for_duration(row["cube"].times,
-                                           range_time_plot_duration_s)
-        comparison.append((row["label"], row["cube"], row["wall_time_s"],
-                           frame_count))
+        frame_count = _frames_for_duration(row["cube"].times, range_time_plot_duration_s)
+        comparison.append((row["label"], row["cube"], row["wall_time_s"], frame_count))
 
     range_time_results = []
     for label, cube, wall_time_s, frame_count in comparison:
@@ -359,13 +317,15 @@ def _plot_results(args, output_dir, fmcw, baseline, baseline_wall_time_s,
         )
         range_mask = ranges_m <= args.range_plot_limit_m
         slow_time_ms = cube.times[:frame_count].reshape(-1) * 1e3
-        range_time_results.append((
-            label,
-            wall_time_s,
-            _relative_db(rt_map[:, range_mask]),
-            slow_time_ms,
-            ranges_m[range_mask],
-        ))
+        range_time_results.append(
+            (
+                label,
+                wall_time_s,
+                _relative_db(rt_map[:, range_mask]),
+                slow_time_ms,
+                ranges_m[range_mask],
+            )
+        )
 
     fig, axes = plt.subplots(
         1,
@@ -374,14 +334,12 @@ def _plot_results(args, output_dir, fmcw, baseline, baseline_wall_time_s,
         constrained_layout=True,
     )
     axes = np.atleast_1d(axes)
-    for ax, (label, wall_time_s, db_map, slow_time_ms, ranges_m) in zip(
-            axes, range_time_results):
+    for ax, (label, wall_time_s, db_map, slow_time_ms, ranges_m) in zip(axes, range_time_results):
         im = ax.imshow(
             db_map.T,
             origin="lower",
             aspect="auto",
-            extent=[slow_time_ms[0], slow_time_ms[-1],
-                    ranges_m[0], ranges_m[-1]],
+            extent=[slow_time_ms[0], slow_time_ms[-1], ranges_m[0], ranges_m[-1]],
             vmin=args.plot_vmin_db,
             vmax=0,
             cmap="viridis",
@@ -404,12 +362,14 @@ def _plot_results(args, output_dir, fmcw, baseline, baseline_wall_time_s,
         )
         rd_power = np.sum(np.abs(rd_cube) ** 2, axis=-1)
         rd_mask = rd_ranges_m <= args.range_plot_limit_m
-        range_doppler_results.append((
-            label,
-            _relative_db(rd_power[:, rd_mask]),
-            rd_ranges_m[rd_mask],
-            velocities_mps,
-        ))
+        range_doppler_results.append(
+            (
+                label,
+                _relative_db(rd_power[:, rd_mask]),
+                rd_ranges_m[rd_mask],
+                velocities_mps,
+            )
+        )
 
     fig, axes = plt.subplots(
         1,
@@ -418,14 +378,12 @@ def _plot_results(args, output_dir, fmcw, baseline, baseline_wall_time_s,
         constrained_layout=True,
     )
     axes = np.atleast_1d(axes)
-    for ax, (label, rd_db, rd_ranges_m, velocities_mps) in zip(
-            axes, range_doppler_results):
+    for ax, (label, rd_db, rd_ranges_m, velocities_mps) in zip(axes, range_doppler_results):
         im = ax.imshow(
             rd_db,
             origin="lower",
             aspect="auto",
-            extent=[rd_ranges_m[0], rd_ranges_m[-1],
-                    velocities_mps[0], velocities_mps[-1]],
+            extent=[rd_ranges_m[0], rd_ranges_m[-1], velocities_mps[0], velocities_mps[-1]],
             vmin=args.plot_vmin_db,
             vmax=0,
             cmap="magma",
@@ -451,12 +409,14 @@ def _plot_results(args, output_dir, fmcw, baseline, baseline_wall_time_s,
             slow_time_s=cube.times[:rd_frame_count].reshape(-1),
             range_limits_m=(0.0, args.range_plot_limit_m),
         )
-        doppler_time_results.append((
-            label,
-            _relative_db(dt_spectrum),
-            dt_times_s * 1e3,
-            dt_velocities_mps,
-        ))
+        doppler_time_results.append(
+            (
+                label,
+                _relative_db(dt_spectrum),
+                dt_times_s * 1e3,
+                dt_velocities_mps,
+            )
+        )
 
     fig, axes = plt.subplots(
         1,
@@ -465,14 +425,12 @@ def _plot_results(args, output_dir, fmcw, baseline, baseline_wall_time_s,
         constrained_layout=True,
     )
     axes = np.atleast_1d(axes)
-    for ax, (label, dt_db, dt_time_ms, dt_velocities_mps) in zip(
-            axes, doppler_time_results):
+    for ax, (label, dt_db, dt_time_ms, dt_velocities_mps) in zip(axes, doppler_time_results):
         im = ax.imshow(
             dt_db.T,
             origin="lower",
             aspect="auto",
-            extent=[dt_time_ms[0], dt_time_ms[-1],
-                    dt_velocities_mps[0], dt_velocities_mps[-1]],
+            extent=[dt_time_ms[0], dt_time_ms[-1], dt_velocities_mps[0], dt_velocities_mps[-1]],
             vmin=args.plot_vmin_db,
             vmax=0,
             cmap="plasma",
@@ -491,18 +449,14 @@ def _result_row(result):
     setting = result.setting
     return {
         "label": result.label,
-        "setting_K": int(setting.visibility_refresh_chirps),
-        "normal_threshold_deg": float(setting.normal_threshold_deg),
-        "centroid_displacement_threshold_m": float(
-            setting.centroid_displacement_threshold_m),
-        "area_relative_threshold": float(setting.area_relative_threshold),
+        "po_visibility_refresh_frames": int(setting.po_visibility_refresh_frames),
+        "po_refresh_on_phase_error_rad": float(setting.po_refresh_on_phase_error_rad),
         "wall_time_s": float(result.wall_time_s),
         "num_chirps": int(result.num_chirps),
         "seconds_per_chirp": float(result.wall_time_s / result.num_chirps),
         "speedup": float(result.speedup),
         "adc_relative_error": float(result.adc_relative_error),
-        "range_profile_relative_error": float(
-            result.range_profile_relative_error),
+        "range_profile_relative_error": float(result.range_profile_relative_error),
         "path_count_delta_min": int(result.path_count_delta_min),
         "path_count_delta_mean": float(result.path_count_delta_mean),
         "path_count_delta_max": int(result.path_count_delta_max),
@@ -528,13 +482,11 @@ def _single_result_row(label, cube, wall_time_s: float, num_chirps: int):
     }
     if cube.metadata.runtime_profile_s is not None:
         row["runtime_profile_s"] = {
-            key: float(value)
-            for key, value in cube.metadata.runtime_profile_s.items()
+            key: float(value) for key, value in cube.metadata.runtime_profile_s.items()
         }
     if cube.metadata.runtime_profile_counts is not None:
         row["runtime_profile_counts"] = {
-            key: int(value)
-            for key, value in cube.metadata.runtime_profile_counts.items()
+            key: int(value) for key, value in cube.metadata.runtime_profile_counts.items()
         }
     if cube.metadata.incremental_recomputed_face_counts is not None:
         recomputed = cube.metadata.incremental_recomputed_face_counts
@@ -551,28 +503,20 @@ def _single_result_row(label, cube, wall_time_s: float, num_chirps: int):
             float(np.mean(full_refresh)) if full_refresh is not None else None
         )
         row["incremental_visibility_refresh_fraction"] = (
-            float(np.mean(visibility_refresh))
-            if visibility_refresh is not None else None
+            float(np.mean(visibility_refresh)) if visibility_refresh is not None else None
         )
     return row
 
 
-def _single_po_config(args) -> HumanPOMobilityConfig:
-    return HumanPOMobilityConfig(
-        visibility_samples_per_face=args.visibility_samples_per_face,
-        visibility_fade_chirps=args.visibility_fade_chirps,
-        visibility_use_phase_center=True,
-        adaptive_visibility_sampling=args.adaptive_visibility_sampling,
-        adaptive_visibility_edge_margin=args.adaptive_visibility_edge_margin,
-        incremental_update=args.incremental_update,
-        incremental_visibility_refresh_chirps=(
-            args.incremental_visibility_refresh_chirps),
-        incremental_full_refresh_chirps=args.incremental_full_refresh_chirps,
-        incremental_normal_threshold_deg=args.incremental_normal_threshold_deg,
-        incremental_centroid_displacement_threshold_m=(
-            args.incremental_centroid_displacement_threshold_m),
-        incremental_area_relative_threshold=(
-            args.incremental_area_relative_threshold),
+def _single_po_config(args) -> POConfig:
+    return POConfig(
+        po_visibility_samples_per_face=args.po_visibility_samples_per_face,
+        po_visibility_fade_frames=args.po_visibility_fade_frames,
+        po_adaptive_visibility_sampling=args.po_adaptive_visibility_sampling,
+        po_adaptive_visibility_edge_margin=args.po_adaptive_visibility_edge_margin,
+        po_refresh_frames=args.po_refresh_frames,
+        po_visibility_refresh_frames=args.po_visibility_refresh_frames,
+        po_refresh_on_phase_error_rad=args.po_refresh_on_phase_error_rad,
     )
 
 
@@ -587,56 +531,74 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--mode", choices=("single", "sweep"), default="sweep")
     parser.add_argument("--mesh-npz", type=Path, required=True)
-    parser.add_argument("--output-dir", type=Path,
-                        default=Path(tempfile.gettempdir()) / "mmwave_human_po")
+    parser.add_argument(
+        "--output-dir", type=Path, default=Path(tempfile.gettempdir()) / "mmwave_human_po"
+    )
     parser.add_argument("--duration-s", type=float, default=5.0)
     parser.add_argument("--num-frames", type=int, default=None)
     parser.add_argument("--progress", action="store_true")
-    parser.add_argument("--reuse", action=argparse.BooleanOptionalAction,
-                        default=True)
-    parser.add_argument("--plot", action=argparse.BooleanOptionalAction,
-                        default=True)
-    parser.add_argument("--setting", type=_parse_setting, action="append",
-                        default=None,
-                        help=("Override default sweep. Repeat as needed. "
-                              "Format: label:K:normal_deg:centroid_m:area_rel"))
+    parser.add_argument("--reuse", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--plot", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument(
+        "--setting",
+        type=_parse_setting,
+        action="append",
+        default=None,
+        help=(
+            "Override default sweep. Repeat as needed. "
+            "Format: label:visibility_frames:phase_error_rad"
+        ),
+    )
 
     parser.add_argument("--radar-clearance-m", type=float, default=0.50)
-    parser.add_argument("--radar-position", type=lambda s: _parse_vec3(
-        s, name="radar-position"), default=None)
-    parser.add_argument("--radar-look-at", type=lambda s: _parse_vec3(
-        s, name="radar-look-at"), default=None)
-    parser.add_argument("--radar-orientation", type=lambda s: _parse_vec3(
-        s, name="radar-orientation"), default=None)
+    parser.add_argument(
+        "--radar-position", type=lambda s: _parse_vec3(s, name="radar-position"), default=None
+    )
+    parser.add_argument(
+        "--radar-look-at", type=lambda s: _parse_vec3(s, name="radar-look-at"), default=None
+    )
+    parser.add_argument(
+        "--radar-orientation",
+        type=lambda s: _parse_vec3(s, name="radar-orientation"),
+        default=None,
+    )
 
-    parser.add_argument("--visibility-samples-per-face", type=int, default=4)
-    parser.add_argument("--visibility-fade-chirps", type=int, default=8)
-    parser.add_argument("--adaptive-visibility-sampling",
-                        action=argparse.BooleanOptionalAction,
-                        default=False)
-    parser.add_argument("--adaptive-visibility-edge-margin", type=float,
-                        default=0.15)
-    parser.add_argument("--incremental-update",
-                        action=argparse.BooleanOptionalAction,
-                        default=False)
-    parser.add_argument("--incremental-visibility-refresh-chirps", type=int,
-                        default=8)
-    parser.add_argument("--incremental-full-refresh-chirps", type=int,
-                        default=64)
-    parser.add_argument("--incremental-normal-threshold-deg", type=float,
-                        default=5.0)
-    parser.add_argument("--incremental-centroid-displacement-threshold-m",
-                        type=float, default=None)
-    parser.add_argument("--incremental-area-relative-threshold", type=float,
-                        default=None)
-    parser.add_argument("--compute-backend", choices=("numpy", "torch", "auto"),
-                        default="auto")
-    parser.add_argument("--compute-precision", choices=("float64", "float32"),
-                        default="float32")
-    parser.add_argument("--adc-compute-backend",
-                        choices=("numpy", "torch", "auto"), default=None)
-    parser.add_argument("--adc-compute-precision",
-                        choices=("float64", "float32"), default=None)
+    parser.add_argument("--po-visibility-samples-per-face", type=int, default=4)
+    parser.add_argument(
+        "--po-visibility-fade-frames",
+        type=int,
+        default=0,
+        help="Visibility fade in radar frames; 0 = step.",
+    )
+    parser.add_argument(
+        "--po-adaptive-visibility-sampling", action=argparse.BooleanOptionalAction, default=False
+    )
+    parser.add_argument("--po-adaptive-visibility-edge-margin", type=float, default=0.15)
+    parser.add_argument(
+        "--po-refresh-frames",
+        type=int,
+        default=1,
+        help=(
+            "Single mode: exact PO every N frames with "
+            "phase updates in between; 0 = every chirp."
+        ),
+    )
+    parser.add_argument(
+        "--po-visibility-refresh-frames",
+        type=int,
+        default=1,
+        help="Visibility every N frames; 0 = every chirp.",
+    )
+    parser.add_argument(
+        "--po-refresh-on-phase-error-rad",
+        type=float,
+        default=POConfig().po_refresh_on_phase_error_rad,
+        help="Neglected vertex phase-change trigger [rad].",
+    )
+    parser.add_argument("--compute-backend", choices=("numpy", "torch", "auto"), default="auto")
+    parser.add_argument("--compute-precision", choices=("float64", "float32"), default="float32")
+    parser.add_argument("--adc-compute-backend", choices=("numpy", "torch", "auto"), default=None)
+    parser.add_argument("--adc-compute-precision", choices=("float64", "float32"), default=None)
 
     parser.add_argument("--carrier-frequency", type=float, default=60e9)
     parser.add_argument("--slope", type=float, default=68e12)
@@ -652,11 +614,31 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--plot-vmin-db", type=float, default=-50.0)
     parser.add_argument("--plot-dpi", type=int, default=150)
     parser.add_argument("--matplotlib-backend", default="Agg")
+    add_removed_options(
+        parser,
+        {
+            "--visibility-samples-per-face": "--po-visibility-samples-per-face",
+            "--visibility-fade-chirps": "--po-visibility-fade-frames",
+            "--adaptive-visibility-sampling": "--po-adaptive-visibility-sampling",
+            "--no-adaptive-visibility-sampling": "--no-po-adaptive-visibility-sampling",
+            "--adaptive-visibility-edge-margin": "--po-adaptive-visibility-edge-margin",
+            "--incremental-update": "--po-refresh-frames N (0 = exact every chirp)",
+            "--no-incremental-update": "--po-refresh-frames 0",
+            "--incremental-full-refresh-chirps": "--po-refresh-frames",
+            "--incremental-visibility-refresh-chirps": "--po-visibility-refresh-frames",
+            "--incremental-normal-threshold-deg": "--po-refresh-on-phase-error-rad",
+            "--incremental-centroid-displacement-threshold-m": "--po-refresh-on-phase-error-rad",
+            "--incremental-area-relative-threshold": "--po-refresh-on-phase-error-rad",
+            "--po-refresh-on-normal-deg": "--po-refresh-on-phase-error-rad",
+            "--po-refresh-on-centroid-m": "--po-refresh-on-phase-error-rad",
+            "--po-refresh-on-area-fraction": "--po-refresh-on-phase-error-rad",
+        },
+    )
     return parser.parse_args()
 
 
 def main() -> None:
-    """Runs the human-only PO benchmark and writes summaries/plots."""
+    """Runs the PO benchmark on the human mesh and writes summaries/plots."""
 
     args = _parse_args()
     os.environ.setdefault(
@@ -675,16 +657,14 @@ def main() -> None:
         material=human_skin_material("human-skin-po-benchmark"),
     )
 
-    max_sequence_frames = _count_radar_frames_in_mesh_sequence(
-        mesh_sequence, radar.fmcw)
+    max_sequence_frames = _count_radar_frames_in_mesh_sequence(mesh_sequence, radar.fmcw)
     duration_frames = max(1, int(np.floor(args.duration_s / radar.fmcw.frame_period)))
     num_frames = (
         min(max_sequence_frames, duration_frames)
         if args.num_frames is None
         else min(max_sequence_frames, int(args.num_frames))
     )
-    last_chirp_time = radar.fmcw.chirp_time(
-        num_frames - 1, radar.fmcw.num_chirps_per_frame - 1)
+    last_chirp_time = radar.fmcw.chirp_time(num_frames - 1, radar.fmcw.num_chirps_per_frame - 1)
 
     print(f"Mesh NPZ: {args.mesh_npz}", flush=True)
     print(
@@ -728,7 +708,7 @@ def main() -> None:
     }
 
     if args.mode == "single":
-        cube, wall_time_s, num_chirps = _run_human_only_po(
+        cube, wall_time_s, num_chirps = _run_po(
             label="Single PO",
             config=_single_po_config(args),
             radar=radar,
@@ -744,12 +724,11 @@ def main() -> None:
         f"full_po_{label_slug(args.mesh_npz.stem)}_"
         f"{num_frames}f_{radar.fmcw.num_chirps_per_frame}c.npz"
     )
-    baseline_config = HumanPOMobilityConfig(
-        visibility_samples_per_face=args.visibility_samples_per_face,
-        visibility_fade_chirps=args.visibility_fade_chirps,
-        visibility_use_phase_center=True,
-        adaptive_visibility_sampling=False,
-        incremental_update=False,
+    baseline_config = POConfig(
+        po_visibility_samples_per_face=args.po_visibility_samples_per_face,
+        po_visibility_fade_frames=args.po_visibility_fade_frames,
+        po_adaptive_visibility_sampling=False,
+        po_refresh_frames=0,
     )
 
     def cache_match(cube):
@@ -763,22 +742,18 @@ def main() -> None:
         )
 
     if args.reuse and baseline_path.exists():
-        baseline, baseline_wall_time_s, baseline_num_chirps = load_radar_cube_npz(
-            baseline_path)
+        baseline, baseline_wall_time_s, baseline_num_chirps = load_radar_cube_npz(baseline_path)
         if cache_match(baseline):
             print(f"Loaded saved full PO baseline: {baseline_path}", flush=True)
         else:
-            print("Saved baseline does not match current setup; rerunning",
-                  flush=True)
-            baseline, baseline_wall_time_s, baseline_num_chirps = (
-                _run_human_only_po(
-                    label="Full PO baseline",
-                    config=baseline_config,
-                    radar=radar,
-                    target=target,
-                    num_frames=num_frames,
-                    args=args,
-                )
+            print("Saved baseline does not match current setup; rerunning", flush=True)
+            baseline, baseline_wall_time_s, baseline_num_chirps = _run_po(
+                label="Full PO baseline",
+                config=baseline_config,
+                radar=radar,
+                target=target,
+                num_frames=num_frames,
+                args=args,
             )
             save_radar_cube_npz(
                 baseline_path,
@@ -788,7 +763,7 @@ def main() -> None:
                 label="Full PO baseline",
             )
     else:
-        baseline, baseline_wall_time_s, baseline_num_chirps = _run_human_only_po(
+        baseline, baseline_wall_time_s, baseline_num_chirps = _run_po(
             label="Full PO baseline",
             config=baseline_config,
             radar=radar,
@@ -809,24 +784,15 @@ def main() -> None:
     def run_cube(label, config):
         """Runs or loads one incremental PO benchmark cube."""
 
-        config = HumanPOMobilityConfig(
-            visibility_samples_per_face=args.visibility_samples_per_face,
-            visibility_fade_chirps=args.visibility_fade_chirps,
-            visibility_use_phase_center=True,
-            adaptive_visibility_sampling=True,
-            adaptive_visibility_edge_margin=args.adaptive_visibility_edge_margin,
-            incremental_update=True,
-            incremental_visibility_refresh_chirps=(
-                config.incremental_visibility_refresh_chirps),
-            incremental_full_refresh_chirps=0,
-            incremental_normal_threshold_deg=(
-                config.incremental_normal_threshold_deg),
-            incremental_centroid_displacement_threshold_m=(
-                config.incremental_centroid_displacement_threshold_m),
-            incremental_area_relative_threshold=(
-                config.incremental_area_relative_threshold),
+        # One exact solve at the start; afterwards only the drift triggers
+        # re-integrate facets, which is what the sweep measures.
+        config = replace(
+            config,
+            po_visibility_fade_frames=args.po_visibility_fade_frames,
+            po_adaptive_visibility_edge_margin=(args.po_adaptive_visibility_edge_margin),
+            po_refresh_frames=max(1, num_frames),
         )
-        return _run_human_only_po(
+        return _run_po(
             label=label,
             config=config,
             radar=radar,
@@ -840,19 +806,21 @@ def main() -> None:
         baseline_cube=baseline,
         baseline_wall_time_s=baseline_wall_time_s,
         fmcw=radar.fmcw,
-        visibility_samples_per_face=args.visibility_samples_per_face,
+        po_visibility_samples_per_face=args.po_visibility_samples_per_face,
         run_cube=run_cube,
         output_dir=output_dir,
         reuse_saved=args.reuse,
         cache_match=cache_match,
-        filename_prefix=f"incremental_po_{label_slug(args.mesh_npz.stem)}",
+        filename_prefix=f"po_incremental_{label_slug(args.mesh_npz.stem)}",
     )
     rows = [_result_row(result) for result in profile_results]
-    rows.sort(key=lambda row: (row["setting_K"], row["range_profile_relative_error"]))
+    rows.sort(
+        key=lambda row: (row["po_visibility_refresh_frames"], row["range_profile_relative_error"])
+    )
 
     print("\nPO incremental sweep summary", flush=True)
     print(
-        "label                              K  normal  disp_m  area    speedup  "
+        "label                              V  phase_rad  speedup  "
         "adc_err   range_err  recompute_mean",
         flush=True,
     )
@@ -860,10 +828,8 @@ def main() -> None:
     for row in rows:
         print(
             f"{row['label']:<34} "
-            f"{row['setting_K']:>3d} "
-            f"{row['normal_threshold_deg']:>6.1f} "
-            f"{row['centroid_displacement_threshold_m']:>7.4f} "
-            f"{row['area_relative_threshold']:>6.2f} "
+            f"{row['po_visibility_refresh_frames']:>3d} "
+            f"{row['po_refresh_on_phase_error_rad']:>9.3f} "
             f"{row['speedup']:>8.2f} "
             f"{row['adc_relative_error']:>8.3e} "
             f"{row['range_profile_relative_error']:>9.3e} "
@@ -878,12 +844,14 @@ def main() -> None:
         plot_row["cube"] = result.cube
         plot_rows.append(plot_row)
 
-    metadata.update({
-        "baseline_cube_path": str(baseline_path),
-        "baseline_wall_time_s": float(baseline_wall_time_s),
-        "baseline_num_chirps": int(baseline_num_chirps),
-        "settings": [asdict(setting) for setting in settings],
-    })
+    metadata.update(
+        {
+            "baseline_cube_path": str(baseline_path),
+            "baseline_wall_time_s": float(baseline_wall_time_s),
+            "baseline_num_chirps": int(baseline_num_chirps),
+            "settings": [asdict(setting) for setting in settings],
+        }
+    )
     _write_summary(output_dir, metadata, rows)
 
     if args.plot:

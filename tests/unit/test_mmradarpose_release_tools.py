@@ -11,7 +11,6 @@ import tempfile
 import numpy as np
 import pytest
 
-
 PUBLIC_ROOT = Path(__file__).resolve().parents[2]
 
 
@@ -123,8 +122,7 @@ def test_default_output_root_is_outside_the_source_checkout():
     )
 
     expected = (
-        Path(tempfile.gettempdir())
-        / "hermes-validation-bundles/mmradarpose/p1_an0_ac4_r0/bundles"
+        Path(tempfile.gettempdir()) / "hermes-validation-bundles/mmradarpose/p1_an0_ac4_r0/bundles"
     ).resolve()
     output = module.resolve_output_root("p1_an0_ac4_r0", None)
 
@@ -168,34 +166,26 @@ def test_direct_bundle_consumes_sparse_fit_and_raw_radar(tmp_path, monkeypatch):
     assert np.array_equal(flattened_adc, explicit_adc.reshape(1, 128, 64, 12))
     assert not (output / "mesh_sequence.npz").exists()
     with np.load(output / "amass_sequence.npz", allow_pickle=False) as data:
-        assert data["bundle_times"].tolist() == pytest.approx(
-            [-1.0 / 15.0, 0.0, 1.0 / 15.0]
-        )
-        assert data["times"].tolist() == pytest.approx(
-            [0.0, 1.0 / 15.0, 2.0 / 15.0]
-        )
+        assert data["bundle_times"].tolist() == pytest.approx([-1.0 / 15.0, 0.0, 1.0 / 15.0])
+        assert data["times"].tolist() == pytest.approx([0.0, 1.0 / 15.0, 2.0 / 15.0])
         assert data["frame_ids"].tolist() == ["000000", "000001", "000002"]
         assert data["output_axes"].tolist() == [0, 1, 2]
         assert data["output_signs"].tolist() == pytest.approx([1.0, 1.0, 1.0])
         assert data["trans"][1].tolist() == pytest.approx([0.84, 4.85, 1.93])
-        assert data["radar_to_smpl_translation"].tolist() == pytest.approx(
-            [0.16, 1.07, 2.85]
-        )
+        assert data["radar_to_smpl_translation"].tolist() == pytest.approx([0.16, 1.07, 2.85])
     frames = json.loads((output / "frames.json").read_text(encoding="utf-8"))
     assert frames["frames"][0]["dataset_frame_id"] == "p1_an0_ac4_r0:000001"
     sensor = json.loads((output / "sensor.json").read_text(encoding="utf-8"))
-    assert sensor["fmcw"]["tdm_enabled"] is True
+    assert sensor["fmcw"]["tx_schedule"] == "tdm"
+    assert sensor["fmcw"]["carrier_reference"] == "first_adc_sample"
+    assert "nominal_first_sample_assumption" in sensor["fmcw"]["carrier_frequency_status"]
     assert sensor["board_model"] == "IWR6843AOPEVM"
-    assert sensor["metadata"]["alignment"]["source"] == (
-        "radar_to_smpl_alignment_inferred.json"
-    )
+    assert sensor["metadata"]["alignment"]["source"] == ("radar_to_smpl_alignment_inferred.json")
     assert sensor["metadata"]["alignment"]["selected_alignment"] == "all_angles"
     assert sensor["metadata"]["alignment"]["status"] == "inferred_from_dataset"
     assert sensor["metadata"]["frame_mapping"] == result["frame_mapping"]
     assert sensor["metadata"]["environment"]["type"] == "empty"
-    benchmark = json.loads(
-        (output / "benchmark_metadata.json").read_text(encoding="utf-8")
-    )
+    benchmark = json.loads((output / "benchmark_metadata.json").read_text(encoding="utf-8"))
     assert benchmark["motion"]["file"] == "amass_sequence.npz"
     assert benchmark["motion"]["timing_fields"]["bundle_times"].endswith("t=0.")
     assert result["source_amass_npz"] == "fits/fit.npz"
@@ -268,9 +258,7 @@ def test_alignment_is_composed_into_amass_world(tmp_path):
     assert axes.tolist() == [0, 1, 2]
     assert signs.tolist() == pytest.approx([1.0, 1.0, 1.0])
     assert metadata["smpl_model_to_radar_output_axes"] == [0, 2, 1]
-    assert metadata["smpl_model_to_radar_output_signs"] == pytest.approx(
-        [1.0, -1.0, 1.0]
-    )
+    assert metadata["smpl_model_to_radar_output_signs"] == pytest.approx([1.0, -1.0, 1.0])
 
 
 def test_direct_bundle_scans_hidden_radar_members_without_pickle(tmp_path, monkeypatch):

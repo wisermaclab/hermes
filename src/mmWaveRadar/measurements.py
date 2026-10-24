@@ -10,12 +10,13 @@ import hashlib
 from pathlib import Path
 import tempfile
 from typing import Any
-import zipfile
 
 import numpy as np
 
+from bundle_prepare.archives import extract_bundle_zip, ZipExtractionLimits
 from bundle_prepare.contract import Bundle, load_adc, load_bundle_descriptor
-from bundle_prepare.integrity import check_bundle_integrity
+from bundle_prepare.integrity import check_and_load_bundle
+from bundle_prepare.paths import safe_bundle_destination, safe_bundle_file
 from bundle_prepare.safe_npz import (
     DEFAULT_NPZ_LIMITS,
     GUI_NPZ_LIMITS,
@@ -24,10 +25,9 @@ from bundle_prepare.safe_npz import (
 )
 from validation.metrics import background_subtract_adc, normalized_correlation
 
-from .dsp import framewise_range_doppler_map, range_time_map
+from .dsp import framewise_range_doppler_map, range_fft, remove_slow_time_mean
 
-
-HERMES_BUNDLE_SCHEMA_VERSION = 1
+HERMES_BUNDLE_SCHEMA_VERSION = 2
 _MAX_BUNDLE_ZIP_MEMBERS = 4_096
 _MAX_BUNDLE_ZIP_MEMBER_BYTES = 2 * 1024**3
 _MAX_BUNDLE_ZIP_TOTAL_BYTES = 4 * 1024**3
@@ -77,6 +77,8 @@ class RadarProducts:
     range_doppler_power: np.ndarray
     range_doppler_ranges_m: np.ndarray
     velocities_mps: np.ndarray
+    channel_range_profile_power: np.ndarray | None = None
+    channel_labels: tuple[str, ...] | None = None
 
 
 @dataclass(frozen=True)
@@ -96,9 +98,7 @@ class ComparisonMetrics:
             "range_time_correlation": float(self.range_time_correlation),
             "range_doppler_correlation": float(self.range_doppler_correlation),
             "complex_correlation": float(self.complex_correlation),
-            "scale_adjusted_complex_nmse": float(
-                self.scale_adjusted_complex_nmse
-            ),
+            "scale_adjusted_complex_nmse": float(self.scale_adjusted_complex_nmse),
             "peak_range_error_m": float(self.peak_range_error_m),
         }
 
@@ -156,7 +156,7 @@ class HermesBundle:
 
     @property
     def can_resimulate(self) -> bool:
-        """Whether the bundle declares inputs for a fresh human simulation."""
+        """Whether the bundle declares geometry for a fresh simulation."""
 
         return self.bundle.can_resimulate
 
@@ -164,6 +164,21 @@ class HermesBundle:
         """Load one embedded solver ADC cube."""
 
         return self.bundle.load_bundled_simulation(solver)
+
+    def _channel_labels(self) -> tuple[str, ...]:
+        hardware = self.bundle.sensor().hardware
+        metadata = hardware.board_metadata or {}
+        tx = np.asarray(metadata.get("physical_tx_indices", range(hardware.num_tx)))
+        rx = np.asarray(metadata.get("physical_rx_indices", range(hardware.num_rx)))
+        return tuple(
+            f"Channel {index} · TX{tx[t]}/RX{rx[r]}"
+            for index, (t, r) in enumerate(
+                zip(
+                    hardware.virtual_tx_indices(),
+                    hardware.virtual_rx_indices(),
+                )
+            )
+        )
 
     def primary_products(
         self,
@@ -176,14 +191,13 @@ class HermesBundle:
         adc = np.asarray(self.bundle.real_adc)
         if background_subtraction:
             if self.bundle.background_adc is None:
-                raise ValueError(
-                    "background subtraction requires a background ADC artifact"
-                )
+                raise ValueError("background subtraction requires a background ADC artifact")
             adc = background_subtract_adc(adc, self.bundle.background_adc)
         return compute_radar_products(
             adc,
             self.bundle.sensor_config.fmcw,
             clutter_removal=clutter_removal,
+            channel_labels=self._channel_labels(),
         )
 
     def compare_adc(
@@ -205,18 +219,14 @@ class HermesBundle:
                 raise ValueError("channel_indices must select at least one channel")
             if np.unique(selected_indices).size != selected_indices.size:
                 raise ValueError("channel_indices must not contain duplicates")
-            if np.any(selected_indices < 0) or np.any(
-                selected_indices >= full_primary_shape[-1]
-            ):
+            if np.any(selected_indices < 0) or np.any(selected_indices >= full_primary_shape[-1]):
                 raise ValueError(
                     "channel_indices contains an index outside the primary ADC "
                     f"channel axis [0, {full_primary_shape[-1] - 1}]"
                 )
         if background_subtraction:
             if self.bundle.background_adc is None:
-                raise ValueError(
-                    "background subtraction requires a background ADC artifact"
-                )
+                raise ValueError("background subtraction requires a background ADC artifact")
             background_adc = np.asarray(self.bundle.background_adc)
             if selected_indices is not None:
                 background_adc = background_adc[..., selected_indices]
@@ -236,15 +246,20 @@ class HermesBundle:
                 f"({candidate.shape} != {primary_adc.shape})"
             )
         fmcw = self.bundle.sensor_config.fmcw
+        labels = self._channel_labels()
+        if selected_indices is not None:
+            labels = tuple(labels[index] for index in selected_indices)
         primary_products = compute_radar_products(
             primary_adc,
             fmcw,
             clutter_removal=clutter_removal,
+            channel_labels=labels,
         )
         candidate_products = compute_radar_products(
             candidate,
             fmcw,
             clutter_removal=clutter_removal,
+            channel_labels=labels,
         )
         return ADCComparison(
             primary=primary_products,
@@ -268,132 +283,39 @@ def load_bundle(
     source_path = Path(path).expanduser().resolve()
     temporary_directory = None
     if source_path.is_file() and source_path.suffix.lower() == ".zip":
-        temporary_directory = tempfile.TemporaryDirectory(
-            prefix="hermes-bundle-"
-        )
+        temporary_directory = tempfile.TemporaryDirectory(prefix="hermes-bundle-")
         root = Path(temporary_directory.name)
-        _extract_bundle_zip(source_path, root, limits=resource_limits)
+        extract_bundle_zip(source_path, root, limits=resource_limits)
     else:
         root = source_path
     if resource_limits is not None:
         _preflight_bundle_resources(root, limits=resource_limits)
-    report = check_bundle_integrity(root)
-    bundle = Bundle.load(root)
+    try:
+        bundle, report = check_and_load_bundle(root)
+    except BaseException:
+        if temporary_directory is not None:
+            temporary_directory.cleanup()
+        raise
     return HermesBundle(
         root=root,
         bundle=bundle,
         integrity_report=report,
         fingerprint=bundle_fingerprint(root),
+        schema_version=int(bundle.descriptor["schema_version"]),
         source_path=source_path,
         _temporary_directory=temporary_directory,
     )
 
 
-def _extract_bundle_zip(
-    source: Path,
-    destination: Path,
-    *,
-    limits: BundleResourceLimits | None = None,
-) -> None:
-    """Extract a flat portable bundle ZIP without path traversal or symlinks."""
-
-    max_members = (
-        _MAX_BUNDLE_ZIP_MEMBERS
-        if limits is None
-        else limits.max_zip_members
+def _extract_bundle_zip(source: Path, destination: Path, *, limits=None) -> None:
+    """Compatibility wrapper for callers of the former measurement helper."""
+    limits = limits or ZipExtractionLimits(
+        _MAX_BUNDLE_ZIP_MEMBERS,
+        _MAX_BUNDLE_ZIP_MEMBER_BYTES,
+        _MAX_BUNDLE_ZIP_TOTAL_BYTES,
+        _MAX_BUNDLE_ZIP_COMPRESSION_RATIO,
     )
-    max_member_bytes = (
-        _MAX_BUNDLE_ZIP_MEMBER_BYTES
-        if limits is None
-        else limits.max_zip_member_bytes
-    )
-    max_total_bytes = (
-        _MAX_BUNDLE_ZIP_TOTAL_BYTES
-        if limits is None
-        else limits.max_zip_total_bytes
-    )
-    max_compression_ratio = (
-        _MAX_BUNDLE_ZIP_COMPRESSION_RATIO
-        if limits is None
-        else limits.max_zip_compression_ratio
-    )
-    with zipfile.ZipFile(source) as archive:
-        members = archive.infolist()
-        if not members:
-            raise ValueError("bundle ZIP is empty")
-        if len(members) > max_members:
-            raise ValueError(
-                "bundle ZIP contains too many members: "
-                f"{len(members):,} > {max_members:,}"
-            )
-        declared_total = sum(
-            int(member.file_size)
-            for member in members
-            if not member.is_dir()
-        )
-        if declared_total > max_total_bytes:
-            raise ValueError(
-                "bundle ZIP uncompressed size exceeds the limit: "
-                f"{declared_total:,} > {max_total_bytes:,} bytes"
-            )
-        seen: set[str] = set()
-        extracted_total = 0
-        for member in members:
-            name = member.filename
-            relative = Path(name)
-            if (
-                relative.is_absolute()
-                or "\\" in name
-                or any(
-                    part in {"", ".", ".."} or ":" in part
-                    for part in relative.parts
-                )
-            ):
-                raise ValueError(f"unsafe bundle ZIP member: {name!r}")
-            portable_name = relative.as_posix()
-            if portable_name in seen:
-                raise ValueError(f"duplicate bundle ZIP member: {name!r}")
-            seen.add(portable_name)
-            file_type = (member.external_attr >> 16) & 0o170000
-            if file_type == 0o120000:
-                raise ValueError(f"bundle ZIP members must not be symlinks: {name}")
-            if member.flag_bits & 0x1:
-                raise ValueError(
-                    f"encrypted bundle ZIP members are not supported: {name}"
-                )
-            if member.file_size > max_member_bytes:
-                raise ValueError(
-                    f"bundle ZIP member exceeds the size limit: {name!r}"
-                )
-            if (
-                member.file_size > 0
-                and member.file_size / max(member.compress_size, 1)
-                > max_compression_ratio
-            ):
-                raise ValueError(
-                    f"bundle ZIP member has an unsafe compression ratio: {name!r}"
-                )
-            target = destination / relative
-            if member.is_dir():
-                target.mkdir(parents=True, exist_ok=True)
-                continue
-            target.parent.mkdir(parents=True, exist_ok=True)
-            member_bytes = 0
-            with archive.open(member) as source_handle, target.open("wb") as output:
-                while chunk := source_handle.read(1024 * 1024):
-                    member_bytes += len(chunk)
-                    extracted_total += len(chunk)
-                    if member_bytes > max_member_bytes:
-                        raise ValueError(
-                            "bundle ZIP member exceeded the size limit while "
-                            f"extracting: {name!r}"
-                        )
-                    if extracted_total > max_total_bytes:
-                        raise ValueError(
-                            "bundle ZIP exceeded the total size limit while "
-                            "extracting"
-                        )
-                    output.write(chunk)
+    extract_bundle_zip(source, destination, limits=limits)
 
 
 def _preflight_bundle_resources(
@@ -405,20 +327,14 @@ def _preflight_bundle_resources(
 
     if root.is_symlink() or not root.is_dir():
         raise ValueError("untrusted bundle root must be a regular directory")
-    resolved_root = root.resolve(strict=True)
     bundle_entries = sorted(root.rglob("*"))
     for path in bundle_entries:
-        if path.is_symlink():
-            raise ValueError("untrusted bundles must not contain symlinks")
-        try:
-            path.resolve(strict=True).relative_to(resolved_root)
-        except ValueError as exc:
-            raise ValueError("bundle path escapes the bundle root") from exc
+        safe_bundle_destination(
+            root, path.relative_to(root).as_posix(), label="untrusted bundle path"
+        )
 
     npz_files = [
-        path
-        for path in bundle_entries
-        if path.is_file() and path.suffix.casefold() == ".npz"
+        path for path in bundle_entries if path.is_file() and path.suffix.casefold() == ".npz"
     ]
     if len(npz_files) > limits.max_npz_files:
         raise ValueError(
@@ -428,11 +344,9 @@ def _preflight_bundle_resources(
     archive_total = 0
     array_total = 0
     for path in npz_files:
-        resolved = path.resolve(strict=True)
-        try:
-            resolved.relative_to(resolved_root)
-        except ValueError as exc:
-            raise ValueError("bundle NPZ path escapes the bundle root") from exc
+        resolved = safe_bundle_file(
+            root, path.relative_to(root).as_posix(), label="bundle NPZ path"
+        )
         archive_total += resolved.stat().st_size
         if archive_total > limits.max_npz_archive_total_bytes:
             raise ValueError("bundle NPZ files exceed the aggregate archive limit")
@@ -441,35 +355,24 @@ def _preflight_bundle_resources(
         if array_total > limits.max_npz_array_total_bytes:
             raise ValueError("bundle NPZ arrays exceed the aggregate byte limit")
         if (
-            array_total
-            >= limits.npz_limits.min_compression_ratio_check_bytes
-            and array_total / max(archive_total, 1)
-            > limits.npz_limits.max_compression_ratio
+            array_total >= limits.npz_limits.min_compression_ratio_check_bytes
+            and array_total / max(archive_total, 1) > limits.npz_limits.max_compression_ratio
         ):
-            raise ValueError(
-                "bundle NPZ files have an unsafe aggregate compression ratio"
-            )
+            raise ValueError("bundle NPZ files have an unsafe aggregate compression ratio")
 
     text_total = 0
     for path in bundle_entries:
         suffix = path.suffix.casefold()
         if suffix not in {".json", ".xml"} or not path.is_file():
             continue
-        resolved = path.resolve(strict=True)
-        try:
-            resolved.relative_to(resolved_root)
-        except ValueError as exc:
-            raise ValueError("bundle JSON/XML path escapes the bundle root") from exc
-        size = resolved.stat().st_size
-        limit = (
-            limits.max_json_file_bytes
-            if suffix == ".json"
-            else limits.max_xml_file_bytes
+        resolved = safe_bundle_file(
+            root, path.relative_to(root).as_posix(), label="bundle JSON/XML path"
         )
+        size = resolved.stat().st_size
+        limit = limits.max_json_file_bytes if suffix == ".json" else limits.max_xml_file_bytes
         if size > limit:
             raise ValueError(
-                f"bundle {suffix[1:].upper()} file exceeds the size limit: "
-                f"{resolved.name!r}"
+                f"bundle {suffix[1:].upper()} file exceeds the size limit: " f"{resolved.name!r}"
             )
         text_total += size
         if text_total > limits.max_text_total_bytes:
@@ -518,6 +421,7 @@ def compute_radar_products(
     fmcw,
     *,
     clutter_removal: str = "none",
+    channel_labels: tuple[str, ...] | None = None,
 ) -> RadarProducts:
     """Compute the common GUI products from a measured or simulated ADC cube."""
 
@@ -527,11 +431,19 @@ def compute_radar_products(
     if raw.ndim != 4:
         raise ValueError("adc must have shape [frames, chirps, samples, channels]")
     remove_mean = clutter_removal == "mean"
-    range_time_power, rt_ranges = range_time_map(
-        raw,
+    range_cube, rt_ranges = range_fft(
+        raw.reshape((-1, raw.shape[-2], raw.shape[-1])),
         fmcw=fmcw,
-        remove_mean_clutter=remove_mean,
     )
+    if remove_mean:
+        range_cube = remove_slow_time_mean(range_cube)
+    channel_power = np.abs(range_cube) ** 2
+    del range_cube
+    range_time_power = np.sum(channel_power, axis=-1)
+    channel_profiles = channel_power.reshape(
+        (raw.shape[0], raw.shape[1], *channel_power.shape[1:])
+    ).mean(axis=1)
+    del channel_power
     rd_cube, rd_ranges, velocities = framewise_range_doppler_map(
         raw,
         fmcw=fmcw,
@@ -547,6 +459,8 @@ def compute_radar_products(
         range_doppler_power=range_doppler_power,
         range_doppler_ranges_m=rd_ranges,
         velocities_mps=velocities,
+        channel_range_profile_power=channel_profiles,
+        channel_labels=channel_labels,
     )
 
 
@@ -568,9 +482,7 @@ def _comparison_metrics(
         complex_nmse = float("inf")
     else:
         scale = np.vdot(estimate, reference) / estimate_energy
-        complex_nmse = float(
-            np.linalg.norm(reference - scale * estimate) ** 2 / reference_energy
-        )
+        complex_nmse = float(np.linalg.norm(reference - scale * estimate) ** 2 / reference_energy)
     measured_peak = int(np.argmax(measured.range_profile_power))
     simulated_peak = int(np.argmax(simulated.range_profile_power))
     peak_error = abs(

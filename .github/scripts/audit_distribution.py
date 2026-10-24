@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 from collections.abc import Iterable
 from pathlib import Path, PurePosixPath
 import stat
@@ -13,6 +14,7 @@ import sys
 import tarfile
 import zipfile
 
+from approved_fixtures import package_fixture
 
 FORBIDDEN_SUFFIXES = {
     ".amc",
@@ -58,11 +60,11 @@ def validate_member_name(name: str) -> PurePosixPath:
 
 
 def audit_names(
-    archive: Path, members: Iterable[tuple[str, int, bool]], errors: list[str]
+    archive: Path, members: Iterable[tuple[str, int, bool, str | None]], errors: list[str]
 ) -> None:
     seen: set[str] = set()
     basenames: set[str] = set()
-    for name, size, is_link in members:
+    for name, size, is_link, digest in members:
         try:
             path = validate_member_name(name)
         except ValueError as exc:
@@ -77,9 +79,11 @@ def audit_names(
         if size > MAX_MEMBER_BYTES:
             errors.append(f"{archive.name}: member exceeds 2 MiB: {name}")
         if path.suffix.casefold() in FORBIDDEN_SUFFIXES:
-            errors.append(
-                f"{archive.name}: forbidden binary, model, or data file: {name}"
-            )
+            approved = package_fixture(name, wheel=archive.suffix == ".whl")
+            if approved is None:
+                errors.append(f"{archive.name}: forbidden binary, model, or data file: {name}")
+            elif (size, digest) != approved:
+                errors.append(f"{archive.name}: synthetic fixture size/hash mismatch: {name}")
     for basename in sorted(REQUIRED_BASENAMES - basenames):
         errors.append(f"{archive.name}: required notice is absent: {basename}")
 
@@ -95,7 +99,12 @@ def audit_wheel(path: Path, errors: list[str]) -> None:
                 is_link = file_type == stat.S_IFLNK
                 if info.flag_bits & 0x1:
                     errors.append(f"{path.name}: encrypted member: {info.filename}")
-                members.append((info.filename, info.file_size, is_link))
+                approved = package_fixture(info.filename, wheel=True)
+                digest = None
+                if approved is not None and info.file_size == approved[0] and not is_link:
+                    with archive.open(info) as stream:
+                        digest = hashlib.sha256(stream.read(approved[0] + 1)).hexdigest()
+                members.append((info.filename, info.file_size, is_link, digest))
             audit_names(path, members, errors)
     except (OSError, zipfile.BadZipFile) as exc:
         errors.append(f"{path.name}: invalid wheel archive: {exc}")
@@ -104,11 +113,18 @@ def audit_wheel(path: Path, errors: list[str]) -> None:
 def audit_sdist(path: Path, errors: list[str]) -> None:
     try:
         with tarfile.open(path, mode="r:gz") as archive:
-            members = [
-                (member.name, member.size, member.issym() or member.islnk())
-                for member in archive.getmembers()
-                if not member.isdir()
-            ]
+            members = []
+            for member in archive.getmembers():
+                if member.isdir():
+                    continue
+                approved = package_fixture(member.name, wheel=False)
+                digest = None
+                if approved is not None and member.size == approved[0] and member.isfile():
+                    with archive.extractfile(member) as stream:
+                        digest = hashlib.sha256(stream.read(approved[0] + 1)).hexdigest()
+                members.append(
+                    (member.name, member.size, member.issym() or member.islnk(), digest)
+                )
             unsupported = [
                 member.name
                 for member in archive.getmembers()
@@ -134,9 +150,7 @@ def main() -> None:
     sdists = sorted(directory.glob("*.tar.gz"))
     expected = set(wheels) | set(sdists)
     actual = (
-        {path for path in directory.iterdir() if path.is_file()}
-        if directory.is_dir()
-        else set()
+        {path for path in directory.iterdir() if path.is_file()} if directory.is_dir() else set()
     )
     errors: list[str] = []
     if len(wheels) != 1:

@@ -58,37 +58,34 @@ def test_fmcw_chirp_time_rejects_invalid_indices(frame_index, chirp_index):
 def test_fmcw_defaults_to_simultaneous_transmit_timing():
     fmcw = _fmcw(num_tx=3)
 
-    assert fmcw.tdm_enabled is False
-    assert fmcw.slow_time_interval == pytest.approx(
-        fmcw.chirp_repetition_time
-    )
-    assert fmcw.chirp_time(0, 1) == pytest.approx(
-        fmcw.chirp_repetition_time
-    )
-    assert fmcw.tx_chirp_time(0, 1, 0) == pytest.approx(
-        fmcw.tx_chirp_time(0, 1, 2)
-    )
+    assert fmcw.tx_schedule == "simultaneous"
+    assert fmcw.slow_time_interval == pytest.approx(fmcw.chirp_repetition_time)
+    assert fmcw.chirp_time(0, 1) == pytest.approx(fmcw.chirp_repetition_time)
+    assert fmcw.tx_chirp_time(0, 1, 0) == pytest.approx(fmcw.tx_chirp_time(0, 1, 2))
 
 
 def test_fmcw_tdm_uses_per_tx_slots_and_per_channel_pri():
-    fmcw = _fmcw(num_tx=3, tdm_enabled=np.bool_(True))
+    fmcw = _fmcw(num_tx=3, tx_schedule="tdm")
     repetition = fmcw.chirp_repetition_time
 
-    assert fmcw.tdm_enabled is True
+    assert fmcw.tx_schedule == "tdm"
     assert fmcw.slow_time_interval == pytest.approx(3 * repetition)
     assert fmcw.tx_chirp_time(0, 0, 0) == pytest.approx(0.0)
     assert fmcw.tx_chirp_time(0, 0, 1) == pytest.approx(repetition)
     assert fmcw.tx_chirp_time(0, 0, 2) == pytest.approx(2 * repetition)
     assert fmcw.tx_chirp_time(0, 1, 1) == pytest.approx(4 * repetition)
-    assert fmcw.frame_duration == pytest.approx(
-        fmcw.num_chirps_per_frame * 3 * repetition
-    )
+    assert fmcw.frame_duration == pytest.approx(fmcw.num_chirps_per_frame * 3 * repetition)
 
 
-@pytest.mark.parametrize("value", [1, "true", None])
-def test_fmcw_rejects_non_boolean_tdm_flag(value):
-    with pytest.raises(ValueError, match="tdm_enabled"):
-        _fmcw(tdm_enabled=value)
+@pytest.mark.parametrize("value", [True, "round_robin", None])
+def test_fmcw_rejects_unknown_tx_schedule(value):
+    with pytest.raises(ValueError, match="tx_schedule"):
+        _fmcw(tx_schedule=value)
+
+
+def test_fmcw_rejects_removed_tdm_flag():
+    with pytest.raises(TypeError, match="tdm_enabled"):
+        _fmcw(tdm_enabled=True)
 
 
 def test_fmcw_rejects_out_of_range_tx_time_index():
@@ -101,8 +98,7 @@ def test_fmcw_rejects_out_of_range_tx_time_index():
     [
         {"tx_positions": np.empty((0, 3))},
         {"tx_positions": [[np.nan, 0.0, 0.0]]},
-        {"virtual_channel_tx_indices": [0.0],
-         "virtual_channel_rx_indices": [0]},
+        {"virtual_channel_tx_indices": [0.0], "virtual_channel_rx_indices": [0]},
         {"virtual_channel_phase_signs": [np.nan + 0.0j]},
         {"scalar_antenna_gain_dbi": np.inf},
         {"virtual_channel_labels": [""]},

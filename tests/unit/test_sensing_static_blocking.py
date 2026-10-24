@@ -6,6 +6,44 @@
 from __future__ import annotations
 
 from sensing_test_helpers import *  # noqa: F401,F403
+from mmWaveRadar.radar.ti import SimpleCosinePattern
+
+
+def test_static_path_bank_keeps_propagation_before_off_axis_hardware_loss():
+    coefficient = 0.5 + 0.25j
+
+    class StaticPaths:
+        theta_t = np.array([np.pi])
+        phi_t = np.array([0.0])
+        vertices = np.array([[[0.0, 0.0, -1.0]]])
+        interactions = np.array([[InteractionType.SPECULAR]], dtype=np.uint32)
+
+        def cir(self, **kwargs):
+            return (
+                np.full((1, 1, 1, 1, 1, 1), coefficient, dtype=complex),
+                np.array([[[2.0 / c]]]),
+            )
+
+    radar = _phase_one_radar(num_chirps=1)
+    radar = replace(
+        radar,
+        hardware=replace(
+            radar.hardware,
+            scalar_antenna_gain_dbi=6.0,
+            virtual_channel_phase_signs=np.array([-1.0]),
+            antenna_pattern=SimpleCosinePattern(1),
+        ),
+    )
+
+    bank = extract_static_path_bank(StaticPaths(), radar)
+
+    np.testing.assert_allclose(bank.propagation_coefficients, [[coefficient]])
+    np.testing.assert_allclose(
+        bank.coefficients,
+        [[-coefficient * 10.0 ** ((6.0 - 80.0) / 20.0)]],
+        rtol=1e-12,
+        atol=0.0,
+    )
 
 
 def test_static_path_blocking_detects_crossing_segment():
@@ -27,7 +65,7 @@ def test_static_path_blocking_detects_crossing_segment():
     result = blocked_path_visibility(
         bank,
         scene,
-        fade_chirps=1,
+        fade_steps=1,
         ray_epsilon_m=1e-5,
     )
 
@@ -47,16 +85,20 @@ def test_static_path_blocking_aabb_culls_far_segments():
         coefficients=np.ones((1, 3), dtype=np.complex128),
         delays_s=np.array([1e-9, 2e-9, 3e-9], dtype=float),
         valid=np.array([True, True, True]),
-        segment_starts=np.array([
-            [0.0, 0.0, 0.0],
-            [0.0, 0.75, 0.0],
-            [0.0, 10.0, 0.0],
-        ]),
-        segment_ends=np.array([
-            [1.0, 0.0, 0.0],
-            [1.0, 0.75, 0.0],
-            [1.0, 10.0, 0.0],
-        ]),
+        segment_starts=np.array(
+            [
+                [0.0, 0.0, 0.0],
+                [0.0, 0.75, 0.0],
+                [0.0, 10.0, 0.0],
+            ]
+        ),
+        segment_ends=np.array(
+            [
+                [1.0, 0.0, 0.0],
+                [1.0, 0.75, 0.0],
+                [1.0, 10.0, 0.0],
+            ]
+        ),
         segment_path_indices=np.array([0, 1, 2], dtype=np.int64),
     )
 
@@ -71,7 +113,7 @@ def test_static_path_blocking_aabb_culls_far_segments():
         blocker_vertices=vertices,
         aabb_culling=True,
         aabb_margin_m=0.0,
-        fade_chirps=1,
+        fade_steps=1,
         ray_epsilon_m=1e-5,
     )
 
@@ -96,7 +138,7 @@ def test_static_path_blocking_ignores_zero_length_segment():
         segment_path_indices=np.array([0], dtype=np.int64),
     )
 
-    result = blocked_path_visibility(bank, scene, fade_chirps=1)
+    result = blocked_path_visibility(bank, scene, fade_steps=1)
 
     assert np.array_equal(result.blocked_paths, [False])
     assert np.array_equal(result.visibility_weights, [1.0])
@@ -106,7 +148,7 @@ def test_path_visibility_state_fades_transitions():
     fade, latched = update_path_visibility_state(
         np.array([1.0]),
         state=None,
-        fade_chirps=4,
+        fade_steps=4,
     )
     state = PathVisibilityState(
         was_visible=np.array([True]),
@@ -117,7 +159,7 @@ def test_path_visibility_state_fades_transitions():
     fade, latched = update_path_visibility_state(
         np.array([0.0]),
         state=state,
-        fade_chirps=4,
+        fade_steps=4,
     )
 
     assert np.allclose(fade, [0.75])
@@ -130,17 +172,23 @@ def test_path_visibility_state_fades_transitions():
     fade, latched = update_path_visibility_state(
         np.array([1.0]),
         state=state,
-        fade_chirps=4,
+        fade_steps=4,
     )
     assert np.allclose(fade, [1.0])
     assert np.allclose(latched, [1.0])
 
 
 def test_extract_static_path_bank_builds_direct_and_reflected_segments():
-    fmcw = FMCWConfig(carrier_frequency=60e9, slope=1e12,
-                      chirp_duration=1e-3, chirp_repetition_time=0.5,
-                      sampling_frequency=2e3, num_adc_samples=4,
-                      num_chirps_per_frame=2, frame_period=1.0)
+    fmcw = FMCWConfig(
+        carrier_frequency=60e9,
+        slope=1e12,
+        chirp_duration=1e-3,
+        chirp_repetition_time=0.5,
+        sampling_frequency=2e3,
+        num_adc_samples=4,
+        num_chirps_per_frame=2,
+        frame_period=1.0,
+    )
     radar = RadarSensor(
         name="radar",
         position=(0.0, 0.0, 0.0),

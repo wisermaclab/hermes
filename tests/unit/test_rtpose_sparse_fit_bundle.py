@@ -11,7 +11,6 @@ import tempfile
 import numpy as np
 import pytest
 
-
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
 
@@ -90,7 +89,10 @@ def _write_camera_frame(dataset: Path, sequence: str, frame: str) -> None:
     for side in ("left", "right"):
         path = dataset / f"Data/sequences/{sequence}/camera/{side}/{frame}.png"
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_bytes(b"\x89PNG\r\n\x1a\n" + side.encode("ascii"))
+        from PIL import Image
+
+        Image.new("RGB", (2, 2)).save(path)
+        path.write_bytes(path.read_bytes() + side.encode("ascii"))
 
 
 def _write_frame_archive(path: Path, frame_ids: tuple[str, ...]) -> Path:
@@ -103,8 +105,7 @@ def test_default_output_root_is_outside_the_source_checkout():
     module = _load_tool()
 
     expected = (
-        Path(tempfile.gettempdir())
-        / "hermes-validation-bundles/rtpose/sequence_176/bundles"
+        Path(tempfile.gettempdir()) / "hermes-validation-bundles/rtpose/sequence_176/bundles"
     ).resolve()
     output = module.resolve_output_root("176", None)
 
@@ -126,22 +127,22 @@ def test_amass_archive_is_discovered_below_sequence_smpl_directory(tmp_path):
     module = _load_tool()
     dataset = tmp_path / "RT-Pose"
     labels = _write_labels(dataset / "RT-POSE/Train.json")
-    expected = (
-        dataset
-        / "Data/sequences/176/smpl/rtpose_best_gender_smpl_amass_like.npz"
-    )
+    expected = dataset / "Data/sequences/176/smpl/rtpose_best_gender_smpl_amass_like.npz"
     _write_frame_archive(expected, ("000002", "000005", "000008"))
     # A preferred top-level release artifact wins over nested checkpoints.
     checkpoint = expected.parent / "checkpoints/old.npz"
     _write_frame_archive(checkpoint, ("000084", "000086", "000088"))
 
-    assert module.resolve_amass_npz(
-        None,
-        rtpose_root=dataset,
-        sequence="176",
-        labels_path=labels,
-        radar_frame_id="000111",
-    ) == expected.resolve()
+    assert (
+        module.resolve_amass_npz(
+            None,
+            rtpose_root=dataset,
+            sequence="176",
+            labels_path=labels,
+            radar_frame_id="000111",
+        )
+        == expected.resolve()
+    )
 
 
 def test_ambiguous_discovered_amass_archives_require_explicit_path(tmp_path):
@@ -189,13 +190,16 @@ def test_segment_manifest_selects_archive_containing_synchronized_pose(tmp_path)
         encoding="utf-8",
     )
 
-    assert module.resolve_amass_npz(
-        None,
-        rtpose_root=dataset,
-        sequence="176",
-        labels_path=labels,
-        radar_frame_id="000111",
-    ) == first.resolve()
+    assert (
+        module.resolve_amass_npz(
+            None,
+            rtpose_root=dataset,
+            sequence="176",
+            labels_path=labels,
+            radar_frame_id="000111",
+        )
+        == first.resolve()
+    )
 
 
 def test_sequence_metadata_uses_rtpose_filemeta_fields(tmp_path):
@@ -365,10 +369,7 @@ def test_rtpose_output_transform_converts_amass_world_to_radar_axes():
     module = _load_tool()
     # AMASS [left, -forward, up] -> RT-Pose [range, lateral, up].
     amass_points = np.asarray([[1.0, -2.0, 3.0]], dtype=np.float32)
-    radar_points = (
-        amass_points[..., module.AMASS_TO_RTPOSE_AXES]
-        * module.AMASS_TO_RTPOSE_SIGNS
-    )
+    radar_points = amass_points[..., module.AMASS_TO_RTPOSE_AXES] * module.AMASS_TO_RTPOSE_SIGNS
 
     assert np.allclose(radar_points, [[2.0, 1.0, 3.0]])
 
@@ -510,9 +511,7 @@ def test_rtpose_adc_cache_rejects_ambiguous_receiver_order(tmp_path):
     np.savez_compressed(
         cache,
         adc_cube=np.zeros((4, 2, 16, 12), dtype=np.complex64),
-        metadata_json=np.asarray(
-            json.dumps({"sequence": "176", "radar_frame_id": "000111"})
-        ),
+        metadata_json=np.asarray(json.dumps({"sequence": "176", "radar_frame_id": "000111"})),
     )
 
     with pytest.raises(ValueError, match="receiver ordering cannot be inferred"):
@@ -542,10 +541,13 @@ def test_center_selection_joins_fit_pose_ids_to_dataset_radar_ids(tmp_path):
     )
 
     assert object_index == 1
-    assert module.select_center_smpl_index(
-        frame_mapping=aligned,
-        radar_frame_id="000111",
-    ) == 1
+    assert (
+        module.select_center_smpl_index(
+            frame_mapping=aligned,
+            radar_frame_id="000111",
+        )
+        == 1
+    )
 
     legacy = module.ArrayArchive(data)
     del legacy["frame_ids"]
@@ -615,11 +617,11 @@ def test_bundle_accepts_pose_only_fit_and_writes_aligned_timing(
     def fake_load_or_build_adc(_root, sequence, radar_frame_id):
         observed["adc_identity"] = (sequence, radar_frame_id)
         return (
-            np.zeros((4, 2, 1, 1), dtype=np.complex64),
+            np.zeros((4, 2, 16, 12), dtype=np.complex64),
             {
-                "source_rx_order": [1],
-                "exported_rx_order": [1],
-                "rx_order": [1],
+                "source_rx_order": list(range(1, 17)),
+                "exported_rx_order": list(range(1, 17)),
+                "rx_order": list(range(1, 17)),
             },
             tmp_path / "radar/bin",
         )
@@ -688,14 +690,12 @@ def test_bundle_accepts_pose_only_fit_and_writes_aligned_timing(
     }
     assert (bundle / "camera/left/000005.png").read_bytes().endswith(b"left")
     assert (bundle / "camera/right/000005.png").read_bytes().endswith(b"right")
-    benchmark = json.loads(
-        (bundle / "benchmark_metadata.json").read_text(encoding="utf-8")
-    )
+    benchmark = json.loads((bundle / "benchmark_metadata.json").read_text(encoding="utf-8"))
     sensor = json.loads((bundle / "sensor.json").read_text(encoding="utf-8"))
-    assert sensor["fmcw"]["tdm_enabled"] is True
-    assert sensor["metadata"]["source_rx_order"] == [1]
-    assert sensor["metadata"]["exported_rx_order"] == [1]
-    assert sensor["metadata"]["rx_order"] == [1]
+    assert sensor["fmcw"]["tx_schedule"] == "tdm"
+    assert sensor["metadata"]["source_rx_order"] == list(range(1, 17))
+    assert sensor["metadata"]["exported_rx_order"] == list(range(1, 17))
+    assert sensor["metadata"]["rx_order"] == list(range(1, 17))
     assert "physical 1-based" in sensor["metadata"]["rx_order_note"]
     assert sensor["metadata"]["velocity_resolution_mps"] > 0.0
     assert benchmark["camera_privacy"]["faces_obfuscated"] is False
@@ -703,9 +703,7 @@ def test_bundle_accepts_pose_only_fit_and_writes_aligned_timing(
     assert benchmark["motion"]["file"] == "amass_sequence.npz"
     assert "without refitting" in benchmark["motion"]["parameter_source"]
     assert benchmark["motion"]["timing_fields"]["bundle_times"].endswith("t=0.")
-    assert summary["amass_sequence_relative_times_s"] == pytest.approx(
-        [-0.04, 0.0, 0.11]
-    )
+    assert summary["amass_sequence_relative_times_s"] == pytest.approx([-0.04, 0.0, 0.11])
     assert summary["mesh_sequence_included"] is False
     assert benchmark["motion"]["mesh_sequence_included"] is False
     assert not (bundle / "mesh_sequence.npz").exists()
@@ -733,6 +731,8 @@ def test_bundle_accepts_pose_only_fit_and_writes_aligned_timing(
 
 def test_rtpose_publish_does_not_replace_late_foreign_destination(tmp_path):
     module = _load_tool()
+    from bundle_prepare.writer import publish_staged_directory
+
     output_root = tmp_path / "results"
     output_root.mkdir()
     staged = output_root / ".staged"
@@ -742,13 +742,14 @@ def test_rtpose_publish_does_not_replace_late_foreign_destination(tmp_path):
     target.mkdir()
     (target / "foreign.txt").write_text("keep", encoding="utf-8")
 
-    with pytest.raises(FileExistsError, match="appeared while preparing"):
-        module.publish_staged_bundle(
+    with pytest.raises(FileExistsError, match="exists"):
+        publish_staged_directory(
             staged,
             target,
             force=False,
-            sequence="176",
-            radar_frame_id="000111",
+            ownership_check=lambda path: module.replaceable_bundle(
+                path, sequence="176", radar_frame_id="000111"
+            ),
         )
 
     assert (target / "foreign.txt").read_text(encoding="utf-8") == "keep"
@@ -757,6 +758,8 @@ def test_rtpose_publish_does_not_replace_late_foreign_destination(tmp_path):
 
 def test_rtpose_publish_restores_owned_bundle_on_failure(tmp_path, monkeypatch):
     module = _load_tool()
+    from bundle_prepare.writer import publish_staged_directory
+
     output_root = tmp_path / "results"
     output_root.mkdir()
     staged = output_root / ".staged"
@@ -764,6 +767,7 @@ def test_rtpose_publish_restores_owned_bundle_on_failure(tmp_path, monkeypatch):
     (staged / "new.txt").write_text("new", encoding="utf-8")
     target = output_root / "frame0111"
     target.mkdir()
+    (target / "bundle.json").write_text("{}")
     (target / "old.txt").write_text("keep old", encoding="utf-8")
     (target / "bundle_summary.json").write_text(
         json.dumps(
@@ -785,12 +789,13 @@ def test_rtpose_publish_restores_owned_bundle_on_failure(tmp_path, monkeypatch):
 
     monkeypatch.setattr(module.os, "replace", fail_staged_publish)
     with pytest.raises(OSError, match="injected publication failure"):
-        module.publish_staged_bundle(
+        publish_staged_directory(
             staged,
             target,
             force=True,
-            sequence="176",
-            radar_frame_id="000111",
+            ownership_check=lambda path: module.replaceable_bundle(
+                path, sequence="176", radar_frame_id="000111"
+            ),
         )
 
     assert (target / "old.txt").read_text(encoding="utf-8") == "keep old"
@@ -894,20 +899,16 @@ def test_environment_copy_sanitizes_json_and_drops_unneeded_object_arrays(tmp_pa
     )
 
     sanitized = json.loads(
-        (bundle / "environment_geometry/environment_surfaces.json").read_text(
-            encoding="utf-8"
-        )
+        (bundle / "environment_geometry/environment_surfaces.json").read_text(encoding="utf-8")
     )
     assert sanitized["metadata"]["source"] == "source.ply"
-    assert outputs["environment_mesh_sequence"].endswith(
-        "environment_mesh_sequence.npz"
-    )
+    assert outputs["environment_mesh_sequence"].endswith("environment_mesh_sequence.npz")
     assert module.portable_geometry_outputs(
         outputs,
         roots=(bundle, dataset),
-    )["environment_mesh_sequence"] == (
-        "environment_geometry/environment_mesh_sequence.npz"
-    )
+    )[
+        "environment_mesh_sequence"
+    ] == ("environment_geometry/environment_mesh_sequence.npz")
     with np.load(
         bundle / "environment_geometry/environment_mesh_sequence.npz",
         allow_pickle=False,

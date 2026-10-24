@@ -14,7 +14,6 @@ from pathlib import Path
 
 import numpy as np
 
-
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_OUTPUT_DIR = Path(tempfile.gettempdir()) / "mmwave_radar_outputs" / "ti_board_patterns"
 
@@ -141,11 +140,13 @@ def configure_matplotlib(*, show: bool):
         matplotlib.use("Agg")
     import matplotlib.pyplot as plt  # pylint: disable=import-outside-toplevel
 
-    plt.rcParams.update({
-        "figure.figsize": (10, 4),
-        "axes.grid": True,
-        "grid.alpha": 0.25,
-    })
+    plt.rcParams.update(
+        {
+            "figure.figsize": (10, 4),
+            "axes.grid": True,
+            "grid.alpha": 0.25,
+        }
+    )
     return plt
 
 
@@ -292,7 +293,9 @@ def plot_pattern_losses(plt, radar_hardware, board_key: str) -> list:
                 linewidth=1.2,
             )
 
-        band_label = f"{band_hz / 1e9:.1f} GHz" if len(pattern.band_centers_hz) > 1 else "catalog band"
+        band_label = (
+            f"{band_hz / 1e9:.1f} GHz" if len(pattern.band_centers_hz) > 1 else "catalog band"
+        )
         axes[0].set_title(f"{hardware.name} azimuth loss, {band_label}")
         axes[1].set_title(f"{hardware.name} elevation loss, {band_label}")
         axes[0].set_xlabel("azimuth angle (deg)")
@@ -370,10 +373,7 @@ def print_board_details(radar_hardware, board_key: str) -> None:
             print(json.dumps(dict(metadata), indent=2))
         else:
             print(type(pattern).__name__)
-            print(
-                "half-power angle: "
-                f"{float(pattern.half_power_angle_deg):.1f} degrees"
-            )
+            print("half-power angle: " f"{float(pattern.half_power_angle_deg):.1f} degrees")
 
 
 if __name__ == "__main__":

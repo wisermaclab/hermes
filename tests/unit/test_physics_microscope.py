@@ -66,12 +66,9 @@ def test_physics_microscope_produces_exportable_live_result():
     )
 
     assert result.manifest.scene.scenario == "static_plate"
-    assert result.manifest.solver.mode == "hybrid_rt_po"
+    assert result.manifest.solver.solvers == ("rt", "po")
     solver_parameters = result.manifest.solver.parameters
-    assert (
-        solver_parameters["po_integration_mode"]
-        == "parent_face_quadrature"
-    )
+    assert solver_parameters["po_integration_mode"] == "parent_face_quadrature"
     assert solver_parameters["po_quadrature_phase_span_scale_rad"] == 1.0
     assert solver_parameters["po_quadrature_max_refinement_depth"] == 2
     assert solver_parameters["po_quadrature_max_subfaces_per_parent"] == 16
@@ -85,6 +82,13 @@ def test_physics_microscope_produces_exportable_live_result():
     assert result.visible_face_count > 0
     assert result.po_range_profile_power.shape == result.ranges_m.shape
     assert result.rt_range_profile_power.shape == result.ranges_m.shape
+    assert result.po_channel_range_profile_power.shape == (len(result.ranges_m), 12)
+    np.testing.assert_allclose(
+        result.po_channel_range_profile_power.sum(axis=-1), result.po_range_profile_power
+    )
+    np.testing.assert_allclose(
+        result.rt_channel_range_profile_power.sum(axis=-1), result.rt_range_profile_power
+    )
     assert result.rt_path_count >= 0
     assert result.po_runtime_s >= 0.0
     assert result.rt_runtime_s >= 0.0
@@ -102,7 +106,7 @@ def test_static_experiment_uses_custom_fmcw_and_tdm_selection():
         chirp_repetition_time_s=50.0e-6,
         sampling_frequency_hz=3.0e6,
         frame_period_s=20.0e-3,
-        tdm_enabled=False,
+        tx_schedule="simultaneous",
         selected_tx_indices=(2,),
         selected_rx_indices=(1, 3),
         target_y_m=0.3,
@@ -119,23 +123,17 @@ def test_static_experiment_uses_custom_fmcw_and_tdm_selection():
     )
 
     assert result.po_adc.shape == (1, 4, 64, 2)
-    assert result.sensor_parameters["tdm_enabled"] is False
+    assert result.sensor_parameters["tx_schedule"] == "simultaneous"
     assert result.sensor_parameters["tx_indices_zero_based"] == [2]
     assert result.sensor_parameters["rx_indices_zero_based"] == [1, 3]
-    assert result.sensor_parameters["orientation"] == pytest.approx(
-        np.deg2rad((12.0, -7.0, 4.0))
-    )
-    assert result.sensor_parameters["orientation_deg"] == pytest.approx(
-        (12.0, -7.0, 4.0)
-    )
+    assert result.sensor_parameters["orientation"] == pytest.approx(np.deg2rad((12.0, -7.0, 4.0)))
+    assert result.sensor_parameters["orientation_deg"] == pytest.approx((12.0, -7.0, 4.0))
     assert result.sensor_parameters["pattern_mode"] == "none"
     assert result.sensor_parameters["cosine_3db_beamwidth_deg"] == 42.0
     assert result.target_parameters["position_m"] == [2.0, 0.3, 0.4]
     assert result.target_parameters["target_y_m"] == 0.3
     assert result.target_parameters["target_z_m"] == 0.4
-    assert result.target_parameters["distance_to_radar_m"] == pytest.approx(
-        np.sqrt(4.25)
-    )
+    assert result.target_parameters["distance_to_radar_m"] == pytest.approx(np.sqrt(4.25))
     assert result.target_parameters["rt_diffuse_reflection_coefficient"] == 0.20
     assert result.target_parameters["rt_backscattering_lambda"] == 0.20
     fmcw = result.sensor_parameters["fmcw"]
@@ -144,9 +142,9 @@ def test_static_experiment_uses_custom_fmcw_and_tdm_selection():
     assert fmcw["num_adc_samples"] == 64
     assert fmcw["num_chirps_per_frame"] == 4
     assert fmcw["num_tx"] == 1
-    assert fmcw["tdm_enabled"] is False
+    assert fmcw["tx_schedule"] == "simultaneous"
     radar_parameters = result.manifest.radar.parameters
-    assert radar_parameters["tdm_enabled"] is False
+    assert radar_parameters["tx_schedule"] == "simultaneous"
     assert radar_parameters["tx_indices_zero_based"] == [2]
     assert radar_parameters["rx_indices_zero_based"] == [1, 3]
     assert radar_parameters["radar_yaw_deg"] == 12.0
@@ -203,11 +201,11 @@ def test_trihedral_mesh_and_uploaded_obj_human_run():
         target_type="human_mesh",
         human_mesh=obj,
         human_mesh_filename="person.obj",
-        diffuse_reflection_coefficient=0.6,
+        rt_human_diffuse_coefficient=0.6,
     )
     assert result.target_type == "human_mesh"
     assert result.material_name == "human_tissue"
-    assert result.target_parameters["diffuse_reflection_coefficient"] == 0.6
+    assert result.target_parameters["rt_human_diffuse_coefficient"] == 0.6
     assert result.rt_adc.shape == result.po_adc.shape
 
 

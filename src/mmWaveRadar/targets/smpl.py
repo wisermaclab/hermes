@@ -12,6 +12,8 @@ import os
 
 import numpy as np
 
+from .mesh import MeshSequenceView
+
 
 def load_amass_npz(npz_path: str) -> Dict[str, Any]:
     """
@@ -23,9 +25,7 @@ def load_amass_npz(npz_path: str) -> Dict[str, Any]:
 
     try:
         with np.load(npz_path, allow_pickle=False) as data:
-            out: Dict[str, Any] = {
-                key: np.array(data[key], copy=True) for key in data.files
-            }
+            out: Dict[str, Any] = {key: np.array(data[key], copy=True) for key in data.files}
     except ValueError as exc:
         if "Object arrays cannot be loaded" not in str(exc):
             raise
@@ -36,10 +36,12 @@ def load_amass_npz(npz_path: str) -> Dict[str, Any]:
     labels = out.get("marker_labels")
     if labels is not None and getattr(labels, "dtype", None) is not None:
         if labels.dtype.kind in ("S", "O"):
-            out["marker_labels"] = np.array([
-                label.decode("utf-8") if isinstance(label, bytes) else str(label)
-                for label in labels
-            ])
+            out["marker_labels"] = np.array(
+                [
+                    label.decode("utf-8") if isinstance(label, bytes) else str(label)
+                    for label in labels
+                ]
+            )
     return out
 
 
@@ -69,7 +71,6 @@ def visualize_amass_markers(
     ax.set_zlabel("Z")
     ax.set_title(f"AMASS markers frame {int(frame_idx)}")
     return ax
-
 
 
 def _canonical_gender(gender: Any) -> str:
@@ -248,8 +249,7 @@ def _slerp_quaternion(q0: np.ndarray, q1: np.ndarray, weight: float) -> np.ndarr
     return np.where(linear, lerp, slerp)
 
 
-def _slerp_axis_angle(rotvec0: np.ndarray, rotvec1: np.ndarray,
-                      weight: float) -> np.ndarray:
+def _slerp_axis_angle(rotvec0: np.ndarray, rotvec1: np.ndarray, weight: float) -> np.ndarray:
     """Spherically interpolates axis-angle rotation vectors."""
 
     q0 = _axis_angle_to_quaternion(rotvec0)
@@ -316,7 +316,7 @@ def interpolate_amass_pose_params(
 
 
 @dataclass
-class AMASSSMPLMotionSequence:
+class AMASSSMPLMotionSequence(MeshSequenceView):
     """AMASS motion sequence evaluated through SMPL at arbitrary times.
 
     Pose interpolation uses per-joint spherical interpolation of AMASS
@@ -337,8 +337,7 @@ class AMASSSMPLMotionSequence:
     _torch: Any = field(init=False, repr=False)
     _model: Any = field(init=False, repr=False)
     _initial_vertices: np.ndarray = field(init=False, repr=False)
-    _vertices_cache: np.ndarray | None = field(default=None, init=False,
-                                               repr=False)
+    _vertices_cache: np.ndarray | None = field(default=None, init=False, repr=False)
 
     def __post_init__(self):
         try:
@@ -420,12 +419,6 @@ class AMASSSMPLMotionSequence:
         return int(self._initial_vertices.shape[0])
 
     @property
-    def face_count(self) -> int:
-        """Number of triangular faces."""
-
-        return int(self.faces.shape[0])
-
-    @property
     def vertices(self) -> np.ndarray:
         """Vertices at the original AMASS sample times.
 
@@ -435,7 +428,8 @@ class AMASSSMPLMotionSequence:
 
         if self._vertices_cache is None:
             self._vertices_cache = np.stack(
-                [self.vertices_at(float(t)) for t in self.times], axis=0)
+                [self.vertices_at(float(t)) for t in self.times], axis=0
+            )
         return self._vertices_cache
 
     def vertices_at(self, time: float) -> np.ndarray:
@@ -449,25 +443,14 @@ class AMASSSMPLMotionSequence:
         )
         return self._vertices_from_params(pose, translation)
 
-    def max_vertex_displacement(self, time: float,
-                                reference_vertices: np.ndarray) -> float:
-        """Maximum vertex displacement relative to ``reference_vertices``."""
-
-        vertices = self.vertices_at(time)
-        ref = np.asarray(reference_vertices, dtype=np.float32)
-        if ref.shape != vertices.shape:
-            raise ValueError("reference_vertices shape mismatch")
-        return float(np.max(np.linalg.norm(vertices - ref, axis=1)))
-
-    def _vertices_from_params(self, pose: np.ndarray,
-                              translation: np.ndarray) -> np.ndarray:
+    def _vertices_from_params(self, pose: np.ndarray, translation: np.ndarray) -> np.ndarray:
         """Runs the SMPL-family model for one pose/translation sample."""
 
         torch = self._torch
-        pose_t = torch.from_numpy(np.asarray(pose, dtype=np.float32)[None, :]).to(
-            self.device)
-        trans_t = torch.from_numpy(
-            np.asarray(translation, dtype=np.float32)[None, :]).to(self.device)
+        pose_t = torch.from_numpy(np.asarray(pose, dtype=np.float32)[None, :]).to(self.device)
+        trans_t = torch.from_numpy(np.asarray(translation, dtype=np.float32)[None, :]).to(
+            self.device
+        )
         betas_t = torch.from_numpy(self.betas[None, :]).to(self.device)
         kwargs = dict(
             betas=betas_t,
@@ -476,8 +459,7 @@ class AMASSSMPLMotionSequence:
         kwargs.update(_model_pose_kwargs(pose_t, self.model_type, torch))
         with torch.no_grad():
             output = self._model(**kwargs)
-        return output.vertices.detach().cpu().numpy()[0].astype(
-            np.float32, copy=False)
+        return output.vertices.detach().cpu().numpy()[0].astype(np.float32, copy=False)
 
 
 def amass_to_mesh_npz(
@@ -520,9 +502,7 @@ def amass_to_mesh_npz(
     if betas.size < 10:
         raise ValueError("betas must contain at least 10 shape coefficients")
     if not (
-        np.all(np.isfinite(poses))
-        and np.all(np.isfinite(betas))
-        and np.all(np.isfinite(trans))
+        np.all(np.isfinite(poses)) and np.all(np.isfinite(betas)) and np.all(np.isfinite(trans))
     ):
         raise ValueError("poses, betas, and trans must contain only finite values")
     model_type = _canonical_model_type(model_type)
@@ -545,8 +525,7 @@ def amass_to_mesh_npz(
     ).to(device)
 
     poses_t = torch.from_numpy(poses).to(device)
-    betas_t = torch.from_numpy(betas[:10]).to(device).unsqueeze(0).repeat(
-        num_frames, 1)
+    betas_t = torch.from_numpy(betas[:10]).to(device).unsqueeze(0).repeat(num_frames, 1)
     trans_t = torch.from_numpy(trans).to(device)
 
     kwargs = dict(
@@ -576,7 +555,6 @@ def amass_to_mesh_npz(
     return faces, vertices, times
 
 
-
 def amass_to_smpl_motion_sequence(
     amass_npz_path: str,
     smpl_model_dir: str,
@@ -602,9 +580,7 @@ def amass_to_smpl_motion_sequence(
     if betas.size < 10:
         raise ValueError("betas must contain at least 10 shape coefficients")
     if not (
-        np.all(np.isfinite(poses))
-        and np.all(np.isfinite(trans))
-        and np.all(np.isfinite(betas))
+        np.all(np.isfinite(poses)) and np.all(np.isfinite(trans)) and np.all(np.isfinite(betas))
     ):
         raise ValueError("poses, betas, and trans must contain only finite values")
     model_type = _canonical_model_type(model_type)

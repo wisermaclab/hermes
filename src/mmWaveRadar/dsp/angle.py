@@ -1,7 +1,13 @@
 # SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
 # Copyright (c) 2026 Wireless System Research Group, McMaster University
 
-"""FFT angle spectrum helpers."""
+"""FFT angle spectrum helpers.
+
+ADC snapshots follow the ``tx(t) * conj(rx(t))`` mixer convention shared by the
+simulator and TI hardware, so a source at direction cosine ``u`` gives element
+phases ``exp(-j 2 pi p u)``. The spatial transforms below therefore use the
+unscaled inverse DFT, which peaks at the physical ``+u`` on unchanged axes.
+"""
 
 from __future__ import annotations
 
@@ -9,6 +15,7 @@ from typing import Any, Dict, Literal, Optional, Tuple
 
 import numpy as np
 
+from ..values import positive_float
 from .constants import SPEED_OF_LIGHT
 from .window import window_1d
 
@@ -71,8 +78,7 @@ def angle_map_2d_fft(
         raise ValueError("x_ura must have at least 2 dims [..., Nz, Ny]")
 
     nz, ny = x_ura.shape[-2], x_ura.shape[-1]
-    nfft_z, nfft_y = (nz, ny) if fft_size is None else (
-        int(fft_size[0]), int(fft_size[1]))
+    nfft_z, nfft_y = (nz, ny) if fft_size is None else (int(fft_size[0]), int(fft_size[1]))
     if spacing != "lambda_over_2":
         raise ValueError("Only spacing='lambda_over_2' is supported")
     wave_speed = _positive_finite("c", c)
@@ -84,18 +90,16 @@ def angle_map_2d_fft(
     wz = window_1d(nz, window)
     wy = window_1d(ny, window)
     spec = np.fft.fftshift(
-        np.fft.fft2(x_ura * (wz[:, None] * wy[None, :]),
-                    s=(nfft_z, nfft_y), axes=(-2, -1)),
-        axes=(-2, -1))
-    fy = np.fft.fftshift(
-        np.fft.fftfreq(nfft_y, d=wavelength * spacing_y)
+        np.fft.ifft2(
+            x_ura * (wz[:, None] * wy[None, :]), s=(nfft_z, nfft_y), axes=(-2, -1), norm="forward"
+        ),
+        axes=(-2, -1),
     )
-    fz = np.fft.fftshift(
-        np.fft.fftfreq(nfft_z, d=wavelength * spacing_z)
-    )
+    fy = np.fft.fftshift(np.fft.fftfreq(nfft_y, d=wavelength * spacing_y))
+    fz = np.fft.fftshift(np.fft.fftfreq(nfft_z, d=wavelength * spacing_z))
     mag = np.abs(spec)
     return {
-        "map": mag ** 2 if power else mag,
+        "map": mag**2 if power else mag,
         "spectrum": spec,
         "u": wavelength * fy,
         "v": wavelength * fz,
@@ -135,11 +139,17 @@ def angle_map_fft(
     if nz > 1 and ny > 1:
         if isinstance(fft_size, int):
             fft_size = (fft_size, fft_size)
-        return angle_map_2d_fft(x_array, fc_hz=fc_hz, window=window,
-                                fft_size=fft_size, power=power, c=c,
-                                spacing=spacing,
-                                spacing_y_lambda=spacing_y_lambda,
-                                spacing_z_lambda=spacing_z_lambda)
+        return angle_map_2d_fft(
+            x_array,
+            fc_hz=fc_hz,
+            window=window,
+            fft_size=fft_size,
+            power=power,
+            c=c,
+            spacing=spacing,
+            spacing_y_lambda=spacing_y_lambda,
+            spacing_z_lambda=spacing_z_lambda,
+        )
 
     if spacing != "lambda_over_2":
         raise ValueError("Only spacing='lambda_over_2' is supported")
@@ -150,39 +160,46 @@ def angle_map_fft(
     spacing_z = _normalized_spacing("spacing_z_lambda", spacing_z_lambda)
 
     if nz == 1 and ny > 1:
-        nfft = ny if fft_size is None else (
-            int(fft_size) if isinstance(fft_size, int) else int(fft_size[1]))
-        wy = window_1d(ny, window)
-        spec = np.fft.fftshift(np.fft.fft(x_array * wy, n=nfft, axis=-1),
-                               axes=(-1,))
-        fy = np.fft.fftshift(
-            np.fft.fftfreq(nfft, d=wavelength * spacing_y)
+        nfft = (
+            ny
+            if fft_size is None
+            else (int(fft_size) if isinstance(fft_size, int) else int(fft_size[1]))
         )
+        wy = window_1d(ny, window)
+        spec = np.fft.fftshift(
+            np.fft.ifft(x_array * wy, n=nfft, axis=-1, norm="forward"), axes=(-1,)
+        )
+        fy = np.fft.fftshift(np.fft.fftfreq(nfft, d=wavelength * spacing_y))
         mag = np.abs(spec)
-        return {"map": np.squeeze(mag ** 2 if power else mag, axis=-2),
-                "spectrum": np.squeeze(spec, axis=-2),
-                "u": wavelength * fy,
-                "spacing_y_lambda": spacing_y}
+        return {
+            "map": np.squeeze(mag**2 if power else mag, axis=-2),
+            "spectrum": np.squeeze(spec, axis=-2),
+            "u": wavelength * fy,
+            "spacing_y_lambda": spacing_y,
+        }
 
     if ny == 1 and nz > 1:
-        nfft = nz if fft_size is None else (
-            int(fft_size) if isinstance(fft_size, int) else int(fft_size[0]))
+        nfft = (
+            nz
+            if fft_size is None
+            else (int(fft_size) if isinstance(fft_size, int) else int(fft_size[0]))
+        )
         wz = window_1d(nz, window)
         spec = np.fft.fftshift(
-            np.fft.fft(x_array * wz[:, None], n=nfft, axis=-2),
-            axes=(-2,))
-        fz = np.fft.fftshift(
-            np.fft.fftfreq(nfft, d=wavelength * spacing_z)
+            np.fft.ifft(x_array * wz[:, None], n=nfft, axis=-2, norm="forward"), axes=(-2,)
         )
+        fz = np.fft.fftshift(np.fft.fftfreq(nfft, d=wavelength * spacing_z))
         mag = np.abs(spec)
-        return {"map": np.squeeze(mag ** 2 if power else mag, axis=-1),
-                "spectrum": np.squeeze(spec, axis=-1),
-                "v": wavelength * fz,
-                "spacing_z_lambda": spacing_z}
+        return {
+            "map": np.squeeze(mag**2 if power else mag, axis=-1),
+            "spectrum": np.squeeze(spec, axis=-1),
+            "v": wavelength * fz,
+            "spacing_z_lambda": spacing_z,
+        }
 
     spec = x_array.astype(np.complex128)
     mag = np.abs(spec)
-    return {"map": mag ** 2 if power else mag, "spectrum": spec}
+    return {"map": mag**2 if power else mag, "spectrum": spec}
 
 
 def _normalized_spacing(name: str, value: float | None) -> float:
@@ -191,13 +208,4 @@ def _normalized_spacing(name: str, value: float | None) -> float:
     return _positive_finite(name, 0.5 if value is None else value)
 
 
-def _positive_finite(name: str, value: object) -> float:
-    """Returns ``value`` as a positive finite float."""
-
-    try:
-        scalar = float(value)
-    except (TypeError, ValueError, OverflowError) as exc:
-        raise ValueError(f"{name} must be finite and positive") from exc
-    if not np.isfinite(scalar) or scalar <= 0.0:
-        raise ValueError(f"{name} must be finite and positive")
-    return scalar
+_positive_finite = positive_float

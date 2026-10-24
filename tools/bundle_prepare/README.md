@@ -1,4 +1,42 @@
-# Validation-bundle preparation
+# Bundle preparation
+
+Use the installed, dataset-neutral preparation command for normalized ADC and
+an existing scene:
+
+```bash
+mmwave-prepare-bundle \
+  --adc /path/to/capture_adc.npz \
+  --sensor /path/to/sensor.json \
+  --scene /path/to/scene.xml \
+  --target-mesh /path/to/plate.npz \
+  --target-material /path/to/material.json \
+  --output /path/to/capture-bundle.zip
+```
+
+Direct mode requires `--adc`, `--output`, and either `--sensor` or `--ti-config`
+with `--board-model`. Scene, target and material inputs are optional. Direct
+paths are relative to the current directory. Use `--help` for timing, background,
+motion, and IQ/phase options.
+
+Alternatively, use a preparation JSON:
+
+```bash
+mmwave-prepare-bundle --config /path/to/prepare.json
+```
+
+Choose direct inputs or `--config`; `--output` and `--force` work with both.
+From a source checkout, run `python tools/prepare_bundle.py` with the same
+arguments from `public/` without reinstalling the package.
+
+Start with [bring your own measurement](BRING_YOUR_OWN.md), including a packaged
+synthetic static-target example that needs no SMPL. The public `BundleWriter`
+is shared by this command, the GUI exporters, and dataset-adapter publication.
+It stages, canonicalizes, checks and publishes directories or ZIPs. JSON paths
+inside a preparation config are relative to that file.
+
+The normative [bundle contract](../../validation/BUNDLE_SPEC.md) defines axes,
+units, phase signs, coordinate transforms, channel maps, physical TDM slots and
+required features. See also [writing a dataset adapter](ADAPTER_GUIDE.md).
 
 This directory contains two reviewed reference adapters for preparing standard
 HERMES bundles from separately obtained datasets:
@@ -50,7 +88,7 @@ datasets used in HERMES validation and demonstrate different radar/channel and
 synchronization layouts. They are not the only datasets the validation package
 can consume. For another dataset, any external or project-specific converter
 may be used as long as it writes the bundle contract documented in
-`validation/README.md` and the result passes `mmwave-check-bundle`.
+`validation/BUNDLE_SPEC.md` and the result passes `mmwave-check-bundle`.
 
 Both adapters have a deliberately compact, fidelity-oriented interface and
 write only canonical `amass_sequence.npz` body motion with source and

@@ -37,8 +37,8 @@ python -m validation.cli \
   --clip data/validation_bundles/rtpose_seq10_frame0020 \
   --out /tmp/rtpose_seq10_frame0020 \
   --smpl-model-dir /path/to/licensed/smpl_models \
-  --subarray-tx 1-3,10 \
-  --subarray-rx 5-12 \
+  --tx-indices 0-2,9 \
+  --rx-indices 4-11 \
   --ignore-tdm-timing \
   --progress
 ```
@@ -46,7 +46,8 @@ python -m validation.cli \
 The ADC channel axis preserves measured TDM TX-block order
 `TX12, TX11, ..., TX1`; receivers within each block were converted from the
 RT-Pose MIMO-processing order to physical `RX1, ..., RX16`. Validation selects
-channels by physical antenna label and keeps output channels in the measured
+channels by zero-based index (index 0 is TX1 or RX1, so the example above
+selects TX1-TX3, TX10 and RX5-RX12) and keeps output channels in the measured
 ADC-axis order. See [`validation/README.md`](../../../validation/README.md) for
 the exact default and `--ignore-tdm-timing` simulation policies.
 

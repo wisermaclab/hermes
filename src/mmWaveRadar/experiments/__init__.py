@@ -3,20 +3,40 @@
 
 """Reproducible experiment contracts and curated public experiment runners."""
 
+from .radar import RadarSettings, build_radar
 from .human_room import (
-    HUMAN_ROOM_SIMULATION_MODES,
     HumanRoomDiagnostics,
     HumanRoomPreview,
     HumanRoomResult,
     LoadedAMASSMotion,
     PREPARED_ROOM_PRESETS,
+    SOLVERS,
     load_amass_motion,
     load_human_motion,
     load_scene_xml,
+    motion_source_to_radar_transform,
     prepared_room_boxes,
     prepare_human_room_preview,
+    radar_frame_count,
     run_human_room_diagnostics,
     run_human_room_experiment,
+    simulate_human_room,
+)
+from .settings import (
+    HumanMotionSettings,
+    RoomSceneSettings,
+    HumanRoomSettings,
+    HumanRoomSolverSettings,
+    HumanPOSettings,
+    HumanRayTracingSettings,
+    HumanHybridSettings,
+    ExperimentExecutionSettings,
+    StaticTargetSettings,
+    StaticTargetGeometrySettings,
+    StaticTargetSolverSettings,
+    StaticPOSettings,
+    StaticRayTracingSettings,
+    StaticExecutionSettings,
 )
 from .manifest import (
     EXPERIMENT_MANIFEST_SCHEMA_VERSION,
@@ -37,6 +57,7 @@ from .physics_microscope import (
     run_physics_microscope,
     run_static_target_diagnostics,
     run_static_target_experiment,
+    simulate_static_target,
 )
 from .solver_diagnostics import (
     POSurfaceDiagnostics,
@@ -47,9 +68,24 @@ from .solver_diagnostics import (
 )
 
 __all__ = [
+    "simulate_human_room",
+    "simulate_static_target",
+    "HumanMotionSettings",
+    "RoomSceneSettings",
+    "HumanRoomSettings",
+    "HumanRoomSolverSettings",
+    "HumanPOSettings",
+    "HumanRayTracingSettings",
+    "HumanHybridSettings",
+    "ExperimentExecutionSettings",
+    "StaticTargetSettings",
+    "StaticTargetGeometrySettings",
+    "StaticTargetSolverSettings",
+    "StaticPOSettings",
+    "StaticRayTracingSettings",
+    "StaticExecutionSettings",
     "EXPERIMENT_MANIFEST_SCHEMA_VERSION",
     "ExperimentManifest",
-    "HUMAN_ROOM_SIMULATION_MODES",
     "HumanRoomDiagnostics",
     "HumanRoomPreview",
     "HumanRoomResult",
@@ -60,6 +96,9 @@ __all__ = [
     "PREPARED_ROOM_PRESETS",
     "PhysicsMicroscopeResult",
     "RadarExperimentConfig",
+    "RadarSettings",
+    "build_radar",
+    "SOLVERS",
     "SceneExperimentConfig",
     "SolverExperimentConfig",
     "SolverDiagnostics",
@@ -72,8 +111,10 @@ __all__ = [
     "make_rectangular_plate_mesh",
     "make_trihedral_corner_mesh",
     "material_preset_parameters",
+    "motion_source_to_radar_transform",
     "prepared_room_boxes",
     "prepare_human_room_preview",
+    "radar_frame_count",
     "run_human_room_diagnostics",
     "run_human_room_experiment",
     "run_physics_microscope",

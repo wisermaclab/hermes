@@ -17,7 +17,6 @@ import numpy as np
 
 from .hardware import _broadcast_channel_angles
 
-
 _PATTERN_ASSET = "ti_digitized_patterns.npz"
 _PATTERN_ASSET_ENV = "MMWAVE_TI_PATTERN_NPZ"
 
@@ -67,8 +66,7 @@ def _canonical_key(model: str) -> str:
     token = "".join(ch for ch in str(model).upper() if ch.isalnum())
     for key, spec in _SPECS.items():
         aliases = {key, *(spec.aliases)}
-        if token in {"".join(ch for ch in alias.upper() if ch.isalnum())
-                    for alias in aliases}:
+        if token in {"".join(ch for ch in alias.upper() if ch.isalnum()) for alias in aliases}:
             return key
     raise KeyError(f"Unknown TI radar board model: {model!r}")
 
@@ -177,26 +175,22 @@ class TIBoardSpec:
     def virtual_channel_tx_indices(self) -> np.ndarray:
         """Returns zero-based Tx indices for virtual channels."""
 
-        return np.asarray([vc.tx_index for vc in self.virtual_channels],
-                          dtype=np.int64)
+        return np.asarray([vc.tx_index for vc in self.virtual_channels], dtype=np.int64)
 
     def virtual_channel_rx_indices(self) -> np.ndarray:
         """Returns zero-based Rx indices for virtual channels."""
 
-        return np.asarray([vc.rx_index for vc in self.virtual_channels],
-                          dtype=np.int64)
+        return np.asarray([vc.rx_index for vc in self.virtual_channels], dtype=np.int64)
 
     def virtual_channel_positions_lambda(self) -> np.ndarray:
         """Returns documented ``[horizontal, vertical]`` positions in wavelengths."""
 
-        return np.asarray([vc.position_lambda for vc in self.virtual_channels],
-                          dtype=float)
+        return np.asarray([vc.position_lambda for vc in self.virtual_channels], dtype=float)
 
     def channel_phase_signs(self) -> np.ndarray:
         """Returns fixed complex phase signs for virtual channels."""
 
-        return np.asarray([vc.phase_sign for vc in self.virtual_channels],
-                          dtype=np.complex128)
+        return np.asarray([vc.phase_sign for vc in self.virtual_channels], dtype=np.complex128)
 
     def pattern(
         self,
@@ -233,17 +227,14 @@ class TIBoardSpec:
             "design_frequency_hz": float(self.design_frequency_hz),
             "lambda_m": float(self.lambda_m),
             "tx_power_dbm": float(self.tx_power_dbm),
-            "antenna_gain_dbi_per_element": float(
-                self.antenna_gain_dbi_per_element
-            ),
+            "antenna_gain_dbi_per_element": float(self.antenna_gain_dbi_per_element),
             "combined_antenna_gain_dbi": float(self.combined_antenna_gain_dbi),
             "noise": dict(self.noise),
             "adc": dict(self.adc),
             "fov_deg": dict(self.fov_deg),
             "angular_resolution_deg": dict(self.angular_resolution_deg),
             "fmcw_profiles": {
-                str(key): dict(value)
-                for key, value in (self.fmcw_profiles or {}).items()
+                str(key): dict(value) for key, value in (self.fmcw_profiles or {}).items()
             },
         }
 
@@ -311,17 +302,10 @@ class TIDigitizedPattern:
             elevation_angles.size,
         )
         if azimuth_loss.shape != expected_azimuth_shape:
-            raise ValueError(
-                f"azimuth_loss_db must have shape {expected_azimuth_shape}"
-            )
+            raise ValueError(f"azimuth_loss_db must have shape {expected_azimuth_shape}")
         if elevation_loss.shape != expected_elevation_shape:
-            raise ValueError(
-                f"elevation_loss_db must have shape {expected_elevation_shape}"
-            )
-        if not (
-            np.all(np.isfinite(azimuth_loss))
-            and np.all(np.isfinite(elevation_loss))
-        ):
+            raise ValueError(f"elevation_loss_db must have shape {expected_elevation_shape}")
+        if not (np.all(np.isfinite(azimuth_loss)) and np.all(np.isfinite(elevation_loss))):
             raise ValueError("pattern loss tables must contain only finite values")
         if not isinstance(self.metadata, Mapping):
             raise ValueError("metadata must be a mapping")
@@ -398,8 +382,7 @@ class TIDigitizedPattern:
             )
         return out
 
-    def _curves_for_frequency(self, frequency_hz: float | None
-                              ) -> tuple[np.ndarray, np.ndarray]:
+    def _curves_for_frequency(self, frequency_hz: float | None) -> tuple[np.ndarray, np.ndarray]:
         """Interpolates azimuth/elevation pattern curves at ``frequency_hz``."""
 
         if frequency_hz is None:
@@ -464,9 +447,7 @@ class SimpleCosinePattern:
         try:
             channel_count = operator.index(self.num_virtual_channels)
         except TypeError as exc:
-            raise ValueError(
-                "num_virtual_channels must be a positive integer"
-            ) from exc
+            raise ValueError("num_virtual_channels must be a positive integer") from exc
         try:
             half_power_angle = float(self.half_power_angle_deg)
             floor_loss = float(self.floor_loss_db)
@@ -543,9 +524,7 @@ def load_ti_digitized_pattern(board_key: str) -> TIDigitizedPattern:
             metadata = json.loads(str(data[f"{prefix}metadata_json"]))
             pattern = TIDigitizedPattern(
                 board_key=key,
-                channel_labels=tuple(
-                    str(v) for v in data[f"{prefix}channel_labels"]
-                ),
+                channel_labels=tuple(str(v) for v in data[f"{prefix}channel_labels"]),
                 band_centers_hz=np.asarray(
                     data[f"{prefix}band_centers_hz"],
                     dtype=float,
@@ -573,7 +552,7 @@ def load_ti_digitized_pattern(board_key: str) -> TIDigitizedPattern:
 
 
 def _tx_major_channels(
-    labels: tuple[tuple[int, int, int, float, float, complex], ...]
+    labels: tuple[tuple[int, int, int, float, float, complex], ...],
 ) -> tuple[VirtualChannelSpec, ...]:
     """Builds documented TI virtual-channel specs from TX-major label tuples."""
 
@@ -614,54 +593,60 @@ def _virtual_channels_from_positions(
     return tuple(channels)
 
 
-_AWRL6844_CHANNELS = _tx_major_channels((
-    (3, 1, 1, 1.0, 0.0, +1),
-    (7, 1, 2, 1.0, 0.5, +1),
-    (8, 1, 3, 1.5, 0.5, +1),
-    (4, 1, 4, 1.5, 0.0, +1),
-    (1, 2, 1, 0.0, 0.0, -1),
-    (5, 2, 2, 0.0, 0.5, -1),
-    (6, 2, 3, 0.5, 0.5, -1),
-    (2, 2, 4, 0.5, 0.0, -1),
-    (9, 3, 1, 0.0, 1.0, +1),
-    (13, 3, 2, 0.0, 1.5, +1),
-    (14, 3, 3, 0.5, 1.5, +1),
-    (10, 3, 4, 0.5, 1.0, +1),
-    (11, 4, 1, 1.0, 1.0, -1),
-    (15, 4, 2, 1.0, 1.5, -1),
-    (16, 4, 3, 1.5, 1.5, -1),
-    (12, 4, 4, 1.5, 1.0, -1),
-))
+_AWRL6844_CHANNELS = _tx_major_channels(
+    (
+        (3, 1, 1, 1.0, 0.0, +1),
+        (7, 1, 2, 1.0, 0.5, +1),
+        (8, 1, 3, 1.5, 0.5, +1),
+        (4, 1, 4, 1.5, 0.0, +1),
+        (1, 2, 1, 0.0, 0.0, -1),
+        (5, 2, 2, 0.0, 0.5, -1),
+        (6, 2, 3, 0.5, 0.5, -1),
+        (2, 2, 4, 0.5, 0.0, -1),
+        (9, 3, 1, 0.0, 1.0, +1),
+        (13, 3, 2, 0.0, 1.5, +1),
+        (14, 3, 3, 0.5, 1.5, +1),
+        (10, 3, 4, 0.5, 1.0, +1),
+        (11, 4, 1, 1.0, 1.0, -1),
+        (15, 4, 2, 1.0, 1.5, -1),
+        (16, 4, 3, 1.5, 1.5, -1),
+        (12, 4, 4, 1.5, 1.0, -1),
+    )
+)
 
-_IWR6843ISK_CHANNELS = _tx_major_channels((
-    (1, 1, 1, 0.0, 0.0, +1),
-    (2, 1, 2, 0.5, 0.0, +1),
-    (3, 1, 3, 1.0, 0.0, +1),
-    (4, 1, 4, 1.5, 0.0, +1),
-    (5, 2, 1, 1.0, 0.5, +1),
-    (6, 2, 2, 1.5, 0.5, +1),
-    (7, 2, 3, 2.0, 0.5, +1),
-    (8, 2, 4, 2.5, 0.5, +1),
-    (9, 3, 1, 2.0, 0.0, +1),
-    (10, 3, 2, 2.5, 0.0, +1),
-    (11, 3, 3, 3.0, 0.0, +1),
-    (12, 3, 4, 3.5, 0.0, +1),
-))
+_IWR6843ISK_CHANNELS = _tx_major_channels(
+    (
+        (1, 1, 1, 0.0, 0.0, +1),
+        (2, 1, 2, 0.5, 0.0, +1),
+        (3, 1, 3, 1.0, 0.0, +1),
+        (4, 1, 4, 1.5, 0.0, +1),
+        (5, 2, 1, 1.0, 0.5, +1),
+        (6, 2, 2, 1.5, 0.5, +1),
+        (7, 2, 3, 2.0, 0.5, +1),
+        (8, 2, 4, 2.5, 0.5, +1),
+        (9, 3, 1, 2.0, 0.0, +1),
+        (10, 3, 2, 2.5, 0.0, +1),
+        (11, 3, 3, 3.0, 0.0, +1),
+        (12, 3, 4, 3.5, 0.0, +1),
+    )
+)
 
-_IWR6843AOP_CHANNELS = _tx_major_channels((
-    (1, 1, 1, 0.5, 1.0, -1),
-    (2, 1, 2, 0.5, 1.5, +1),
-    (3, 1, 3, 0.0, 1.0, -1),
-    (4, 1, 4, 0.0, 1.5, +1),
-    (5, 2, 1, 1.5, 0.0, -1),
-    (6, 2, 2, 1.5, 0.5, +1),
-    (7, 2, 3, 1.0, 0.0, -1),
-    (8, 2, 4, 1.0, 0.5, +1),
-    (9, 3, 1, 0.5, 0.0, -1),
-    (10, 3, 2, 0.5, 0.5, +1),
-    (11, 3, 3, 0.0, 0.0, -1),
-    (12, 3, 4, 0.0, 0.5, +1),
-))
+_IWR6843AOP_CHANNELS = _tx_major_channels(
+    (
+        (1, 1, 1, 0.5, 1.0, -1),
+        (2, 1, 2, 0.5, 1.5, +1),
+        (3, 1, 3, 0.0, 1.0, -1),
+        (4, 1, 4, 0.0, 1.5, +1),
+        (5, 2, 1, 1.5, 0.0, -1),
+        (6, 2, 2, 1.5, 0.5, +1),
+        (7, 2, 3, 1.0, 0.0, -1),
+        (8, 2, 4, 1.0, 0.5, +1),
+        (9, 3, 1, 0.5, 0.0, -1),
+        (10, 3, 2, 0.5, 0.5, +1),
+        (11, 3, 3, 0.0, 0.0, -1),
+        (12, 3, 4, 0.0, 0.5, +1),
+    )
+)
 
 _MMWCAS_RF_EVM_TX_POSITIONS_HALF_LAMBDA_YZ = (
     (11, 6),
@@ -696,12 +681,10 @@ _MMWCAS_RF_EVM_RX_POSITIONS_HALF_LAMBDA_YZ = (
     (3, 0),
 )
 _MMWCAS_RF_EVM_TX_POSITIONS_LAMBDA_YZ = tuple(
-    (0.5 * float(y), 0.5 * float(z))
-    for y, z in _MMWCAS_RF_EVM_TX_POSITIONS_HALF_LAMBDA_YZ
+    (0.5 * float(y), 0.5 * float(z)) for y, z in _MMWCAS_RF_EVM_TX_POSITIONS_HALF_LAMBDA_YZ
 )
 _MMWCAS_RF_EVM_RX_POSITIONS_LAMBDA_YZ = tuple(
-    (0.5 * float(y), 0.5 * float(z))
-    for y, z in _MMWCAS_RF_EVM_RX_POSITIONS_HALF_LAMBDA_YZ
+    (0.5 * float(y), 0.5 * float(z)) for y, z in _MMWCAS_RF_EVM_RX_POSITIONS_HALF_LAMBDA_YZ
 )
 _MMWCAS_RF_EVM_CHANNELS = _virtual_channels_from_positions(
     _MMWCAS_RF_EVM_TX_POSITIONS_LAMBDA_YZ,
@@ -720,7 +703,7 @@ _MMWCAS_RF_EVM_FMCW_PROFILES = {
         "sampling_frequency_hz": 5.0e6,
         "num_adc_samples": 256,
         "num_tx": 12,
-        "tdm_enabled": True,
+        "tx_schedule": "tdm",
         "num_chirps_per_tx": 64,
         "num_chirps_per_frame": 768,
         "frame_period_s": 0.1,
@@ -736,7 +719,7 @@ _MMWCAS_RF_EVM_FMCW_PROFILES = {
         "num_adc_samples": 256,
         "slope_hz_per_s": 79.0e12,
         "sampling_frequency_hz": 8.0e6,
-        "tdm_enabled": True,
+        "tx_schedule": "tdm",
         "num_chirps_per_frame_per_tx": 128,
         "effective_chirp_time_s": 34.0e-6,
         "bandwidth_hz": 2.528e9,
@@ -754,7 +737,7 @@ _MMWCAS_RF_EVM_FMCW_PROFILES = {
         "num_adc_samples": 256,
         "slope_hz_per_s": 15.0e12,
         "sampling_frequency_hz": 15.0e6,
-        "tdm_enabled": True,
+        "tx_schedule": "tdm",
         "num_chirps_per_frame_per_tx": 128,
         "effective_chirp_time_s": 17.0e-6,
         "bandwidth_hz": 256.0e6,
@@ -818,16 +801,13 @@ _SPECS: dict[str, TIBoardSpec] = {
         frequency_range_hz=(57.0e9, 64.0e9),
         design_frequency_hz=59.0e9,
         lambda_m=5.081e-3,
-        tx_positions_lambda_yz=((1.0, 0.0), (0.0, 0.0),
-                                (0.0, 1.0), (1.0, 1.0)),
-        rx_positions_lambda_yz=((0.0, 0.0), (0.0, 0.5),
-                                (0.5, 0.5), (0.5, 0.0)),
+        tx_positions_lambda_yz=((1.0, 0.0), (0.0, 0.0), (0.0, 1.0), (1.0, 1.0)),
+        rx_positions_lambda_yz=((0.0, 0.0), (0.0, 0.5), (0.5, 0.5), (0.5, 0.0)),
         virtual_channels=_AWRL6844_CHANNELS,
         tx_power_dbm=12.5,
         antenna_gain_dbi_per_element=5.5,
         noise={"metric": "NF", "nf_db": 12.5, "n_10mhz_dbm": -91.5},
-        adc={"bits": 12, "real_sample_rate_sps": 25.0e6,
-             "if_bandwidth_hz": 10.0e6},
+        adc={"bits": 12, "real_sample_rate_sps": 25.0e6, "if_bandwidth_hz": 10.0e6},
         fov_deg={"azimuth": (-60.0, 60.0), "elevation": (-60.0, 60.0)},
         angular_resolution_deg={"azimuth": 29.0, "elevation": 29.0},
         pattern_asset_key="AWRL6844EVM",
@@ -840,35 +820,40 @@ _SPECS: dict[str, TIBoardSpec] = {
         design_frequency_hz=60.0e9,
         lambda_m=5.0e-3,
         tx_positions_lambda_yz=((0.0, 0.0), (1.0, 0.5), (2.0, 0.0)),
-        rx_positions_lambda_yz=((0.0, 0.0), (0.5, 0.0),
-                                (1.0, 0.0), (1.5, 0.0)),
+        rx_positions_lambda_yz=((0.0, 0.0), (0.5, 0.0), (1.0, 0.0), (1.5, 0.0)),
         virtual_channels=_IWR6843ISK_CHANNELS,
         tx_power_dbm=12.0,
         antenna_gain_dbi_per_element=7.0,
         noise={"metric": "NF", "nf_db": 12.0, "n_10mhz_dbm": -92.0},
-        adc={"bits": 12, "real_or_complex2x_sample_rate_sps": 25.0e6,
-             "complex1x_sample_rate_sps": 12.5e6, "if_bandwidth_hz": 10.0e6},
+        adc={
+            "bits": 12,
+            "real_or_complex2x_sample_rate_sps": 25.0e6,
+            "complex1x_sample_rate_sps": 12.5e6,
+            "if_bandwidth_hz": 10.0e6,
+        },
         fov_deg={"azimuth": (-60.0, 60.0), "elevation": (-15.0, 15.0)},
         angular_resolution_deg={"azimuth": 15.0, "elevation": 58.0},
         pattern_asset_key="IWR6843ISK",
     ),
     "IWR6843AOPEVM": TIBoardSpec(
         key="IWR6843AOPEVM",
-        aliases=("IWR6843AOP", "AWR6843AOP", "XWR68XXAOP",
-                 "XWR6843AOP"),
+        aliases=("IWR6843AOP", "AWR6843AOP", "XWR68XXAOP", "XWR6843AOP"),
         device="IWR6843AOP",
         frequency_range_hz=(60.0e9, 64.0e9),
         design_frequency_hz=60.0e9,
         lambda_m=5.0e-3,
         tx_positions_lambda_yz=((0.0, 1.0), (1.0, 0.0), (0.0, 0.0)),
-        rx_positions_lambda_yz=((0.5, 0.0), (0.5, 0.5),
-                                (0.0, 0.0), (0.0, 0.5)),
+        rx_positions_lambda_yz=((0.5, 0.0), (0.5, 0.5), (0.0, 0.0), (0.0, 0.5)),
         virtual_channels=_IWR6843AOP_CHANNELS,
         tx_power_dbm=10.0,
         antenna_gain_dbi_per_element=5.0,
         noise={"metric": "EINF", "einf_db": 9.0, "n_10mhz_dbm": -95.0},
-        adc={"bits": 12, "real_or_complex2x_sample_rate_sps": 25.0e6,
-             "complex1x_sample_rate_sps": 12.5e6, "if_bandwidth_hz": 10.0e6},
+        adc={
+            "bits": 12,
+            "real_or_complex2x_sample_rate_sps": 25.0e6,
+            "complex1x_sample_rate_sps": 12.5e6,
+            "if_bandwidth_hz": 10.0e6,
+        },
         fov_deg={"azimuth": (-60.0, 60.0), "elevation": (-60.0, 60.0)},
         angular_resolution_deg={"azimuth": 29.0, "elevation": 29.0},
         pattern_asset_key="IWR6843AOPEVM",

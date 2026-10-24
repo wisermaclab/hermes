@@ -201,12 +201,10 @@ def radial_velocity_summary(
         "signed_max_mps": float(np.max(values)),
         "abs_mean_mps": float(np.average(abs_values, weights=weights)),
         "abs_percentiles_mps": {
-            float(p): float(_weighted_percentile(abs_values, weights, p))
-            for p in percentiles
+            float(p): float(_weighted_percentile(abs_values, weights, p)) for p in percentiles
         },
         "signed_percentiles_mps": {
-            float(p): float(_weighted_percentile(values, weights, p))
-            for p in percentiles
+            float(p): float(_weighted_percentile(values, weights, p)) for p in percentiles
         },
         "fraction_abs_ge_5_mps": float(np.average(abs_values >= 5.0, weights=weights)),
         "fraction_abs_ge_10_mps": float(np.average(abs_values >= 10.0, weights=weights)),

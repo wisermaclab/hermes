@@ -164,10 +164,7 @@ def test_preflight_allows_small_benign_highly_compressible_motion():
 
 def test_preflight_rejects_aggregate_ratio_across_small_members():
     payload = _npz_bytes(
-        **{
-            f"part_{index}": np.zeros(400_000, dtype=np.uint8)
-            for index in range(50)
-        }
+        **{f"part_{index}": np.zeros(400_000, dtype=np.uint8) for index in range(50)}
     )
 
     with pytest.raises(ValueError, match="aggregate compression ratio"):

@@ -17,10 +17,13 @@ unified measurement/simulation bundle workflows.
 
 ## Suggested Order
 
+The [MobiCom PEC-plate example](mobicom/README.md) provides data-free analytic
+verification, mesh convergence and RT plate/corner ray-density diagnostics.
+
 1. `Point-Targets.ipynb` - analytic point-target ADC synthesis, DSP basics, and
    TI board virtual-array angle-map checks.
-2. `Human-Only-PO.ipynb` - moving-human physical optics.
-3. `Full-RT.ipynb` - full-scene RT retracing and coherent-bank comparison.
+2. `PO.ipynb` - the PO solver on a moving human.
+3. `RT.ipynb` - the RT solver: retracing every chirp versus once per frame.
 4. `Hybrid-PO.ipynb` - static-environment RT plus moving-human PO assembly.
 
 Install the notebook dependencies using the
@@ -41,8 +44,8 @@ obtained SMPL-family model.
 | Notebook | Role | External Data |
 | --- | --- | --- |
 | `Point-Targets.ipynb` | Small analytic FMCW/DSP sanity check plus TI board virtual-array angle maps without scene geometry. | No |
-| `Human-Only-PO.ipynb` | Runs human-only PO and incremental PO comparisons. | Included CMU motion or external AMASS motion; external SMPL model |
-| `Full-RT.ipynb` | Compares per-chirp RT retracing with coherent path-bank updates, then illustrates the effect of maximum interaction depth. | Included CMU motion or external AMASS motion; external SMPL model |
+| `PO.ipynb` | Runs the PO solver with exact (`po_refresh_frames=0`) and incremental PO comparisons. | Included CMU motion or external AMASS motion; external SMPL model |
+| `RT.ipynb` | Compares RT retracing every chirp (`rt_refresh_frames=0`) with once per frame and coherent path updates in between, then illustrates the effect of maximum interaction depth. | Included CMU motion or external AMASS motion; external SMPL model |
 | `Hybrid-PO.ipynb` | Recombines static RT, human PO, blocking, and coupling components. | Included CMU motion or external AMASS motion; external SMPL model |
 
 ## Maintenance Notes

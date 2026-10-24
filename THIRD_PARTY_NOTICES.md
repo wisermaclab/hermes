@@ -9,8 +9,12 @@ license terms of HERMES or any third-party material.
 The public Git source checkout contains project source, documentation,
 output-free examples, one reviewed motion fixture, and two limited real-radar
 validation fixtures described below. The Python source distribution (`sdist`)
-and wheel omit all three data examples. Apart from these exact byte-pinned
-source-checkout exceptions, the public release does not contain:
+and wheel omit all three third-party data examples. They include the original
+empty-room XML and synthetic bundle-preparation example (analytic ADC and a
+square target mesh), documented in
+`tools/bundle_prepare/data/static_target/NOTICE.txt`. Apart from these original
+examples and the exact byte-pinned source-checkout exceptions, the public
+release does not contain:
 
 - standalone SMPL, SMPL-H, SMPL-X, or DMPL model files such as templates,
   blend weights, and learned bases;
@@ -105,7 +109,7 @@ versions users install.
 | `torch`, `smplx` | Optional AMASS/SMPL conversion support. | Optional; model data is not included. |
 | `jupyter`, `ipywidgets`, `pythreejs` | Optional notebook workflows. | Optional, not vendored. |
 | `panel`, `plotly` | Optional local GUI framework and interactive plotting. | Optional, not vendored. |
-| `pytest`, `pylint` | Test and development tools. | Development only, not vendored. |
+| `pytest`, `pylint`, `black` | Test, lint and formatting tools. | Development only, not vendored. |
 
 ## Optional Motion And Body-Model Inputs
 

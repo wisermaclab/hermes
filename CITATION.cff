@@ -1,0 +1,18 @@
+cff-version: 1.2.0
+type: software
+message: "Please cite this software and the exact version used in your research."
+title: "HERMES: Human-Environment Radar ModEling and Simulation"
+authors:
+  - family-names: Zheng
+    given-names: Rong
+    affiliation: McMaster University
+version: 0.2.0
+date-released: "2026-10-23"
+repository-code: "https://github.com/wisermaclab/hermes"
+url: "https://github.com/wisermaclab/hermes"
+license: PolyForm-Noncommercial-1.0.0
+keywords:
+  - millimeter-wave radar
+  - physical optics
+  - ray tracing
+  - human motion
