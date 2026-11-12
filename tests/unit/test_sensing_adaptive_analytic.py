@@ -184,6 +184,10 @@ def test_budget_limits_report_unresolved_tolerance(depth, cap, count):
     done = next(e for e in events if e["stage"] == "adaptive_analytic_geometry_done")
     assert done["unresolved_subfaces"] > 0
     assert done["unresolved_parent_faces"] == 1
+    expected_limit = "max_refinement_depth" if depth <= 1 else "max_subfaces_per_parent"
+    assert done["refinement_limits_reached"] == [expected_limit]
+    assert done["refinement_depth_reached"] == (0 if count == 1 else 1)
+    assert len(done["subdivision_sha256"]) == 64
 
 
 def test_leaf_integrals_inherit_visibility_and_sum_coherently_to_original_paths():

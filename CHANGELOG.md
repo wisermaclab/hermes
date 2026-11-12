@@ -2,6 +2,21 @@
 
 All notable changes to HERMES will be recorded in this file.
 
+## Unreleased
+
+- Preserve weak PO and hybrid PO range-profile curves in the GUI instead of
+  dropping values below -80 dB, with axes fitted consistently across frames.
+
+- Expose independent complex transmit/receive polarization fields through the
+  full PO snapshot API, including quadrature, analytic integration and wideband
+  facet responses. Existing polarization defaults remain unchanged.
+- Add an orthonormal transverse linear-polarization reference basis with
+  explicit propagation-direction and phase-sign conventions, stable vector
+  normalization and per-direction fallbacks at the reference axis.
+- Report actual refinement blockers and subdivision diagnostics consistently
+  across PO integration modes, reusing converged geometry checks for progress
+  callbacks.
+
 ## 0.2.0 - 2026-10-23
 
 - Add immutable release-reference comparisons, analytic PEC plate/sphere mesh

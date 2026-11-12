@@ -180,7 +180,10 @@ class RadarWorkflow(Workflow[RadarContext]):
                 self.context.ignored_radar_events[id(changed_widget)] = ignored_count - 1
             self.context.update_radar_summary()
             return
-        if changed_widget in (self.context.tx_antennas, self.context.rx_antennas):
+        if changed_widget is not None and changed_widget in (
+            self.context.tx_antennas,
+            self.context.rx_antennas,
+        ):
             if not changed_widget.value:
                 import param
 

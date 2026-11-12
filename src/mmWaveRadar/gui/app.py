@@ -2163,6 +2163,30 @@ def _profile_channels(values, fallback) -> np.ndarray:
     return power[:, None] if power.ndim == 1 else power
 
 
+def _range_profile_db(power, *, relative: bool = False) -> np.ndarray:
+    """Keep weak finite returns; only missing or nonpositive powers break lines."""
+    power = np.asarray(power, dtype=float)
+    valid = (power > 0.0) & np.isfinite(power)
+    db = np.where(valid, 10.0 * np.log10(np.where(valid, power, 1.0)), np.nan)
+    if relative:
+        reference = float(np.max(np.where(valid, power, 0.0), initial=0.0))
+        if reference > 0.0:
+            db -= 10.0 * np.log10(reference)
+    return db
+
+
+def _range_profile_db_limits(series, *, relative: bool = False) -> tuple[float, float]:
+    """Fit finite profile values across every solver and frame on shared axes."""
+    lower, upper = -80.0, 0.0 if relative else -70.0
+    for db in series:
+        finite = np.asarray(db)[np.isfinite(db)]
+        if finite.size:
+            lower = min(lower, float(5.0 * np.floor((finite.min() - 3.0) / 5.0)))
+            if not relative:
+                upper = max(upper, float(5.0 * np.ceil((finite.max() + 3.0) / 5.0)))
+    return lower, upper
+
+
 def _mean_range_profile_figure(
     series,
     go,
@@ -2176,18 +2200,13 @@ def _mean_range_profile_figure(
     """Overlay channel-mean power for one frame on the original single axes."""
 
     figure = go.Figure()
-    peak_db = -80.0
+    all_db = []
     for label, color, ranges, power in series:
         mean_power = power.mean(axis=-1)
-        reference = max(float(np.max(mean_power)), np.finfo(float).tiny)
-        # Keep one scale across frames while displaying only the selected one.
-        peak_db = max(peak_db, 0.0 if relative else 10.0 * np.log10(reference))
+        db = _range_profile_db(mean_power, relative=relative)
+        all_db.append(db)
         if mean_power.ndim == 2:
-            mean_power = mean_power[int(frame_index)]
-        db = _absolute_power_db(mean_power)
-        if relative:
-            db -= 10.0 * np.log10(reference)
-        db = np.where((mean_power > 0.0) & np.isfinite(db) & (db >= -80.0), db, np.nan)
+            db = db[int(frame_index)]
         figure.add_trace(
             go.Scatter(
                 x=ranges,
@@ -2202,12 +2221,11 @@ def _mean_range_profile_figure(
                 ),
             )
         )
-    upper_db = 0.0 if relative else max(-70.0, 5.0 * np.ceil((peak_db + 3.0) / 5.0))
     figure.update_layout(
         title=title,
         xaxis_title="Range [m]",
         yaxis_title="Relative power [dB]" if relative else "Power [dB, simulator units]",
-        yaxis_range=[-80.0, upper_db],
+        yaxis_range=_range_profile_db_limits(all_db, relative=relative),
         height=height,
         margin={"l": 60, "r": 20, "t": 52, "b": 55},
     )
@@ -2248,20 +2266,17 @@ def _channel_range_profile_figure(
     from plotly.colors import qualitative
 
     power = np.asarray(power, dtype=float)
-    peak = float(np.max(np.where(np.isfinite(power), power, 0.0)))
-    upper_db = max(-70.0, 5.0 * np.ceil((10 * np.log10(max(peak, 1e-30)) + 3.0) / 5.0))
+    db = _range_profile_db(power)
+    db_limits = _range_profile_db_limits([db])
     if power.ndim == 3:
-        power = power[int(frame_index)]
+        db = db[int(frame_index)]
     figure = go.Figure()
     colors = qualitative.Light24 if plot_template == "plotly_dark" else qualitative.Dark24
     for channel, label in enumerate(labels):
-        values = power[:, channel]
-        db = _absolute_power_db(values)
-        db = np.where((values > 0.0) & np.isfinite(db) & (db >= -80.0), db, np.nan)
         figure.add_trace(
             go.Scatter(
                 x=ranges_m,
-                y=db,
+                y=db[:, channel],
                 name=label,
                 mode="lines",
                 connectgaps=False,
@@ -2275,7 +2290,7 @@ def _channel_range_profile_figure(
         title=title,
         xaxis_title="Range [m]",
         yaxis_title="Power [dB, simulator units]",
-        yaxis_range=[-80.0, upper_db],
+        yaxis_range=db_limits,
         height=420,
         legend={"title": "Channel"},
         margin={"l": 60, "r": 20, "t": 52, "b": 55},

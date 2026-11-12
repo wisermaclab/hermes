@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from hashlib import sha256
 import math
 from typing import Callable, Literal
 
@@ -13,6 +14,7 @@ import mitsuba as mi
 import numpy as np
 from scipy.constants import c, epsilon_0, pi
 
+from ..polarization import PolarizationCallback, _project_transverse, _transverse_polarizations
 from .options import (
     POArraySettings,
     POChannelSettings,
@@ -41,7 +43,6 @@ POIntegrationMode = Literal[
     "parent_face_adaptive_analytic",
     "parent_face_far_field_analytic",
 ]
-PolarizationCallback = Callable[[np.ndarray], tuple[np.ndarray, np.ndarray]]
 
 
 def default_phase_span_scale_rad(po_integration_mode: str) -> float:
@@ -394,8 +395,13 @@ def _adaptive_parent_triangles(
             split |= curvature > float(curvature_error_rad)
         return split, span, curvature
 
+    depth_reached = 0
+    cap_blocked_parents = (
+        np.zeros(num_faces, dtype=bool) if progress_callback is not None else None
+    )
     for depth in range(max_depth):
-        split_mask, _, _ = split_tests(triangles)
+        unresolved, span, curvature = split_tests(triangles)
+        split_mask = unresolved
         if max_per_parent > 0 and np.any(split_mask):
             current_counts = np.bincount(parent_indices, minlength=num_faces)
             split_counts = np.bincount(
@@ -403,7 +409,9 @@ def _adaptive_parent_triangles(
                 minlength=num_faces,
             )
             allowed_parent = current_counts + 3 * split_counts <= max_per_parent
-            split_mask &= allowed_parent[parent_indices]
+            if cap_blocked_parents is not None:
+                cap_blocked_parents |= (split_counts > 0) & ~allowed_parent
+            split_mask = split_mask & allowed_parent[parent_indices]
         split_count = int(np.count_nonzero(split_mask))
         if progress_callback is not None:
             progress_callback(
@@ -441,6 +449,7 @@ def _adaptive_parent_triangles(
             [parent_indices[keep_mask], split_parent_indices],
             axis=0,
         )
+        depth_reached = depth + 1
         if progress_callback is not None:
             progress_callback(
                 {
@@ -455,16 +464,19 @@ def _adaptive_parent_triangles(
                 }
             )
 
-    if progress_callback is not None:
-        diagnostics = {}
-        if curvature_error_rad is not None:
+    else:
+        # A split at the depth limit leaves untested children. On convergence
+        # or a cap stop, the final leaves were already tested inside the loop.
+        if progress_callback is not None:
             unresolved, span, curvature = split_tests(triangles)
-            diagnostics = {
-                "unresolved_subfaces": int(np.count_nonzero(unresolved)),
-                "unresolved_parent_faces": int(np.unique(parent_indices[unresolved]).size),
-                "max_phase_span_rad": float(np.max(span, initial=0.0)),
-                "max_curvature_error_rad": float(np.max(curvature, initial=0.0)),
-            }
+
+    if progress_callback is not None:
+        diagnostics = _refinement_diagnostics(
+            triangles, parent_indices, unresolved, cap_blocked_parents, depth_reached, max_depth
+        )
+        diagnostics["max_phase_span_rad"] = float(np.max(span, initial=0.0))
+        if curvature_error_rad is not None:
+            diagnostics["max_curvature_error_rad"] = float(np.max(curvature, initial=0.0))
         progress_callback(
             {
                 "stage": f"{stage_prefix}_geometry_done",
@@ -475,6 +487,27 @@ def _adaptive_parent_triangles(
             }
         )
     return triangles, parent_indices
+
+
+def _refinement_diagnostics(
+    triangles, parent_indices, unresolved, cap_blocked_parents, depth_reached, max_depth
+):
+    """Describe unresolved leaves and limits that actually prevented refinement."""
+    blocked = cap_blocked_parents[parent_indices[unresolved]]
+    limits_reached = []
+    if depth_reached == max_depth and np.any(~blocked):
+        limits_reached.append("max_refinement_depth")
+    if np.any(blocked):
+        limits_reached.append("max_subfaces_per_parent")
+    subdivision_hash = sha256(np.ascontiguousarray(triangles, dtype="<f8"))
+    subdivision_hash.update(np.ascontiguousarray(parent_indices, dtype="<i8"))
+    return {
+        "unresolved_subfaces": int(np.count_nonzero(unresolved)),
+        "unresolved_parent_faces": int(np.count_nonzero(np.bincount(parent_indices[unresolved]))),
+        "refinement_depth_reached": depth_reached,
+        "refinement_limits_reached": limits_reached,
+        "subdivision_sha256": subdivision_hash.hexdigest(),
+    }
 
 
 def parent_face_far_field_analytic_geometry(
@@ -565,9 +598,14 @@ def parent_face_far_field_analytic_geometry(
                 "far_field_max_edge_m": float(max_edge_m),
             }
         )
+    depth_reached = 0
+    cap_blocked_parents = (
+        np.zeros(num_faces, dtype=bool) if progress_callback is not None else None
+    )
     for depth in range(max_depth):
         max_edges = _triangle_max_edge_lengths(triangles)
-        split_mask = max_edges > max_edge_m
+        unresolved = max_edges > max_edge_m
+        split_mask = unresolved
         if max_per_parent > 0 and np.any(split_mask):
             current_counts = np.bincount(parent_indices, minlength=num_faces)
             split_counts = np.bincount(
@@ -575,7 +613,9 @@ def parent_face_far_field_analytic_geometry(
                 minlength=num_faces,
             )
             allowed_parent = current_counts + 3 * split_counts <= max_per_parent
-            split_mask &= allowed_parent[parent_indices]
+            if cap_blocked_parents is not None:
+                cap_blocked_parents |= (split_counts > 0) & ~allowed_parent
+            split_mask = split_mask & allowed_parent[parent_indices]
         split_count = int(np.count_nonzero(split_mask))
         if progress_callback is not None:
             progress_callback(
@@ -615,6 +655,7 @@ def parent_face_far_field_analytic_geometry(
             [parent_indices[keep_mask], split_parent_indices],
             axis=0,
         )
+        depth_reached = depth + 1
         if progress_callback is not None:
             progress_callback(
                 {
@@ -630,6 +671,10 @@ def parent_face_far_field_analytic_geometry(
                     "far_field_max_edge_m": float(max_edge_m),
                 }
             )
+    else:
+        if progress_callback is not None:
+            max_edges = _triangle_max_edge_lengths(triangles)
+            unresolved = max_edges > max_edge_m
     if progress_callback is not None:
         progress_callback(
             {
@@ -639,8 +684,14 @@ def parent_face_far_field_analytic_geometry(
                 "subfaces_total": int(triangles.shape[0]),
                 "nearest_mesh_distance_m": float(nearest_distance_m),
                 "far_field_max_edge_m": float(max_edge_m),
-                "max_subface_edge_m": float(
-                    np.max(_triangle_max_edge_lengths(triangles), initial=0.0)
+                "max_subface_edge_m": float(np.max(max_edges, initial=0.0)),
+                **_refinement_diagnostics(
+                    triangles,
+                    parent_indices,
+                    unresolved,
+                    cap_blocked_parents,
+                    depth_reached,
+                    max_depth,
                 ),
             }
         )
@@ -1563,6 +1614,8 @@ def vector_facet_face_contributions(
         rx_pol = _transverse_polarizations(rx_hat_vis, preferred_axis)
     else:
         tx_pol, rx_pol = (p[illum_mask] for p in polarizations)
+        if any(not np.all(np.isfinite(p)) for p in (tx_pol, rx_pol)):
+            raise ValueError("polarization callback fields must be finite on contributing faces")
     kernel = _reciprocal_facet_kernel(
         tx_hat_vis,
         rx_hat_vis,
@@ -1873,6 +1926,8 @@ def _torch_vector_facet_face_contributions(
         tx_pol, rx_pol = (
             torch.as_tensor(p, dtype=cdtype, device=device)[illum_mask] for p in polarizations
         )
+        if not bool((torch.isfinite(tx_pol).all() & torch.isfinite(rx_pol).all()).item()):
+            raise ValueError("polarization callback fields must be finite on contributing faces")
     kernel = torch.zeros_like(tx_dist_vis, dtype=cdtype)
     for source, observer, incident, receive in (
         (tx_hat_vis, rx_hat_vis, tx_pol, rx_pol),
@@ -2032,9 +2087,7 @@ def _torch_transverse_polarizations(propagation_hats, preferred_axis):
         torch.linalg.norm(preferred_axis),
         min=1e-18,
     )
-    polarization = preferred_axis[None, :] - (
-        torch.sum(propagation_hats * preferred_axis[None, :], dim=1)[:, None] * propagation_hats
-    )
+    polarization = _project_transverse(propagation_hats, preferred_axis)
     norms = torch.linalg.norm(polarization, dim=1)
     for alt in (
         torch.tensor(
@@ -2047,9 +2100,7 @@ def _torch_transverse_polarizations(propagation_hats, preferred_axis):
         missing = norms <= 1e-18
         if not bool(torch.any(missing).item()):
             break
-        alt_pol = alt[None, :] - (
-            torch.sum(propagation_hats * alt[None, :], dim=1)[:, None] * propagation_hats
-        )
+        alt_pol = _project_transverse(propagation_hats, alt)
         polarization = torch.where(missing[:, None], alt_pol, polarization)
         norms = torch.linalg.norm(polarization, dim=1)
     return polarization / torch.clamp(norms[:, None], min=1e-18)
@@ -2159,10 +2210,17 @@ def po_channel(
     compute_backend: ComputeBackend = "numpy",
     compute_precision: ComputePrecision = "float64",
     polarization_axis: np.ndarray | None = None,
+    polarization_callback: PolarizationCallback | None = None,
     max_frequency_offset_hz: float | None = None,
     receiver_fmcw=None,
 ) -> POChannelResult:
-    """Evaluates a human-only PO virtual channel over one chirp."""
+    """Evaluate one PO snapshot, optionally with independent Tx/Rx fields.
+
+    The callback receives integration points and returns complex incident and
+    receive fields there, each shaped ``[points, 3]``. Receive projection is
+    Hermitian. It is evaluated in the existing phase-center approximation;
+    use one physical Tx/Rx pair for element-specific polarization patterns.
+    """
     return evaluate_po_channel(
         vertices,
         faces,
@@ -2176,6 +2234,7 @@ def po_channel(
                 virtual_channel_rx_indices=virtual_channel_rx_indices,
                 virtual_channel_order=virtual_channel_order,
                 polarization_axis=polarization_axis,
+                polarization_callback=polarization_callback,
                 max_frequency_offset_hz=max_frequency_offset_hz,
                 receiver_fmcw=receiver_fmcw,
             ),
@@ -2249,6 +2308,10 @@ class _POChannelSolve:
     def _stage_prepare(self):
         """Prepare this run using its settings and prior stage outputs."""
         validate_compute_backend(self.compute_backend)
+        if self.settings.array.polarization_callback is not None and not callable(
+            self.settings.array.polarization_callback
+        ):
+            raise ValueError("polarization_callback must be callable or None")
         self.float_dtype, complex_dtype = _numpy_dtypes_for_precision(self.compute_precision)
         self.vertices = np.asarray(self.vertices, dtype=np.float64)
         self.faces = np.asarray(self.faces, dtype=np.uint32)
@@ -2429,6 +2492,7 @@ class _POChannelSolve:
                 precision=self.compute_precision,
                 progress_callback=self.settings.compute.progress_callback,
                 polarization_axis=self.settings.array.polarization_axis,
+                polarization_callback=self.settings.array.polarization_callback,
                 delay_response=self.delay_response,
             )
             self.phase_center_delays_s = _phase_center_delays_for_centroids(
@@ -2494,6 +2558,7 @@ class _POChannelSolve:
                 precision=self.compute_precision,
                 progress_callback=self.settings.compute.progress_callback,
                 polarization_axis=self.settings.array.polarization_axis,
+                polarization_callback=self.settings.array.polarization_callback,
                 delay_response=self.delay_response,
             )
             self.phase_center_delays_s = _phase_center_delays_for_centroids(
@@ -2523,6 +2588,7 @@ class _POChannelSolve:
                     backend=self.compute_backend,
                     precision=self.compute_precision,
                     polarization_axis=self.settings.array.polarization_axis,
+                    polarization_callback=self.settings.array.polarization_callback,
                 )
             )
 
@@ -2643,38 +2709,6 @@ def _normalize_rows(
         result[~valid] = fallback[~valid]
 
     return result
-
-
-def _transverse_polarizations(
-    propagation_hats: np.ndarray,
-    preferred_axis: np.ndarray,
-) -> np.ndarray:
-    """Builds polarization vectors transverse to propagation directions."""
-
-    propagation_hats = np.asarray(propagation_hats, dtype=np.float64)
-    preferred_axis = np.asarray(preferred_axis, dtype=np.float64)
-    preferred_axis = preferred_axis / max(np.linalg.norm(preferred_axis), 1e-18)
-
-    polarization = preferred_axis[None, :] - (
-        np.einsum("ij,j->i", propagation_hats, preferred_axis)[:, None] * propagation_hats
-    )
-    norms = np.linalg.norm(polarization, axis=1)
-
-    for alt_axis in (
-        np.array([0.0, 1.0, 0.0], dtype=np.float64),
-        np.array([1.0, 0.0, 0.0], dtype=np.float64),
-    ):
-        missing = norms <= 1e-18
-        if not np.any(missing):
-            break
-        polarization[missing] = alt_axis[None, :] - (
-            np.einsum("ij,j->i", propagation_hats[missing], alt_axis)[:, None]
-            * propagation_hats[missing]
-        )
-        norms = np.linalg.norm(polarization, axis=1)
-
-    polarization /= np.maximum(norms[:, None], 1e-18)
-    return polarization
 
 
 def _local_incidence_bases(

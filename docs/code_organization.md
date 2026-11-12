@@ -94,6 +94,27 @@ The existing `run_human_room_experiment`, `run_static_target_experiment`,
 `run_calibrated_hybrid_po` and `po_channel` signatures remain supported. Their
 adapters construct settings and call the same staged implementation.
 
+Full PO snapshots accept `POArraySettings.polarization_callback` (also a
+`po_channel` keyword). It supplies complex incident and receive vectors at
+integration points; receive projection is Hermitian. Independent Tx/Rx fields
+reuse the existing centroid, quadrature and analytic kernels and wideband
+response. The phase-center approximation is retained: use one physical pair
+when supplying element-specific patterns. Pair-batched and incremental solver
+interfaces do not yet expose this callback. `polarization.transverse_linear_basis`
+provides an explicit orthonormal reference with `H = k cross V`; it does not
+assert a measured antenna's basis or replace its polarization response.
+Directions parallel to the reference axis use projected +Y, then +X, only on
+the affected rows. Non-finite callback fields are rejected only on facets
+that contribute after the illumination and weight mask.
+
+Quadrature, adaptive-analytic and far-field-analytic geometry completion
+events include unresolved subface/parent counts, the refinement depth,
+`refinement_limits_reached` and a deterministic `subdivision_sha256`.
+Limits name constraints that actually prevented splits; a depth stop does not
+also report a cap that would have blocked a hypothetical later split.
+Completion diagnostics reuse the final split test when refinement converges
+or the cap stops it. Only a depth stop needs a test of the newly created leaves.
+
 For a human in the empty room:
 
 ```python

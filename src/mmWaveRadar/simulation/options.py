@@ -14,6 +14,8 @@ from typing import Callable, TYPE_CHECKING
 
 import numpy as np
 
+from ..polarization import PolarizationCallback
+
 if TYPE_CHECKING:
     from .calibration import POCalibrationConfig
     from .compute import ComputeBackend, ComputePrecision
@@ -142,6 +144,7 @@ class POArraySettings:
     virtual_channel_rx_indices: np.ndarray | None = None
     virtual_channel_order: str = "tx_major"
     polarization_axis: np.ndarray | None = None
+    polarization_callback: PolarizationCallback | None = None
     max_frequency_offset_hz: float | None = None
     receiver_fmcw: object = None
 
@@ -222,6 +225,7 @@ class POChannelSettings:
             "compute_backend": self.compute.compute_backend,
             "compute_precision": self.compute.compute_precision,
             "polarization_axis": self.array.polarization_axis,
+            "polarization_callback": self.array.polarization_callback,
             "max_frequency_offset_hz": self.array.max_frequency_offset_hz,
             "receiver_fmcw": self.array.receiver_fmcw,
         }
