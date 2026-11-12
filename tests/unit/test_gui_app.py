@@ -3943,7 +3943,7 @@ def test_angle_fft_defaults_to_target_centroid_and_compares_rt_po():
     ):
         mean = next(trace for trace in range_figure.data if trace.name == name)
         expected_mean = 10.0 * np.log10(np.maximum(power.mean(axis=-1), np.finfo(float).tiny))
-        expected_mean[expected_mean < -80.0] = np.nan
+        expected_mean[power.mean(axis=-1) <= 0.0] = np.nan
         np.testing.assert_allclose(mean.y, expected_mean, equal_nan=True)
     assert len(range_figure.data) == 2
     assert range_figure.layout.height == 330
@@ -5542,11 +5542,11 @@ def test_channel_profile_panels_preserve_each_channel_and_selected_frame():
         assert "xaxis2" not in figure.layout.to_plotly_json()
         for channel, trace in enumerate(figure.data):
             expected = 10 * np.log10(np.maximum(power[frame, :, channel], 1e-30))
-            expected[expected < -80] = np.nan
+            expected[power[frame, :, channel] <= 0.0] = np.nan
             np.testing.assert_allclose(trace.y, expected, equal_nan=True)
             assert not trace.connectgaps
     assert figures[0].layout.yaxis.range == figures[1].layout.yaxis.range
-    assert figures[0].layout.yaxis.range[0] == -80
+    assert figures[0].layout.yaxis.range[0] < -90
 
 
 def test_static_channel_panels_label_physical_pairs_in_stored_order():
@@ -5579,7 +5579,7 @@ def test_static_channel_panels_label_physical_pairs_in_stored_order():
     np.testing.assert_allclose(figures[1].data[2].y, 10 * np.log10(0.1 * power[:, 2]))
 
 
-def test_static_profile_restores_single_axes_with_mean_power_and_the_floor():
+def test_static_profile_preserves_weak_channel_means_on_single_axes():
     po = np.asarray([[1e-4, 1e-6], [1e-9, 0.0], [1e-8, 1e-8], [1e-3, 1e-5]])
     result = SimpleNamespace(
         ranges_m=np.arange(4),
@@ -5596,12 +5596,11 @@ def test_static_profile_restores_single_axes_with_mean_power_and_the_floor():
     assert figure.layout.height == 330
     po_traces = [trace for trace in figure.data if trace.name == "Physical optics (PO)"]
     expected_mean = 10.0 * np.log10(po.mean(axis=-1))
-    expected_mean[expected_mean < -80.0] = np.nan
     np.testing.assert_allclose(po_traces[0].y, expected_mean, equal_nan=True)
     assert len(po_traces) == 1
     assert po_traces[0].y[2] == pytest.approx(-80.0)
     assert not po_traces[0].connectgaps
-    assert figure.layout.yaxis.range[0] == -80.0
+    assert figure.layout.yaxis.range[0] < np.min(expected_mean - 10.0)
 
 
 def test_dynamic_profiles_overlay_component_channel_means_on_single_axes():
@@ -5623,7 +5622,7 @@ def test_dynamic_profiles_overlay_component_channel_means_on_single_axes():
     assert "xaxis2" not in figure.layout.to_plotly_json()
 
 
-def test_bundle_profiles_normalize_the_channel_mean_and_mask_the_floor():
+def test_bundle_profiles_normalize_the_channel_mean_and_preserve_weak_returns():
     channels = np.asarray([[1, 0.01], [1e-9, 0.0], [1e-8, 1e-5]])
     products = SimpleNamespace(
         channel_range_profile_power=channels,
@@ -5641,9 +5640,66 @@ def test_bundle_profiles_normalize_the_channel_mean_and_mask_the_floor():
     measured = [trace for trace in figure.data if trace.name == "Measured"]
     assert len(measured) == 1
     expected = 10 * np.log10(channels.mean(axis=-1) / channels.mean(axis=-1).max())
-    expected[expected < -80] = np.nan
     np.testing.assert_allclose(measured[0].y, expected, equal_nan=True)
-    assert figure.layout.yaxis.range == (-80.0, 0.0)
+    assert figure.layout.yaxis.range[0] < np.min(expected)
+    assert figure.layout.yaxis.range[1] == 0.0
+
+
+@pytest.mark.parametrize("relative", [False, True])
+@pytest.mark.parametrize("plot_template", ["plotly_dark", "plotly_white"])
+def test_weak_profile_curves_are_complete_and_use_stable_axes_across_frames(
+    relative, plot_template
+):
+    power = np.array([[1e-4, 1e-12, 1e-5], [1e-8, 1e-20, 1e-9]])[:, :, None]
+    series = [
+        ("PO", "blue", np.arange(3), power),
+        ("Hybrid PO", "orange", np.arange(3), power * 1e-6),
+    ]
+    figures = [
+        gui_app_module._mean_range_profile_figure(
+            series,
+            go,
+            title="Range profile comparison",
+            plot_template=plot_template,
+            relative=relative,
+            frame_index=frame,
+        )
+        for frame in range(2)
+    ]
+    assert figures[0].layout.yaxis.range == figures[1].layout.yaxis.range
+    lower, upper = figures[0].layout.yaxis.range
+    for frame, figure in enumerate(figures):
+        for trace, (_, _, _, values) in zip(figure.data, series):
+            expected = 10.0 * np.log10(values[frame, :, 0])
+            if relative:
+                expected -= 10.0 * np.log10(values.max())
+            np.testing.assert_allclose(trace.y, expected)
+            assert np.all(np.isfinite(trace.y))
+            assert lower < expected.min()
+            assert upper >= expected.max()
+
+
+@pytest.mark.parametrize("relative", [False, True])
+def test_profile_gaps_only_mask_nonpositive_or_invalid_powers(relative):
+    power = np.array([1e-10, 1e-20, 0.0, -1.0, np.nan, np.inf])
+    with np.errstate(divide="raise", invalid="raise"):
+        db = gui_app_module._range_profile_db(power, relative=relative)
+    expected = np.array([-100.0, -200.0]) + (100.0 if relative else 0.0)
+    np.testing.assert_allclose(db[:2], expected)
+    assert np.all(np.isnan(db[2:]))
+    lower, upper = gui_app_module._range_profile_db_limits([db], relative=relative)
+    assert np.isfinite([lower, upper]).all()
+    assert lower < expected.min()
+    assert upper >= expected.max()
+
+
+@pytest.mark.parametrize("relative", [False, True])
+def test_empty_signal_profiles_keep_finite_display_limits(relative):
+    db = gui_app_module._range_profile_db(np.array([0.0, np.nan, np.inf]), relative=relative)
+    assert np.all(np.isnan(db))
+    lower, upper = gui_app_module._range_profile_db_limits([db], relative=relative)
+    assert np.isfinite([lower, upper]).all()
+    assert lower < upper
 
 
 def test_bundle_profile_frame_controls_show_one_frame_and_follow_adc_selection():

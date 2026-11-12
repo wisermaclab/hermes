@@ -9,7 +9,7 @@
     {
       "mode": "100644",
       "path": "CHANGELOG.md",
-      "sha256": "551c47fc4ba84ebbfac48c1387354c7dfaf5580a3a7f4b9f7b172421292f7aef"
+      "sha256": "fb872b2bafcac9d45753a62d7525a459e230ca3483f5b28c2158c44e2ddf23cc"
     },
     {
       "mode": "100644",
@@ -254,12 +254,12 @@
     {
       "mode": "100644",
       "path": "docs/api/index.html",
-      "sha256": "29abfb7e88f77c91a7f416772616f6a696d28042d556b0228a413eee7617f66d"
+      "sha256": "a9f1af328e0ebeae0d6a9f0020736f14d9ca525e4a286c0a964c44c949ea7379"
     },
     {
       "mode": "100644",
       "path": "docs/code_organization.md",
-      "sha256": "eb805602b6746e74801794b1dc112e0f53540919989ae169f07bdfd2cd147789"
+      "sha256": "a9e15506ec5fdd451bb1e70299c438dac877b7be337723e464f6ffb100926cc2"
     },
     {
       "mode": "100644",
@@ -469,7 +469,7 @@
     {
       "mode": "100644",
       "path": "src/mmWaveRadar/gui/app.py",
-      "sha256": "6c187938f11cc7603507d04d6b87f2d17ca6ab542eaf3770f76ebaf0c380a82d"
+      "sha256": "a346f0993d20d45c7f2c8459e4abb68c2c15c0d8e5c1eb42d953ed6f4d224d59"
     },
     {
       "mode": "100644",
@@ -529,7 +529,7 @@
     {
       "mode": "100644",
       "path": "src/mmWaveRadar/gui/workflows/radar.py",
-      "sha256": "332de88907ec75170b7d539d9096011777ba483984267f0d2b0a177cacb9ccd1"
+      "sha256": "97df32a7d552cb613134da656647b4adeb731fef4ec8b44e77dd775539d4222e"
     },
     {
       "mode": "100644",
@@ -570,6 +570,11 @@
       "mode": "100644",
       "path": "src/mmWaveRadar/naming.py",
       "sha256": "4e842a15cbc34d97cce5e8a3bc21efb66a0eee3ad9749c27c6600c9fce8fddd6"
+    },
+    {
+      "mode": "100644",
+      "path": "src/mmWaveRadar/polarization.py",
+      "sha256": "abaabf9ee74031cfd571df2be68eb57d16a2245d7db86ee429ec6a218bac3a2d"
     },
     {
       "mode": "100644",
@@ -669,7 +674,7 @@
     {
       "mode": "100644",
       "path": "src/mmWaveRadar/simulation/options.py",
-      "sha256": "101741a5cc7a9bb186101f3c70d8d3306cf1260eeafc3ad20f38920e15e78ba7"
+      "sha256": "0444ba7a1c6da0c1e9ef81b87f27bf9bd953698e5d46d6e66590d41207e04e24"
     },
     {
       "mode": "100644",
@@ -684,7 +689,7 @@
     {
       "mode": "100644",
       "path": "src/mmWaveRadar/simulation/physical_optics.py",
-      "sha256": "14025aaae9ad1c27c7b8c3f92c349596a4853d51fc94231d160ced16c5aca6a7"
+      "sha256": "137ac03a44f4744340b4bf436ac8a5592fcf00c51ed76dab8448ba22685c3f38"
     },
     {
       "mode": "100644",
@@ -874,7 +879,7 @@
     {
       "mode": "100644",
       "path": "tests/unit/test_gui_app.py",
-      "sha256": "93268d9c351b63c0e51f74c20ed426e48d0ba8148612a38b2186c26d4fc1869e"
+      "sha256": "c5dcaa18d9e184cefb97a63739c8bfbbdef686605b7f0e283c2d6bd64ab602db"
     },
     {
       "mode": "100644",
@@ -923,6 +928,16 @@
     },
     {
       "mode": "100644",
+      "path": "tests/unit/test_po_polarization.py",
+      "sha256": "edd79f12f4d43e5e7749b828fc5ae302c4134e103d67b4df8a992e94db6e809d"
+    },
+    {
+      "mode": "100644",
+      "path": "tests/unit/test_po_refinement_diagnostics.py",
+      "sha256": "2e7c6e0c758bc7a26363af59eacde3d7c83208e7a6dbb12e613905012e43d4a6"
+    },
+    {
+      "mode": "100644",
       "path": "tests/unit/test_po_torch_integration.py",
       "sha256": "603de8e092bc115f80a81da1be3ea60ab593bbaeb3d851c6cffdf13be5cd451c"
     },
@@ -935,6 +950,11 @@
       "mode": "100644",
       "path": "tests/unit/test_point_targets.py",
       "sha256": "f5c4fa992a68a2a5a8ae25eb0beb066a84b33e965b4585b354da9c7e42f6ee5d"
+    },
+    {
+      "mode": "100644",
+      "path": "tests/unit/test_polarization.py",
+      "sha256": "ddb7702b5bc5fee50121a04266bee635b90188010e7f678eeb78c60e765fbef6"
     },
     {
       "mode": "100644",
@@ -979,7 +999,7 @@
     {
       "mode": "100644",
       "path": "tests/unit/test_sensing_adaptive_analytic.py",
-      "sha256": "a824f231e428bcc63c60f344998d884071937b7ef9aeafbb1c25f9d3daa23a06"
+      "sha256": "702ac288694451e09e1cddd8c18c006740e01375686e0f80321efa54ac2bcd5d"
     },
     {
       "mode": "100644",
@@ -1434,6 +1454,6 @@
   ],
   "policy_sha256": "2566472853f2130c2a1f93e5c619adcc7e115c1b79e5c0793362f8b168a87b8f",
   "schema_version": 1,
-  "source_commit": "0342f4417987d328bbd04d9250adb9f28a64de28",
-  "tree_sha256": "58dc5216eba4b3ad7faee3ac4e32606b3f090439532f60b1468dc0290ef8dc43"
+  "source_commit": "7409e907a580f1e06fd12216dc0c8091764277e2",
+  "tree_sha256": "376e84cd6179ac386a3308d465415e62de2c1c8b163e571ea6be979e29e0ffda"
 }
